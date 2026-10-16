@@ -74,7 +74,6 @@ function createCacheKey(config) {
         xtreamUsername: config.xtreamUsername,
         xtreamUseM3U: !!config.xtreamUseM3U,
         xtreamOutput: config.xtreamOutput,
-        xtreamStreamFormat: config.xtreamStreamFormat || 'ts',
         epgOffsetHours: config.epgOffsetHours,
         includeSeries: config.includeSeries !== false // default true
     };
