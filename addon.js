@@ -368,6 +368,45 @@ class M3UEPGAddon {
         return upcoming.sort((a, b) => a.startTime - b.startTime);
     }
 
+    /**
+     * Return XMLTV programmes overlapping a time window.
+     * The guide passes UTC-day boundaries; parseEPGTime applies the addon's
+     * configured EPG offset consistently with its existing programme methods.
+     */
+    getScheduledPrograms(channel, windowStartMs, windowEndMs) {
+        if (!channel || channel.type !== 'tv' || !Number.isFinite(windowStartMs) ||
+            !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) return [];
+
+        const epgId = channel.attributes?.['tvg-id'] || channel.attributes?.['tvg-name'];
+        const sourcePrograms = epgId && this.epgData[epgId];
+        if (!Array.isArray(sourcePrograms)) return [];
+
+        const videos = [];
+        for (const program of sourcePrograms) {
+            if (!program || !program.start || !program.stop) continue;
+
+            const start = this.parseEPGTime(program.start);
+            const end = this.parseEPGTime(program.stop);
+            const startMs = start instanceof Date ? start.getTime() : NaN;
+            const endMs = end instanceof Date ? end.getTime() : NaN;
+            if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
+            if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
+
+            const video = {
+                id: `${channel.id}:epg:${start.toISOString()}`,
+                title: String(program.title || 'Untitled programme'),
+                released: start.toISOString(),
+                startTime: start.toISOString(),
+                endTime: end.toISOString()
+            };
+            if (program.desc) video.overview = String(program.desc);
+            const runtimeMinutes = Math.round((endMs - startMs) / 60000);
+            if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
+            videos.push(video);
+        }
+        return videos.sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime));
+    }
+
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) return null;
         if (this.seriesInfoCache.has(seriesId)) return this.seriesInfoCache.get(seriesId);
@@ -622,7 +661,7 @@ async function createAddon(config) {
                 type: 'tv',
                 id: 'iptv_channels',
                 name: 'IPTV Channels',
-                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }],
+                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }, { name: 'date' }],
                 genres: []
             },
             {
@@ -675,7 +714,11 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e);
         }
         addonInstance.buildGenresInManifest();
-        
+
+        // Only advertise native EPG when this instance has parsed real programme data.
+        manifest.behaviorHints.epgProvider = Object.values(addonInstance.epgData || {})
+            .some(programmes => Array.isArray(programmes) && programmes.length > 0);
+
         // Pass the fully populated manifest to builder
         // IMPORTANT: We must ensure 'manifest' object has 'catalogs[].genres' populated BEFORE creating builder
         const builder = new addonBuilder(manifest); 
@@ -715,7 +758,51 @@ async function createAddon(config) {
                 
                 // Pagination / Skip
                 const skip = extra.skip ? parseInt(extra.skip) : 0;
-                const metas = filtered.slice(skip, skip + 100).map(i => addonInstance.generateMetaPreview(i));
+                const page = filtered.slice(skip, skip + 100);
+
+                // Native EPG requests specify a UTC date and expect metasDetailed.
+                if (args.type === 'tv' && args.id === 'iptv_channels' && extra.date) {
+                    const dateMatch = /^\d{4}-\d{2}-\d{2}$/.test(extra.date);
+                    const dateStart = dateMatch ? Date.parse(`${extra.date}T00:00:00.000Z`) : NaN;
+                    const validDate = Number.isFinite(dateStart) &&
+                        new Date(dateStart).toISOString().slice(0, 10) === extra.date;
+                    if (!validDate) return { metasDetailed: [], cacheMaxAge: 300 };
+
+                    const dateEnd = dateStart + 86400000;
+                    const metasDetailed = page.map(channel => {
+                        const videos = addonInstance.getScheduledPrograms(channel, dateStart, dateEnd);
+                        return {
+                            ...addonInstance.generateMetaPreview(channel),
+                            type: 'tv',
+                            posterShape: 'square',
+                            behaviorHints: {
+                                isLive: true,
+                                hasScheduledVideos: videos.length > 0
+                            },
+                            videos
+                        };
+                    });
+
+                    if (addonInstance.config.debug) {
+                        console.log('[DEBUG] EPG guide catalog', {
+                            date: extra.date,
+                            channels: metasDetailed.length,
+                            scheduledChannels: metasDetailed.filter(m => m.videos.length > 0).length,
+                            skip,
+                            ms: Date.now() - start
+                        });
+                    }
+                    return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
+                }
+
+                const metas = page.map(i => {
+                    const meta = addonInstance.generateMetaPreview(i);
+                    if (i.type === 'tv') {
+                        meta.behaviorHints = { isLive: true };
+                        meta.posterShape = 'square';
+                    }
+                    return meta;
+                });
                 
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
@@ -793,6 +880,22 @@ async function createAddon(config) {
                     return { meta: meta || null };
                 }
                 const meta = addonInstance.getDetailedMeta(id);
+                if (meta && type === 'tv' && meta.type === 'tv') {
+                    const channel = addonInstance.channels.find(item => item.id === id);
+                    if (channel) {
+                        const now = Date.now();
+                        const videos = addonInstance.getScheduledPrograms(
+                            channel, now - 3 * 3600000, now + 24 * 3600000
+                        );
+                        meta.behaviorHints = {
+                            ...(meta.behaviorHints || {}),
+                            isLive: true,
+                            hasScheduledVideos: videos.length > 0
+                        };
+                        meta.posterShape = 'square';
+                        meta.videos = videos;
+                    }
+                }
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Meta request', { id, type, found: !!meta });
                 }
