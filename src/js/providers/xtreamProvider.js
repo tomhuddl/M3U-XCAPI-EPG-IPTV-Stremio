@@ -116,9 +116,6 @@ async function fetchData(addonInstance) {
       /* ignore */
     }
 
-    const streamFormat = config.xtreamStreamFormat === "m3u8" ? "m3u8" : "ts";
-    const streamUsername = encodeURIComponent(xtreamUsername);
-    const streamPassword = encodeURIComponent(xtreamPassword);
     addonInstance.channels = (Array.isArray(live) ? live : []).map((s) => {
       const cat =
         liveCatMap[s.category_id] || s.category_name || s.category_id || "Live";
@@ -126,7 +123,7 @@ async function fetchData(addonInstance) {
         id: `iptv_live_${s.stream_id}`,
         name: s.name,
         type: "tv",
-        url: `${xtreamUrl}/live/${streamUsername}/${streamPassword}/${s.stream_id}.${streamFormat}`,
+        url: `${xtreamUrl}/live/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.m3u8`,
         logo: s.stream_icon,
         category: cat,
         epg_channel_id: s.epg_channel_id,
