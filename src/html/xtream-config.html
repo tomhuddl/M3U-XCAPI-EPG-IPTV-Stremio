@@ -55,6 +55,18 @@
         </fieldset>
 
         <fieldset>
+            <legend>Live Stream Format</legend>
+            <div class="form-group">
+                <label for="xtreamStreamFormat">Live stream URL extension</label>
+                <select id="xtreamStreamFormat" name="xtreamStreamFormat">
+                    <option value="ts" selected>.ts (common Xtream format)</option>
+                    <option value="m3u8">.m3u8 (HLS)</option>
+                </select>
+                <small class="hint">If all channels fail, choose the format supported by your IPTV provider and reinstall/update the addon.</small>
+            </div>
+        </fieldset>
+
+        <fieldset>
             <legend>EPG Options</legend>
             <div class="form-group checkbox-line">
                 <input type="checkbox" id="enableEpg" name="enableEpg" checked>
