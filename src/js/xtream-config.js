@@ -353,6 +353,7 @@
         xtreamUrl: baseUrl,
         xtreamUsername: username,
         xtreamPassword: password,
+        xtreamStreamFormat: document.getElementById("xtreamStreamFormat")?.value === "m3u8" ? "m3u8" : "ts",
         enableEpg: enableEpgFinal,
         debug: debug || undefined,
       };
