@@ -165,7 +165,8 @@ class M3UEPGAddon {
         const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
         const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
 
-        // Helper: set catalog.genres (options are added post-build to avoid SDK linter size limits)
+        // Helper: set catalog.genres (options are added post-build to avoid SDK linter size limits).
+        // Keep first-seen order so groups follow the provider's channel/category ordering.
         function setGenresOnCatalog(catalog, groups) {
             if (!catalog) return;
             catalog.genres = groups;
@@ -179,7 +180,7 @@ class M3UEPGAddon {
                         .filter(Boolean)
                         .map(s => s.trim())
                 )
-            ].sort((a, b) => a.localeCompare(b));
+            ];
             if (!groups.includes('All Channels')) groups.unshift('All Channels');
             setGenresOnCatalog(tvCatalog, groups);
         }
@@ -192,7 +193,7 @@ class M3UEPGAddon {
                         .filter(Boolean)
                         .map(s => s.trim())
                 )
-            ].sort((a, b) => a.localeCompare(b));
+            ];
             setGenresOnCatalog(movieCatalog, movieGroups);
         }
 
@@ -204,7 +205,7 @@ class M3UEPGAddon {
                         .filter(Boolean)
                         .map(s => s.trim())
                 )
-            ].sort((a, b) => a.localeCompare(b));
+            ];
             setGenresOnCatalog(seriesCatalog, seriesGroups);
         }
 
