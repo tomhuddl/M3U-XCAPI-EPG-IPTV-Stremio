@@ -107,7 +107,7 @@
         "Mixed content blocked (forcing server prefetch fallback)",
       );
     }
-    appendDetail(`→ (Browser) Fetching ${phaseLabel}: ${url}`);
+    appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
     const res = await fetch(url, { method: "GET" });
     if (!res.ok) throw new Error(`${phaseLabel} HTTP ${res.status}`);
     const txt = await res.text();
@@ -118,7 +118,7 @@
   }
 
   async function fetchTextServer(url, purpose) {
-    appendDetail(`→ (Server) Prefetch ${purpose}: ${url}`);
+    appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
     const res = await fetch("/api/prefetch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -391,13 +391,9 @@
 
       config.instanceId = config.instanceId || uuid();
 
-      const passHash = await sha256Fragment(password);
-      appendDetail(`Password hash fragment: ${passHash}`);
-
-      const { manifestUrl, stremioUrl } = buildUrls(config);
+const { manifestUrl, stremioUrl } = await buildUrls(config);
       appendDetail("✔ Token built");
-      appendDetail("Manifest URL: " + manifestUrl);
-      appendDetail("Stremio URL: " + stremioUrl);
+      appendDetail("Secure manifest and Stremio links created (links hidden for privacy).");
 
       setProgress(70, "Waiting for manifest");
       appendDetail("== SERVER BUILD PHASE ==");
