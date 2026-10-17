@@ -28,7 +28,7 @@ module.exports = async function (req, res) {
             res.end();
         });
     } catch (e) {
-        console.error('[SERVERLESS] Error:', e);
+        console.error('[SERVERLESS] Error:', e && e.name ? e.name : 'Error');
         res.statusCode = 500;
         res.end(JSON.stringify({ error: 'Serverless addon error' }));
     }

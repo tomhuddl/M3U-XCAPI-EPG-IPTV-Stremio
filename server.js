@@ -9,6 +9,7 @@ const crypto = require("crypto");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
+const { validateConfig } = require("./configValidation");
 const LRUCache = require("./lruCache");
 
 const DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
@@ -16,52 +17,62 @@ function dlog(...args) {
   if (DEBUG) console.log("[DEBUG]", ...args);
 }
 
-let redisClient = null;
-if (process.env.REDIS_URL) {
-  try {
-    const { Redis } = require("ioredis");
-    redisClient = new Redis(process.env.REDIS_URL, {
-      lazyConnect: true,
-      maxRetriesPerRequest: 2,
-    });
-    redisClient.on("error", (e) => console.error("[REDIS] Error:", e.message));
-    redisClient
-      .connect()
-      .catch((err) => console.error("[REDIS] Connect failed:", err.message));
-    console.log("[REDIS] Enabled (interface cache)");
-  } catch (e) {
-    console.warn("[REDIS] ioredis not available, fallback to in-memory LRU");
-    redisClient = null;
-  }
-}
-
-const INTERFACE_TTL_MS = parseInt(
-  process.env.CACHE_TTL_MS || (6 * 3600 * 1000).toString(),
-  10,
-);
-const interfaceCache = new LRUCache({
-  max: parseInt(process.env.MAX_CACHE_ENTRIES || "100", 10),
-  ttl: INTERFACE_TTL_MS,
-});
 const CACHE_ENABLED =
   (process.env.CACHE_ENABLED || "true").toLowerCase() !== "false";
 
-const PREFETCH_MAX_BYTES = parseInt(
-  process.env.PREFETCH_MAX_BYTES || "150000000",
+const parsePositiveInteger = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed >= min
+    ? Math.min(parsed, max)
+    : fallback;
+};
+
+const INTERFACE_TTL_MS = parsePositiveInteger(
+  process.env.CACHE_TTL_MS,
+  6 * 3600 * 1000,
+  1000,
+  30 * 24 * 3600 * 1000,
+);
+const interfaceCache = new LRUCache({
+  max: parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500),
+  ttl: INTERFACE_TTL_MS,
+});
+const MAX_ACTIVE_INTERFACE_BUILDS = parsePositiveInteger(
+  process.env.MAX_ACTIVE_INTERFACE_BUILDS,
+  2,
+  1,
+  8,
+);
+let activeInterfaceBuilds = 0;
+
+const PREFETCH_MAX_BYTES_RAW = Number.parseInt(
+  process.env.PREFETCH_MAX_BYTES || "50000000",
   10,
 );
+const PREFETCH_MAX_BYTES =
+  Number.isSafeInteger(PREFETCH_MAX_BYTES_RAW) && PREFETCH_MAX_BYTES_RAW >= 1024
+    ? Math.min(PREFETCH_MAX_BYTES_RAW, 150000000)
+    : 150000000;
 const PREFETCH_ENABLED =
   (process.env.PREFETCH_ENABLED || "true").toLowerCase() !== "false";
+const MAX_ACTIVE_PREFETCHES = parsePositiveInteger(
+  process.env.PREFETCH_MAX_CONCURRENT,
+  2,
+  1,
+  8,
+);
+let activePrefetches = 0;
 
 const app = express();
 const staticDir = path.join(__dirname, "src");
-app.use(express.static(staticDir));
-app.use(express.json({ limit: "512kb" }));
-
 app.use((req, res, next) => {
   res.setHeader("X-App", "IPTV-Stremio-Addon");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
   next();
 });
+app.use(express.static(staticDir));
+app.use(express.json({ limit: "128kb" }));
 
 // Encryption endpoint
 app.post("/encrypt", (req, res) => {
@@ -74,113 +85,209 @@ app.post("/encrypt", (req, res) => {
     return res.status(400).json({ error: "Config payload must be a JSON object" });
   }
   try {
-    const jsonStr = JSON.stringify(req.body);
+    const validatedConfig = validateConfig(req.body);
+    const jsonStr = JSON.stringify(validatedConfig);
     const token = encryptConfig(jsonStr);
     if (!token) return res.status(500).json({ error: "Encrypt failed" });
     res.json({ token });
-  } catch {
-    res.status(400).json({ error: "Invalid config payload" });
+  } catch (error) {
+    res.status(400).json({ error: "Invalid config payload", detail: DEBUG ? error.message : undefined });
   }
 });
 
+const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
+
 /**
- * Prefetch endpoint: server-side fetch to bypass browser CORS for playlist / EPG pre-flight.
- * SECURITY: Basic SSRF protections included (blocks local/private networks).
- * NOTE: For production, consider a stricter allowlist or DNS/IP resolution checks.
+ * Server-side prefetch for playlist / EPG pre-flight.
+ * Every redirect is checked separately; the timeout covers DNS and body reads.
  */
 app.post("/api/prefetch", async (req, res) => {
-  if (!PREFETCH_ENABLED)
+  if (!PREFETCH_ENABLED) {
     return res.status(403).json({ error: "Prefetch disabled by server" });
+  }
 
   const { url, purpose } = req.body || {};
-  if (!url || typeof url !== "string")
+  if (!url || typeof url !== "string") {
     return res.status(400).json({ error: "Missing url" });
-  if (!/^https?:\/\//i.test(url))
-    return res.status(400).json({ error: "Only http(s) URLs allowed" });
+  }
+  if (url.length > 8192) {
+    return res.status(400).json({ error: "URL is too long" });
+  }
+  const safePurpose = typeof purpose === "string"
+    ? purpose.slice(0, 80).replace(/[^a-zA-Z0-9 _.-]/g, "")
+    : null;
+  if (activePrefetches >= MAX_ACTIVE_PREFETCHES) {
+    res.setHeader("Retry-After", "5");
+    return res.status(503).json({ error: "Prefetch capacity reached; retry shortly" });
+  }
+  activePrefetches += 1;
+
+  const controller = new AbortController();
+  const agents = [];
+  let timeoutHandle;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller.abort();
+      const error = new Error("Prefetch timed out");
+      error.name = "AbortError";
+      reject(error);
+    }, 45000);
+  });
 
   try {
-    const u = new URL(url);
-    const host = u.hostname;
-    // Basic SSRF / local network block
-    if (
-      host === "localhost" ||
-      host === "0.0.0.0" ||
-      /^127\./.test(host) ||
-      /^10\./.test(host) ||
-      /^192\.168\./.test(host) ||
-      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host) ||
-      /^169\.254\./.test(host)
-    ) {
-      return res.status(400).json({ error: "Blocked host" });
-    }
-
-    dlog("Prefetch start", { purpose });
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 45000);
-
-    let fetched;
+    let currentUrl;
     try {
-      fetched = await fetch(url, {
-        method: "GET",
-        signal: controller.signal,
-        headers: { "User-Agent": "IPTV-Stremio-Addon Prefetch/1.1" },
-      });
-    } finally {
-      clearTimeout(timeout);
+      currentUrl = new URL(url);
+    } catch {
+      return res.status(400).json({ error: "Invalid URL" });
     }
 
-    if (!fetched.ok) {
-      dlog("Prefetch non-OK", fetched.status);
-      return res
-        .status(502)
-        .json({ error: `Fetch failed (${fetched.status})` });
-    }
+    dlog("Prefetch start", { purpose: safePurpose });
 
-    // Accumulate stream with a byte limit
-    const reader = fetched.body; // Node.js readable stream
-    const chunks = [];
-    let received = 0;
-    let truncated = false;
-
-    await new Promise((resolve, reject) => {
-      reader.on("data", (chunk) => {
-        received += chunk.length;
-        if (received <= PREFETCH_MAX_BYTES) {
-          chunks.push(chunk);
-        } else {
-          truncated = true;
-          // Stop reading further; destroy stream.
-          reader.destroy();
+    const performFetch = async () => {
+      let fetched;
+      for (let redirects = 0; ; redirects++) {
+        let addresses;
+        let dnsTimer;
+        try {
+          addresses = await Promise.race([
+            resolvePublicAddresses(currentUrl),
+            new Promise((_, reject) => {
+              dnsTimer = setTimeout(
+                () => reject(new Error("URL DNS lookup timed out")),
+                10000,
+              );
+            }),
+          ]);
+        } catch (error) {
+          if (error.message === "Blocked host") {
+            const blocked = new Error("Blocked host");
+            blocked.statusCode = 400;
+            throw blocked;
+          }
+          const invalid = new Error("Invalid or unsupported URL");
+          invalid.statusCode = 400;
+          throw invalid;
+        } finally {
+          clearTimeout(dnsTimer);
         }
+
+        if (controller.signal.aborted) {
+          const timeoutError = new Error("Prefetch timed out");
+          timeoutError.name = "AbortError";
+          throw timeoutError;
+        }
+        const agent = createPinnedAgent(currentUrl, addresses);
+        agents.push(agent);
+        fetched = await fetch(currentUrl.toString(), {
+          method: "GET",
+          signal: controller.signal,
+          redirect: "manual",
+          agent,
+          headers: { "User-Agent": "IPTV-Stremio-Addon Prefetch/1.1" },
+        });
+
+        if (![301, 302, 303, 307, 308].includes(fetched.status)) break;
+        const location = fetched.headers.get("location");
+        if (!location) break;
+        if (fetched.body) fetched.body.destroy();
+        if (redirects >= 3) {
+          const tooMany = new Error("Too many redirects");
+          tooMany.statusCode = 502;
+          throw tooMany;
+        }
+        try {
+          currentUrl = new URL(location, currentUrl);
+        } catch {
+          const invalidRedirect = new Error("Invalid redirect URL");
+          invalidRedirect.statusCode = 502;
+          throw invalidRedirect;
+        }
+      }
+
+      if (!fetched.ok) {
+        if (fetched.body) fetched.body.destroy();
+        const upstream = new Error("Upstream request failed");
+        upstream.statusCode = 502;
+        upstream.upstreamStatus = fetched.status;
+        throw upstream;
+      }
+
+      const reader = fetched.body;
+      if (!reader) throw new Error("Empty response body");
+      const chunks = [];
+      let received = 0;
+      let truncated = false;
+
+      await new Promise((resolve, reject) => {
+        let ended = false;
+        reader.on("data", (chunk) => {
+          const remaining = Math.max(0, PREFETCH_MAX_BYTES - received);
+          if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+          received += chunk.length;
+          if (received > PREFETCH_MAX_BYTES) {
+            truncated = true;
+            reader.destroy();
+          }
+        });
+        reader.on("end", () => {
+          ended = true;
+          resolve();
+        });
+        reader.on("close", () => {
+          if (ended || truncated) resolve();
+          else reject(new Error("Response stream closed before completion"));
+        });
+        reader.on("error", (error) => {
+          if (truncated) resolve();
+          else reject(error);
+        });
       });
-      reader.on("end", resolve);
-      reader.on("close", resolve);
-      reader.on("error", reject);
-    });
 
-    let content = Buffer.concat(chunks).toString("utf8");
-    if (content.charCodeAt(0) === 0xfeff) content = content.slice(1); // strip BOM
+      let content = Buffer.concat(chunks).toString("utf8");
+      if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
 
-    dlog("Prefetch done", {
-      bytes: received,
-      truncated,
-      returnedBytes: Buffer.byteLength(content),
-    });
+      dlog("Prefetch done", {
+        bytes: received,
+        truncated,
+        returnedBytes: Buffer.byteLength(content),
+      });
 
-    res.json({
-      ok: true,
-      bytes: received,
-      truncated,
-      purpose: purpose || null,
-      content,
-    });
-  } catch (e) {
-    dlog("Prefetch error", e.message);
-    res.status(500).json({
-      error: "Prefetch error",
-      detail: DEBUG ? e.message : undefined,
-    });
+      return {
+        ok: true,
+        bytes: received,
+        truncated,
+        purpose: safePurpose,
+        content,
+      };
+    };
+
+    const result = await Promise.race([performFetch(), timeoutPromise]);
+    clearTimeout(timeoutHandle);
+    res.json(result);
+  } catch (error) {
+    dlog("Prefetch error", error && error.name ? error.name : "Error");
+    if (!res.headersSent) {
+      const status = error.statusCode || (
+        error.name === "AbortError" || controller.signal.aborted ? 504 : 502
+      );
+      const response = {
+        error: error.statusCode === 400
+          ? error.message
+          : error.statusCode === 502 && error.message === "Too many redirects"
+            ? error.message
+            : error.name === "AbortError" || controller.signal.aborted
+              ? "Prefetch timed out"
+              : "Prefetch error",
+      };
+      if (error.upstreamStatus) response.error = "Fetch failed (" + error.upstreamStatus + ")";
+      if (DEBUG && status !== 400) response.detail = error.name || "Request failed";
+      res.status(status).json(response);
+    }
+  } finally {
+    clearTimeout(timeoutHandle);
+    for (const agent of agents) agent.destroy();
+    activePrefetches = Math.max(0, activePrefetches - 1);
   }
 });
 
@@ -224,12 +331,11 @@ app.get("/:token/configure", (req, res) => {
     return res.status(400).json({ error: "Invalid configuration" });
   let cfg;
   try {
-    cfg = maybeDecryptConfig(token);
+    cfg = validateConfig(maybeDecryptConfig(token));
   } catch {
-    return res.redirect(`/${encodeURIComponent(token)}/configure-direct`);
+    return res.status(400).json({ error: "Invalid or unsupported configuration token" });
   }
-  const provider = cfg.provider || (cfg.useXtream ? "xtream" : "direct");
-  return res.redirect(`/${encodeURIComponent(token)}/configure-${provider}`);
+  return res.redirect(`/${encodeURIComponent(token)}/configure-${cfg.provider}`);
 });
 
 app.get("/:token/configure-direct", (req, res) => {
@@ -256,7 +362,7 @@ app.get("/:token/configuration.json", (req, res) => {
   if (!isConfigToken(token)) return res.status(400).json({ error: "Invalid token" });
   let config;
   try {
-    config = maybeDecryptConfig(token);
+    config = validateConfig(maybeDecryptConfig(token));
   } catch {
     return res.status(400).json({ error: "Invalid configuration token" });
   }
@@ -273,49 +379,36 @@ app.use("/:token", async (req, res, next) => {
 
   let config;
   try {
-    config = maybeDecryptConfig(token);
+    config = validateConfig(maybeDecryptConfig(token));
   } catch (e) {
-    dlog("Config parse failed", e.message);
+    dlog("Config parse or validation failed", e.message);
     return res.status(400).json({ error: "Invalid configuration token" });
   }
-  if (!config.provider)
-    config.provider = config.useXtream ? "xtream" : "direct";
   if (DEBUG && config.debug !== false) config.debug = true;
 
   const ifaceKey =
-    "iface:" + crypto.createHash("md5").update(token).digest("hex");
-
-  async function redisGet(key) {
-    if (!CACHE_ENABLED || !redisClient) return null;
-    try {
-      return await redisClient.get(key);
-    } catch {
-      return null;
-    }
-  }
-  async function redisSet(key, ttl) {
-    if (!CACHE_ENABLED || !redisClient) return;
-    try {
-      await redisClient.set(key, "1", "PX", ttl);
-    } catch {}
-  }
+    "iface:" + crypto.createHash("sha256").update(token).digest("hex");
 
   let iface = CACHE_ENABLED ? interfaceCache.get(ifaceKey) : null;
   if (!iface) {
-    await redisGet(ifaceKey);
+    if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
+      res.setHeader("Retry-After", "5");
+      return res.status(503).json({ error: "Addon is busy building configurations; retry shortly" });
+    }
+    activeInterfaceBuilds += 1;
     try {
-      dlog("Building addon interface (cache miss)", ifaceKey);
+      dlog("Building addon interface (cache miss)");
       iface = await createAddon(config);
-      if (CACHE_ENABLED) {
-        interfaceCache.set(ifaceKey, iface);
-        await redisSet(ifaceKey, INTERFACE_TTL_MS);
-      }
+      if (CACHE_ENABLED) interfaceCache.set(ifaceKey, iface);
     } catch (e) {
-      console.error("[SERVER] Addon build failed:", e);
+      // Provider errors can include request URLs; don't log them with credentials.
+      console.error("[SERVER] Addon build failed:", e && e.name ? e.name : "Error");
       return res.status(500).json({ error: "Addon build error" });
+    } finally {
+      activeInterfaceBuilds = Math.max(0, activeInterfaceBuilds - 1);
     }
   } else {
-    dlog("Interface cache hit", ifaceKey);
+    dlog("Interface cache hit");
   }
 
   req.addonInterface = iface;
@@ -347,20 +440,29 @@ app.get("/:token/logo/:tvgId.png", async (req, res) => {
     for (const template of sources) {
       const url = template.replace("{id}", cand);
       try {
-        let head = await fetch(url, { method: "HEAD", timeout: 7000 });
-        if (!head.ok)
-          head = await fetch(url, { method: "GET", timeout: 10000 });
-        if (head.ok) {
-          const buf = await head.buffer();
-          if (buf.length > 50) {
-            const ct = head.headers.get("content-type") || "image/png";
-            res.setHeader("Content-Type", ct);
-            res.setHeader("Cache-Control", "public, max-age=21600");
-            return res.end(buf);
-          }
+        const image = await safeFetch(url, {
+          method: "GET",
+          timeout: 10000,
+          size: 5 * 1024 * 1024,
+        });
+        if (!image.ok) {
+          if (image.body) image.body.destroy();
+          continue;
+        }
+        const contentType = image.headers.get("content-type") || "";
+        if (!contentType.toLowerCase().startsWith("image/")) {
+          if (image.body) image.body.destroy();
+          continue;
+        }
+        const buffer = await image.buffer();
+        if (buffer.length > 50) {
+          res.setHeader("Content-Type", contentType);
+          res.setHeader("X-Content-Type-Options", "nosniff");
+          res.setHeader("Cache-Control", "public, max-age=21600");
+          return res.end(buffer);
         }
       } catch {
-        /* continue */
+        /* Try another candidate. */
       }
     }
   }
@@ -392,7 +494,7 @@ app.use("/:token", (req, res) => {
   const router = getRouter(iface);
   router(req, res, (err) => {
     if (err) {
-      console.error("[SERVER] Router error:", err);
+      console.error("[SERVER] Router error:", err && err.name ? err.name : "Error");
       res.status(500).json({ error: "Addon error" });
     } else {
       res.status(404).json({ error: "Not found" });
@@ -403,7 +505,7 @@ app.use("/:token", (req, res) => {
 app.use("*", (req, res) => res.status(404).json({ error: "Not found" }));
 
 app.use((error, req, res, next) => {
-  console.error("[SERVER] Unhandled error:", error);
+  console.error("[SERVER] Unhandled error:", error && error.name ? error.name : "Error");
   if (!res.headersSent)
     res.status(500).json({ error: "Internal server error" });
 });

@@ -32,8 +32,15 @@ function decryptConfig(token) {
     const key = getSecret();
     if (!key) throw new Error('Encryption disabled');
     const b64 = token.slice(4);
-    const buf = Buffer.from(b64.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-    if (buf.length < 12 + 16 + 1) throw new Error('Bad payload');
+    if (
+        b64.length > 1024 * 1024 ||
+        !/^[A-Za-z0-9_-]+$/.test(b64) ||
+        b64.length % 4 === 1
+    ) throw new Error('Bad payload');
+    const buf = Buffer.from(b64, 'base64url');
+    if (buf.toString('base64url') !== b64 || buf.length < 12 + 16 + 1) {
+        throw new Error('Bad payload');
+    }
     const iv = buf.subarray(0, 12);
     const tag = buf.subarray(12, 28);
     const ciphertext = buf.subarray(28);
@@ -51,8 +58,19 @@ function decryptConfig(token) {
  *  - base64url ( - _ no padding)
  */
 function tryParseConfigToken(token) {
-    if (!token) throw new Error('Empty token');
+    if (typeof token !== 'string' || !token) throw new Error('Empty token');
+    if (token.length > 1024 * 1024) throw new Error('Configuration token too large');
     if (token.startsWith('enc:')) return decryptConfig(token);
+
+    // Legacy Base64 tokens expose their configuration in plaintext and can be
+    // forged without CONFIG_SECRET. Require an explicit opt-in for migration.
+    if ((process.env.ALLOW_LEGACY_CONFIG_TOKENS || "").toLowerCase() !== "true") {
+        throw new Error("Legacy unencrypted configuration tokens are disabled");
+    }
+    if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(token) ||
+        (/[+/]/.test(token) && /[-_]/.test(token))) {
+        throw new Error('Invalid base64');
+    }
 
     // Normalize base64url -> base64
     let base = token.replace(/-/g, '+').replace(/_/g, '/');

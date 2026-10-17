@@ -3,7 +3,7 @@
 // Series grouping heuristic looks for SxxEyy or "Season" patterns.
 // Episodes are stored in addonInstance.directSeriesEpisodeIndex for quick meta/stream resolution.
 
-const fetch = require('node-fetch');
+const { safeFetch: fetch } = require('../../../urlSafety');
 const crypto = require('crypto');
 
 function hash(str) {
@@ -134,16 +134,21 @@ async function fetchData(addonInstance) {
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), 45000);
                 let epgResp;
+                let epgText;
                 try {
                     epgResp = await fetch(sourceUrl, {
                         signal: controller.signal,
                         headers: { 'User-Agent': 'Stremio M3U/EPG Addon (directProvider/epg)' }
                     });
+                    if (!epgResp || !epgResp.ok) {
+                        if (epgResp?.body) epgResp.body.destroy();
+                        continue;
+                    }
+                    epgText = await epgResp.text();
                 } finally {
                     clearTimeout(timeout);
                 }
-                if (!epgResp || !epgResp.ok) continue;
-                const parsed = await addonInstance.parseEPG(await epgResp.text());
+                const parsed = await addonInstance.parseEPG(epgText);
                 for (const [channelId, programmes] of Object.entries(parsed)) {
                     if (!merged[channelId]) merged[channelId] = [];
                     merged[channelId].push(...programmes);

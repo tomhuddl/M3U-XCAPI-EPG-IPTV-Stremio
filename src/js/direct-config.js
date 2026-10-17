@@ -22,7 +22,9 @@
         setProgress,
         overlaySetMessage,
         appendDetail,
-        prefillIfReconfigure
+        prefillIfReconfigure,
+        robustFetch,
+        quickEpgStats
     } = window.ConfigureCommon || {};
 
     if (!window.ConfigureCommon) {
@@ -39,45 +41,6 @@
         } catch {
             return false;
         }
-    }
-
-    async function fetchTextBrowser(url, phaseLabel) {
-        appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
-        const res = await fetch(url, { method: 'GET' });
-        if (!res.ok) throw new Error(`${phaseLabel} HTTP ${res.status}`);
-        const txt = await res.text();
-        appendDetail(`✔ (Browser) ${phaseLabel} ${txt.length.toLocaleString()} bytes`);
-        return txt;
-    }
-
-    async function fetchTextServer(url, purpose) {
-        appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
-        const res = await fetch('/api/prefetch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url, purpose })
-        });
-        let payload = {};
-        try { payload = await res.json(); } catch { /* ignore */ }
-        if (!res.ok) {
-            const msg = payload.error || `HTTP ${res.status}`;
-            const detail = payload.detail ? ` (${payload.detail})` : '';
-            throw new Error(`Server prefetch failed ${res.status} - ${msg}${detail}`);
-        }
-        if (!payload.ok || !payload.content) throw new Error('Server prefetch empty content');
-        appendDetail(`✔ (Server) ${purpose} ${payload.bytes.toLocaleString()} bytes${payload.truncated ? ' (truncated)' : ''}`);
-        return payload.content;
-    }
-
-    async function robustFetch(url, purpose, browserFirst = true) {
-        if (browserFirst) {
-            try {
-                return await fetchTextBrowser(url, purpose);
-            } catch (e) {
-                appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
-            }
-        }
-        return await fetchTextServer(url, purpose);
     }
 
     function parseM3U(content) {
@@ -120,20 +83,7 @@
         return out;
     }
 
-    function quickEpgStats(xml) {
-        const prog = xml.match(/<programme\s/gi);
-        const ch   = xml.match(/<channel\s/gi);
-        return {
-            programmes: prog ? prog.length : 0,
-            channels: ch ? ch.length : 0
-        };
-    }
-
-    function uuid() {
-        return (crypto && crypto.randomUUID)
-            ? crypto.randomUUID()
-            : 'id-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-    }
+    
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -142,6 +92,10 @@
         const enableEpgInitial = enableEpgChk.checked;
         const epgUrl = epgInput.value.trim();
         const epgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
+        if (epgUrls.length > 20) {
+            alert('Please enter no more than 20 additional EPG URLs.');
+            return;
+        }
         const epgOffsetHours = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
         const debug = !!(debugChk && debugChk.checked);
 
@@ -170,13 +124,7 @@
         try {
             // 1. Fetch Playlist
             setProgress(10, 'Fetching Playlist');
-            let playlistText;
-            try {
-                playlistText = await robustFetch(m3uUrl, 'playlist', true);
-            } catch (bFail) {
-                appendDetail('⚠ Playlist fetch failed in browser; trying server fallback.');
-                playlistText = await robustFetch(m3uUrl, 'playlist', false);
-            }
+            const playlistText = await robustFetch(m3uUrl, 'playlist');
 
             // 2. Parse M3U
             setProgress(28, 'Parsing Playlist');
@@ -191,19 +139,14 @@
             appendDetail(`Heuristic: ~${approxTv} TV / ~${approxMovies} Movie`);
 
             // 3. Optional EPG feeds (each source fails independently)
-            let epgStats = { programmes: 0, channels: 0 };
             const epgSources = [...new Set([...(epgUrl ? [epgUrl] : []), ...epgUrls])];
             const validEpgSources = [];
             if (enableEpgInitial && epgSources.length) {
                 for (let index = 0; index < epgSources.length; index++) {
                     const sourceUrl = epgSources[index];
                     try {
-                        let epgTxt;
-                        try { epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1), true); }
-                        catch { epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1), false); }
+                        const epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1));
                         const stats = quickEpgStats(epgTxt);
-                        epgStats.programmes += stats.programmes;
-                        epgStats.channels = Math.max(epgStats.channels, stats.channels);
                         validEpgSources.push(sourceUrl);
                         appendDetail('✔ EPG source ' + (index + 1) + ': ' + stats.programmes.toLocaleString() + ' programmes');
                     } catch {
@@ -231,16 +174,6 @@
                 config.epgUrls = validEpgSources.slice(1);
             }
             if (isFinite(epgOffsetHours) && epgOffsetHours !== 0) config.epgOffsetHours = epgOffsetHours;
-
-            config.prescan = {
-                entries: items.length,
-                approxTv,
-                approxMovies,
-                epgProgrammes: enableEpgFinal ? epgStats.programmes : 0,
-                epgChannels: enableEpgFinal ? epgStats.channels : 0
-            };
-
-            config.instanceId = config.instanceId || uuid();
 
             const { manifestUrl, stremioUrl } = await buildUrls(config);
             appendDetail('✔ Token built');

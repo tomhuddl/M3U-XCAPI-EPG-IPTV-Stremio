@@ -5,18 +5,19 @@ require('dotenv').config();
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
-const fetch = require('node-fetch');
+
+const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
 let redisClient = null;
-if (process.env.REDIS_URL) {
+if (process.env.REDIS_URL && CACHE_ENABLED) {
     try {
         const { Redis } = require('ioredis');
         redisClient = new Redis(process.env.REDIS_URL, {
             lazyConnect: true,
             maxRetriesPerRequest: 2
         });
-        redisClient.on('error', e => console.error('[REDIS] Error:', e.message));
-        redisClient.connect().catch(err => console.error('[REDIS] Connect failed:', err.message));
+        redisClient.on('error', e => console.error('[REDIS] Error:', e && e.name ? e.name : 'Error'));
+        redisClient.connect().catch(err => console.error('[REDIS] Connect failed:', err && err.name ? err.name : 'Error'));
         console.log('[REDIS] Enabled');
     } catch (e) {
         console.warn('[REDIS] ioredis not installed or failed, falling back to in-memory LRU');
@@ -38,9 +39,14 @@ function makeLogger(cfgDebug) {
     };
 }
 
-const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
-const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS || (6 * 3600 * 1000).toString(), 10);
-const MAX_CACHE_ENTRIES = parseInt(process.env.MAX_CACHE_ENTRIES || '300', 10);
+function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isSafeInteger(parsed) && parsed >= min
+        ? Math.min(parsed, max)
+        : fallback;
+}
+const CACHE_TTL_MS = parsePositiveInteger(process.env.CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000);
+const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500);
 
 const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
 const buildPromiseCache = new Map();
@@ -61,7 +67,17 @@ async function redisSetJSON(key, value, ttl) {
 }
 
 function stableStringify(obj) {
-    return JSON.stringify(obj, Object.keys(obj).sort());
+    // This cache-key input is deliberately a flat object with a fixed property order.
+    return JSON.stringify(obj);
+}
+
+function safeStreamTarget(value) {
+    try {
+        const parsed = new URL(value);
+        return parsed.protocol + '//' + parsed.host;
+    } catch {
+        return '[invalid URL]';
+    }
 }
 
 function createCacheKey(config) {
@@ -73,12 +89,14 @@ function createCacheKey(config) {
         enableEpg: !!config.enableEpg,
         xtreamUrl: config.xtreamUrl,
         xtreamUsername: config.xtreamUsername,
+        // Keep accounts with different credentials in separate cache namespaces.
+        xtreamPassword: config.xtreamPassword,
         xtreamUseM3U: !!config.xtreamUseM3U,
         xtreamOutput: config.xtreamOutput,
         epgOffsetHours: config.epgOffsetHours,
         includeSeries: config.includeSeries !== false // default true
     };
-    return crypto.createHash('md5').update(stableStringify(minimal)).digest('hex');
+    return crypto.createHash('sha256').update(stableStringify(minimal)).digest('hex');
 }
 
 class M3UEPGAddon {
@@ -94,7 +112,9 @@ class M3UEPGAddon {
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
-        this.seriesInfoCache = new Map(); // seriesId -> { videos: [...], fetchedAt }
+        // Bound lazily loaded episode metadata so browsing many series cannot grow
+        // this addon instance's memory without limit.
+        this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
         this.epgData = {};
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
@@ -115,7 +135,6 @@ class M3UEPGAddon {
 
         this.log.debug('Addon instance created', {
             provider: this.providerName,
-            cacheKey: this.cacheKey,
             epgOffsetHours: this.config.epgOffsetHours,
             includeSeries: this.config.includeSeries
         });
@@ -339,37 +358,6 @@ class M3UEPGAddon {
         return d;
     }
 
-    getCurrentProgram(channelId) {
-        if (!channelId || !this.epgData[channelId]) return null;
-        const now = new Date();
-        for (const p of this.epgData[channelId]) {
-            const start = this.parseEPGTime(p.start);
-            const stop = this.parseEPGTime(p.stop);
-            if (now >= start && now <= stop) {
-                return { title: p.title, description: p.desc, start, stop, startTime: start, stopTime: stop };
-            }
-        }
-        return null;
-    }
-
-    getUpcomingPrograms(channelId, limit = 5) {
-        if (!channelId || !this.epgData[channelId]) return [];
-        const now = new Date();
-        const upcoming = [];
-        for (const p of this.epgData[channelId]) {
-            const start = this.parseEPGTime(p.start);
-            if (start > now && upcoming.length < limit) {
-                upcoming.push({
-                    title: p.title,
-                    description: p.desc,
-                    startTime: start,
-                    stopTime: this.parseEPGTime(p.stop)
-                });
-            }
-        }
-        return upcoming.sort((a, b) => a.startTime - b.startTime);
-    }
-
     /**
      * Return XMLTV programmes overlapping a time window.
      * The guide passes UTC-day boundaries; parseEPGTime applies the addon's
@@ -421,7 +409,7 @@ class M3UEPGAddon {
                 return info;
             }
         } catch (e) {
-            this.log.warn('Series info fetch failed', seriesId, e.message);
+            this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
         }
         // Fallback empty structure
         const empty = { videos: [] };
@@ -455,7 +443,7 @@ class M3UEPGAddon {
                 ms: Date.now() - start
             });
         } catch (e) {
-            this.log.error('[UPDATE] Failed:', e.message);
+            this.log.error('[UPDATE] Failed:', e && e.name ? e.name : 'Error');
         }
     }
 
@@ -670,19 +658,16 @@ async function createAddon(config) {
         }
     };
 
-    config.instanceId = config.instanceId ||
-        (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex'));
-
     const cacheKey = createCacheKey(config);
     const debugFlag = !!config.debug || DEBUG_ENV;
     if (debugFlag) {
-        console.log('[DEBUG] createAddon start', { cacheKey, provider: config.provider, includeSeries: config.includeSeries !== false });
+        console.log('[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
     } else {
-        console.log(`[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'} for config ${cacheKey}`);
+        console.log(`[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
     }
 
     if (CACHE_ENABLED && buildPromiseCache.has(cacheKey)) {
-        if (debugFlag) console.log('[DEBUG] Reusing build promise', cacheKey);
+        if (debugFlag) console.log('[DEBUG] Reusing in-progress addon build');
         return buildPromiseCache.get(cacheKey);
     }
 
@@ -695,7 +680,7 @@ async function createAddon(config) {
                 await addonInstance.updateData(true);
             }
         } catch (e) {
-            console.error('[ADDON] Initial update failed:', e);
+            console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
 
@@ -802,7 +787,7 @@ async function createAddon(config) {
                 }
                 return { metas };
             } catch (e) {
-                console.error('[CATALOG] Error', e);
+                console.error('[CATALOG] Error', e && e.name ? e.name : 'Error');
                 return { metas: [] };
             }
         });
@@ -813,18 +798,18 @@ async function createAddon(config) {
                     const stream = addonInstance.getStream(id);
                     if (!stream) return { streams: [] };
                     if (addonInstance.config.debug) {
-                        console.log('[DEBUG] Series Episode Stream request', { id, url: stream.url });
+                        console.log('[DEBUG] Series Episode Stream request', { id, target: safeStreamTarget(stream.url) });
                     }
                     return { streams: [stream] };
                 }
                 const stream = addonInstance.getStream(id);
                 if (!stream) return { streams: [] };
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Stream request', { id, url: stream.url });
+                    console.log('[DEBUG] Stream request', { id, target: safeStreamTarget(stream.url) });
                 }
                 return { streams: [stream] };
             } catch (e) {
-                console.error('[STREAM] Error', e);
+                console.error('[STREAM] Error', e && e.name ? e.name : 'Error');
                 return { streams: [] };
             }
         });
@@ -885,7 +870,7 @@ async function createAddon(config) {
                 }
                 return { meta };
             } catch (e) {
-                console.error('[META] Error', e);
+                console.error('[META] Error', e && e.name ? e.name : 'Error');
                 return { meta: null };
             }
         });
@@ -916,7 +901,10 @@ async function createAddon(config) {
         const iface = await buildPromise;
         return iface;
     } finally {
-        // Keep promise cached
+        // Coalesce concurrent builds, but don't retain completed promises forever.
+        if (buildPromiseCache.get(cacheKey) === buildPromise) {
+            buildPromiseCache.delete(cacheKey);
+        }
     }
 }
 

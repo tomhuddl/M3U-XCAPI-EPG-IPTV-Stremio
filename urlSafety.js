@@ -1,0 +1,223 @@
+"use strict";
+
+const dns = require("dns").promises;
+const http = require("http");
+const https = require("https");
+const net = require("net");
+const ipaddr = require("ipaddr.js");
+const fetch = require("node-fetch");
+
+const PROVIDER_MAX_BYTES_RAW = Number.parseInt(
+  process.env.PROVIDER_MAX_BYTES || "50000000",
+  10,
+);
+const PROVIDER_MAX_BYTES =
+  Number.isSafeInteger(PROVIDER_MAX_BYTES_RAW) && PROVIDER_MAX_BYTES_RAW >= 1024
+    ? Math.min(PROVIDER_MAX_BYTES_RAW, 150000000)
+    : 50000000;
+
+// Reject non-public destinations before server-side requests. The HTTP(S) agent
+// pins DNS lookups to the validated addresses to reduce DNS-rebinding risk.
+function isPublicAddress(address) {
+  try {
+    // ipaddr.js classifies special-use ranges (private, loopback, link-local,
+    // documentation, multicast, mapped IPv4, 6to4, Teredo, etc.) consistently.
+    return ipaddr.process(address).range() === "unicast";
+  } catch {
+    return false;
+  }
+}
+
+async function resolvePublicAddresses(url) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Only HTTP(S) URLs are allowed");
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const lowerHost = hostname.toLowerCase();
+  if (
+    !hostname ||
+    lowerHost === "localhost" ||
+    lowerHost.endsWith(".localhost") ||
+    lowerHost.endsWith(".local") ||
+    lowerHost.endsWith(".internal")
+  ) throw new Error("Blocked host");
+
+  const family = net.isIP(hostname);
+  const records = family
+    ? [{ address: hostname, family }]
+    : await dns.lookup(hostname, { all: true, verbatim: true });
+
+  if (!records.length || records.some((record) => !isPublicAddress(record.address))) {
+    throw new Error("Blocked host");
+  }
+  return records;
+}
+
+function createPinnedAgent(url, addresses) {
+  const lookup = (hostname, options, callback) => {
+    if (typeof options === "function") {
+      callback = options;
+      options = {};
+    }
+    const records = addresses.map(({ address, family }) => ({ address, family }));
+    const matching = options && options.family
+      ? records.filter((record) => record.family === options.family)
+      : records;
+    if (!matching.length) {
+      callback(new Error("No validated address for requested IP family"));
+      return;
+    }
+    if (options && options.all) {
+      callback(null, matching);
+      return;
+    }
+    callback(null, matching[0].address, matching[0].family);
+  };
+
+  return url.protocol === "https:"
+    ? new https.Agent({ keepAlive: false, lookup })
+    : new http.Agent({ keepAlive: false, lookup });
+}
+
+/**
+ * Fetch only from public HTTP(S) destinations and validate every redirect.
+ * Caller-supplied node-fetch options (timeout, signal, headers, etc.) are kept,
+ * but redirect handling and the DNS-pinned agent are controlled here.
+ */
+async function safeFetch(input, options = {}) {
+  let currentUrl;
+  try {
+    currentUrl = input instanceof URL ? new URL(input.toString()) : new URL(input);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+
+  const maxRedirects = Number.isInteger(options.maxRedirects)
+    ? Math.max(0, Math.min(options.maxRedirects, 5))
+    : 3;
+  const fetchOptions = { ...options };
+  delete fetchOptions.maxRedirects;
+
+  // Keep a total deadline active through response-body consumption. node-fetch's
+  // timeout option alone is an inactivity timeout, not a strict overall deadline.
+  const externalSignal = fetchOptions.signal;
+  const timeoutMs = Number.isFinite(fetchOptions.timeout) && fetchOptions.timeout > 0
+    ? Math.min(fetchOptions.timeout, 120000)
+    : 45000;
+  const controller = new AbortController();
+  delete fetchOptions.signal;
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const cleanup = (agent) => {
+    clearTimeout(timeout);
+    if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+    if (agent) agent.destroy();
+  };
+
+  // node-fetch v2 otherwise permits unbounded response bodies. Clamp caller
+  // limits to 150 MB so a malformed provider response cannot exhaust memory.
+  const requestedSize = Number.isSafeInteger(fetchOptions.size) && fetchOptions.size > 0
+    ? fetchOptions.size
+    : PROVIDER_MAX_BYTES;
+  fetchOptions.size = Math.min(requestedSize, 150000000);
+  fetchOptions.signal = controller.signal;
+  fetchOptions.redirect = "manual";
+
+  let finalAgent = null;
+  try {
+    for (let redirects = 0; ; redirects++) {
+      if (controller.signal.aborted) {
+        const error = new Error("Request aborted or timed out");
+        error.name = "AbortError";
+        throw error;
+      }
+
+      let dnsTimer;
+      let records;
+      try {
+        records = await Promise.race([
+          resolvePublicAddresses(currentUrl),
+          new Promise((_, reject) => {
+            dnsTimer = setTimeout(
+              () => reject(new Error("URL DNS lookup timed out")),
+              10000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(dnsTimer);
+      }
+
+      if (controller.signal.aborted) {
+        const error = new Error("Request aborted or timed out");
+        error.name = "AbortError";
+        throw error;
+      }
+
+      const agent = createPinnedAgent(currentUrl, records);
+      let response;
+      try {
+        response = await fetch(currentUrl.toString(), {
+          ...fetchOptions,
+          agent,
+          redirect: "manual",
+        });
+      } catch (error) {
+        agent.destroy();
+        throw error;
+      }
+
+      if (![301, 302, 303, 307, 308].includes(response.status)) {
+        finalAgent = agent;
+        if (response.body) {
+          const close = () => cleanup(finalAgent);
+          response.body.once("end", close);
+          response.body.once("error", close);
+          response.body.once("close", close);
+        } else {
+          cleanup(finalAgent);
+        }
+        return response;
+      }
+
+      const location = response.headers.get("location");
+      if (!location) {
+        finalAgent = agent;
+        if (response.body) {
+          const close = () => cleanup(finalAgent);
+          response.body.once("end", close);
+          response.body.once("error", close);
+          response.body.once("close", close);
+        } else {
+          cleanup(finalAgent);
+        }
+        return response;
+      }
+
+      if (response.body) response.body.destroy();
+      agent.destroy();
+      if (redirects >= maxRedirects) {
+        throw new Error("Too many redirects");
+      }
+      try {
+        currentUrl = new URL(location, currentUrl);
+      } catch {
+        throw new Error("Invalid redirect URL");
+      }
+    }
+  } catch (error) {
+    cleanup(finalAgent);
+    throw error;
+  }
+}
+
+module.exports = {
+  isPublicAddress,
+  resolvePublicAddresses,
+  createPinnedAgent,
+  safeFetch,
+};

@@ -5,12 +5,10 @@ docker-compose.yml
 .git
 .gitignore
 README.md
-reddit_post.md
 *.env
 .env
 vercel.json
 serverless.js
-configure.html
 # Ignore local environment and editor files
 .vscode
 *.swp

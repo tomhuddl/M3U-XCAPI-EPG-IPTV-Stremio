@@ -3,7 +3,7 @@
 // - fetchData now retrieves series list when includeSeries !== false
 // - fetchSeriesInfo lazily queries per-series episodes (get_series_info)
 // episodes are transformed into Stremio 'videos' (season/episode).
-const fetch = require("node-fetch");
+const { safeFetch: fetch } = require("../../../urlSafety");
 
 async function fetchData(addonInstance) {
   const { config } = addonInstance;
