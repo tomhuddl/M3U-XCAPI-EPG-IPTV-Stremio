@@ -36,6 +36,8 @@
     overlaySetMessage,
     forceDisableActions,
     prefillIfReconfigure,
+    robustFetch,
+    quickEpgStats,
   } = window.ConfigureCommon || {};
 
   if (!window.ConfigureCommon) {
@@ -101,95 +103,14 @@
     return s;
   }
 
-  async function fetchTextBrowser(url, phaseLabel) {
-    // Avoid mixed content fetch attempts (HTTPS page -> HTTP resource) which browsers block.
-    if (window.location.protocol === "https:" && /^http:\/\//i.test(url)) {
-      throw new Error(
-        "Mixed content blocked (forcing server prefetch fallback)",
-      );
-    }
-    appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
-    const res = await fetch(url, { method: "GET" });
-    if (!res.ok) throw new Error(`${phaseLabel} HTTP ${res.status}`);
-    const txt = await res.text();
-    appendDetail(
-      `✔ (Browser) ${phaseLabel} ${txt.length.toLocaleString()} bytes`,
-    );
-    return txt;
-  }
-
-  async function fetchTextServer(url, purpose) {
-    appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
-    const res = await fetch("/api/prefetch", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, purpose }),
-    });
-    let payload = {};
+  function safeDisplayOrigin(raw) {
     try {
-      payload = await res.json();
-    } catch {}
-    if (!res.ok) {
-      const msg = payload.error || `HTTP ${res.status}`;
-      const detail = payload.detail ? ` (${payload.detail})` : "";
-      throw new Error(`Server prefetch failed ${res.status} - ${msg}${detail}`);
-    }
-    if (!payload.ok || !payload.content)
-      throw new Error("Server prefetch empty content");
-    appendDetail(
-      `✔ (Server) ${purpose} ${payload.bytes.toLocaleString()} bytes${payload.truncated ? " (truncated)" : ""}`,
-    );
-    if (payload.truncated) {
-      throw new Error(
-        "Prefetch truncated: increase server PREFETCH_MAX_BYTES or reduce dataset (e.g. fetch categories incrementally)",
-      );
-    }
-    return payload.content;
-  }
-
-  async function robustFetch(url, purpose, browserFirst = true) {
-    // If mixed content would occur, skip browser attempt.
-    const mixed =
-      window.location.protocol === "https:" && /^http:\/\//i.test(url);
-    if (browserFirst && !mixed) {
-      try {
-        return await fetchTextBrowser(url, purpose);
-      } catch (e) {
-        appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
-      }
-    }
-    return await fetchTextServer(url, purpose);
-  }
-
-  function quickEpgStats(xml) {
-    const prog = xml.match(/<programme\s/gi);
-    const ch = xml.match(/<channel\s/gi);
-    return {
-      programmes: prog ? prog.length : 0,
-      channels: ch ? ch.length : 0,
-    };
-  }
-
-  function uuid() {
-    return crypto && crypto.randomUUID
-      ? crypto.randomUUID()
-      : "id-" +
-          Math.random().toString(36).slice(2, 10) +
-          Date.now().toString(36);
-  }
-
-  async function sha256Fragment(str) {
-    try {
-      const enc = new TextEncoder().encode(str);
-      const digest = await crypto.subtle.digest("SHA-256", enc);
-      const hex = [...new Uint8Array(digest)]
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-      return hex.slice(0, 10) + "…";
+      return new URL(raw).origin;
     } catch {
-      return "(hash-unavailable)";
+      return "[invalid URL]";
     }
   }
+
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -202,6 +123,10 @@
     const epgMode = enableEpgInitial ? selectedEpgMode() : "disabled";
     const customEpg = epgMode === "custom" ? customEpgUrlInp.value.trim() : "";
     const additionalEpgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
+    if (additionalEpgUrls.length > 20) {
+      alert("Please enter no more than 20 additional EPG URLs.");
+      return;
+    }
     const epgOffset = epgOffsetInput.value
       ? parseFloat(epgOffsetInput.value)
       : 0;
@@ -239,7 +164,7 @@
     overlaySetMessage("Pre-flight: Validating Xtream inputs…");
     setProgress(5, "Starting");
     appendDetail("== PRE-FLIGHT (XTREAM) ==");
-    appendDetail(`Base URL: ${baseUrl}`);
+    appendDetail(`Base origin: ${safeDisplayOrigin(baseUrl)} (credentials and path hidden)`);
     appendDetail(`Mode: 'JSON API'}`);
     appendDetail(
       `EPG Mode: ${enableEpgInitial ? (epgMode === "custom" ? "Custom URL" : "Panel XMLTV") : "Disabled"}`,
@@ -250,26 +175,13 @@
     try {
       let liveCount = 0;
       let vodCount = 0;
-      let categories = new Set();
-      let epgStats = { programmes: 0, channels: 0 };
 
       const base = `${baseUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
       setProgress(12, "Fetching Live Streams");
-      let liveJsonText;
-      try {
-        liveJsonText = await robustFetch(
-          `${base}&action=get_live_streams`,
-          "live_streams",
-          true,
-        );
-      } catch (lErr) {
-        appendDetail('⚠ Live streams browser fetch failed; trying server fallback.');
-        liveJsonText = await robustFetch(
-          `${base}&action=get_live_streams`,
-          "live_streams",
-          false,
-        );
-      }
+      const liveJsonText = await robustFetch(
+        `${base}&action=get_live_streams`,
+        "live_streams",
+      );
       let liveList = [];
       try {
         liveList = JSON.parse(liveJsonText);
@@ -280,21 +192,10 @@
       appendDetail(`✔ Live streams: ${liveCount.toLocaleString()}`);
 
       setProgress(28, "Fetching VOD Streams");
-      let vodJsonText;
-      try {
-        vodJsonText = await robustFetch(
-          `${base}&action=get_vod_streams`,
-          "vod_streams",
-          true,
-        );
-      } catch (vErr) {
-        appendDetail('⚠ VOD browser fetch failed; trying server fallback.');
-        vodJsonText = await robustFetch(
-          `${base}&action=get_vod_streams`,
-          "vod_streams",
-          false,
-        );
-      }
+      const vodJsonText = await robustFetch(
+        `${base}&action=get_vod_streams`,
+        "vod_streams",
+      );
       let vodList = [];
       try {
         vodList = JSON.parse(vodJsonText);
@@ -303,19 +204,6 @@
       }
       vodCount = Array.isArray(vodList) ? vodList.length : 0;
       appendDetail(`✔ VOD streams: ${vodCount.toLocaleString()}`);
-
-      if (Array.isArray(liveList)) {
-        for (const l of liveList) {
-          const c = l.category_name || l.category || "";
-          if (c) categories.add(c);
-        }
-      }
-      if (Array.isArray(vodList)) {
-        for (const v of vodList) {
-          const c = v.category_name || v.category || "";
-          if (c) categories.add(c);
-        }
-      }
 
       // EPG feeds (each source fails independently; merge occurs on the server).
       const primaryEpgUrl = enableEpgInitial
@@ -326,12 +214,8 @@
       if (enableEpgInitial) {
         for (let index = 0; index < epgSources.length; index++) {
           try {
-            let epgTxt;
-            try { epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1), true); }
-            catch { epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1), false); }
+            const epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1));
             const stats = quickEpgStats(epgTxt);
-            epgStats.programmes += stats.programmes;
-            epgStats.channels = Math.max(epgStats.channels, stats.channels);
             validEpgSources.push(epgSources[index]);
             appendDetail("✔ EPG source " + (index + 1) + ": " + stats.programmes.toLocaleString() + " programmes");
           } catch {
@@ -368,22 +252,6 @@
       }
       if (isFinite(epgOffset) && epgOffset !== 0)
         config.epgOffsetHours = epgOffset;
-
-      config.prescan = {
-        liveCount,
-        vodCount,
-        categoryCount: categories.size,
-        epgProgrammes: enableEpgFinal ? epgStats.programmes : 0,
-        epgChannels: enableEpgFinal ? epgStats.channels : 0,
-        mode: "json",
-        epgSource: enableEpgFinal
-          ? epgMode === "custom"
-            ? "custom"
-            : "xtream"
-          : "disabled",
-      };
-
-      config.instanceId = config.instanceId || uuid();
 
       const { manifestUrl, stremioUrl } = await buildUrls(config);
       appendDetail("✔ Token built");

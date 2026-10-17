@@ -8,8 +8,8 @@
 > - Movies & VOD catalog
 > - Series catalog (Xtream native + M3U heuristic grouping)
 > - Client pre‑flight validation with CORS bypass fallback
-> - Config token encoding (+ optional encryption)
-> - Local LRU + Redis caching
+> - Encrypted configuration tokens (AES-256-GCM)
+> - Bounded in-memory LRU caches + optional Redis data cache
 > - Lightweight logo proxy & EPG parsing
 > - Graceful degradation (EPG failures do not block usage)
 
@@ -40,12 +40,14 @@
 
 ## 🧪 Quick Start (Local Dev)
 
+Requires **Node.js 22 or newer**.
+
 ```bash
-git clone https://github.com/Inside4ndroid/IPTV-Stremio-Addon.git
-cd IPTV-Stremio-Addon
+git clone https://github.com/tomhuddl/M3U-XCAPI-EPG-IPTV-Stremio.git
+cd M3U-XCAPI-EPG-IPTV-Stremio
 cp .env.example .env   # create your env (or export vars manually)
-npm install
-npm start
+npm ci
+npm run dev
 # Server runs on PORT (default 7000)
 open http://localhost:7000/
 ```
@@ -59,9 +61,13 @@ MAX_CACHE_ENTRIES=300
 DEBUG_MODE=false
 # Optional:
 # REDIS_URL=redis://localhost:6379
-# CONFIG_SECRET=super-long-random-string   (enables /encrypt)
+# CONFIG_SECRET=use-a-unique-long-random-secret (required for encrypted tokens)
+# ALLOW_LEGACY_CONFIG_TOKENS=false
+# PREFETCH_MAX_CONCURRENT=4
+# MAX_ACTIVE_INTERFACE_BUILDS=4
 # PREFETCH_ENABLED=true
-# PREFETCH_MAX_BYTES=5000000
+# PREFETCH_MAX_BYTES=50000000    (50 MB default; 150 MB hard cap)
+# PROVIDER_MAX_BYTES=50000000     (50 MB default; 150 MB hard cap)
 ```
 
 ---
@@ -113,7 +119,7 @@ Then open: `http://localhost:7000/`
 
 | Type | Format | Notes |
 |------|--------|-------|
-| Plain Token | Base64URL JSON (no prefix) | Legacy only; exposes configuration and credentials |
+| Plain Token | Base64URL JSON (no prefix) | Disabled by default; set `ALLOW_LEGACY_CONFIG_TOKENS=true` temporarily only if migrating old links |
 | Encrypted Token | `enc:<ciphertext>` | Required for newly generated links; AES-256-GCM via `/encrypt` and `CONFIG_SECRET` |
 | Manifest URL | `https://host/<TOKEN>/manifest.json` | Supply to Stremio |
 | Stremio Protocol | `stremio://host/<TOKEN>/manifest.json` | Auto-open from UI |
@@ -172,14 +178,18 @@ curl -X POST http://localhost:7000/api/prefetch \
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `PORT` | `7000` | HTTP server port |
-| `REDIS_URL` | unset | Enable Redis caching (interface + data) |
+| `REDIS_URL` | unset | Optional shared cache for provider data only |
 | `CACHE_ENABLED` | `true` | Master toggle for LRU + Redis |
 | `CACHE_TTL_MS` | `21600000` (6h) | TTL for cached data |
-| `MAX_CACHE_ENTRIES` | `300` | LRU entry cap |
-| `CONFIG_SECRET` | unset | Required for config UI; use a long random secret (minimum 16 characters) to encrypt tokens |
+| `MAX_CACHE_ENTRIES` | `100` | Maximum entries in each in-memory cache; values are bounded by the server | LRU entry cap; values are bounded by the server |
+| `CONFIG_SECRET` | unset | Required to create/decrypt encrypted tokens; use a unique random secret (prefer 32+ random bytes; minimum 16 characters) |
 | `DEBUG_MODE` | `false` | Enables verbose diagnostic logs |
 | `PREFETCH_ENABLED` | `true` | Enable server-side prefetch CORS bypass |
-| `PREFETCH_MAX_BYTES` | `5000000` | Max bytes returned from `/api/prefetch` |
+| `PREFETCH_MAX_BYTES` | `50000000` (50 MB) | Maximum bytes retained from one `/api/prefetch` response; hard cap 150 MB |
+| `PREFETCH_MAX_CONCURRENT` | `2` | Concurrent server-side prefetch limit (maximum 8) |
+| `PROVIDER_MAX_BYTES` | `50000000` (50 MB) | Max bytes read from each playlist, API or EPG response; hard cap 150 MB |
+| `MAX_ACTIVE_INTERFACE_BUILDS` | `2` | Concurrent addon build limit (maximum 8) |
+| `ALLOW_LEGACY_CONFIG_TOKENS` | `false` | Temporary opt-in for old plaintext Base64 configuration links |
 | `NODE_ENV` | (user value) | Standard Node semantics |
 
 > Redis is optional. Without it, only in‑process LRU is used (per container).
@@ -245,11 +255,11 @@ curl -X POST http://localhost:7000/api/prefetch \
 
 | Area | Current Defense | Recommendation |
 |------|------------------|----------------|
-| Prefetch SSRF | Blocks localhost & RFC1918 ranges | Optionally maintain allowlist or DNS resolve & IP classify |
+| Server-side fetches | Reject private/reserved IPv4 and IPv6 destinations, pin DNS answers, revalidate redirects, cap response sizes and timeouts | Use public HTTP(S) provider and EPG URLs |
 | Token Leakage | Newly generated tokens encrypted with AES-256-GCM | Set a strong `CONFIG_SECRET`; keep links private; rotate provider credentials if a plain token was exposed |
-| EPG Size | Prefetch max bytes & server timeouts | Adjust `PREFETCH_MAX_BYTES` for very large XMLTV feeds |
-| DoS / Abuse | Basic size limits | Add rate limiting (e.g. `express-rate-limit`) |
-| Sensitive Creds | Credentials are stored inside encrypted tokens for new configurations | Never share manifest links; old plain tokens remain unsafe until credentials/URLs are rotated and reconfigured |
+| EPG Size | Response-size caps and deadlines | Adjust `PREFETCH_MAX_BYTES` and `PROVIDER_MAX_BYTES` for large XMLTV feeds, up to the 150 MB hard cap |
+| DoS / Abuse | Prefetch and addon-build concurrency caps; bounded caches | Per-IP rate limiting is not currently implemented |
+| Sensitive credentials | New links use authenticated encryption; plaintext legacy tokens are disabled by default | Keep `CONFIG_SECRET` private, keep manifest links private, and rotate credentials if a plaintext token was exposed |
 
 ---
 
@@ -315,10 +325,10 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 | Layer | Scope | Contents |
 |-------|-------|----------|
 | In-Memory LRU | Per process | Addon data (channels/movies/series/epg) |
-| Redis (optional) | Cross replicas | Same payload (JSON) + interface build marker |
+| Redis (optional) | Cross replicas | Provider data cache (JSON) |
 | Build Promise Cache | Prevents simultaneous duplicate warm builds |
 
-Cache key = `md5` of normalized config subset.
+Cache key = SHA-256 of a normalized configuration subset, including provider credentials. The digest is never logged.
 
 ---
 

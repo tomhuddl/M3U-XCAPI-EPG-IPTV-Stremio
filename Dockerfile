@@ -1,18 +1,17 @@
-# Use official Node.js LTS image
-FROM node:18-alpine
+# Use a supported Node.js LTS image.
+FROM node:22-alpine
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files and install dependencies
+# Install exactly the versions recorded in package-lock.json.
 COPY package.json package-lock.json ./
-RUN npm install --production
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Copy the rest of the code
-COPY . .
+# Copy application files without making the runtime process root.
+COPY --chown=node:node . .
 
-# Expose the default port
 EXPOSE 7000
 
-# Start the server
+USER node
+
 CMD ["npm", "start"]

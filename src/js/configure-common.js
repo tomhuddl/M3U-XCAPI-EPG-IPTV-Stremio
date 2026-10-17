@@ -185,6 +185,120 @@
 
     /* -------- Token / URL builder -------- */
 
+    function quickEpgStats(xml) {
+        const pattern = /<programme\s/gi;
+        let programmes = 0;
+        while (pattern.exec(xml) !== null) programmes += 1;
+        return { programmes };
+    }
+
+    // Shared browser/server preflight fetchers. Limits and deadlines prevent a
+    // malformed or unexpectedly large playlist/EPG from hanging the setup page.
+    const MAX_BROWSER_RESPONSE_BYTES = 50000000;
+    const BROWSER_FETCH_TIMEOUT_MS = 45000;
+    const SERVER_FETCH_TIMEOUT_MS = 50000;
+
+    async function fetchTextBrowser(url, phaseLabel) {
+        appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), BROWSER_FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch(url, { method: 'GET', signal: controller.signal });
+            if (!response.ok) throw new Error(`${phaseLabel} HTTP ${response.status}`);
+
+            const contentLength = Number(response.headers.get('content-length'));
+            if (Number.isFinite(contentLength) && contentLength > MAX_BROWSER_RESPONSE_BYTES) {
+                try { await response.body?.cancel(); } catch { /* best effort */ }
+                throw new Error(`${phaseLabel} exceeds the 50 MB browser preflight limit`);
+            }
+
+            if (!response.body || typeof response.body.getReader !== 'function') {
+                const text = await response.text();
+                if (new TextEncoder().encode(text).byteLength > MAX_BROWSER_RESPONSE_BYTES) {
+                    throw new Error(`${phaseLabel} exceeds the 50 MB browser preflight limit`);
+                }
+                appendDetail(`✔ (Browser) ${phaseLabel} ${text.length.toLocaleString()} characters`);
+                return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+            }
+
+            const reader = response.body.getReader();
+            const chunks = [];
+            let totalBytes = 0;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                totalBytes += value.byteLength;
+                if (totalBytes > MAX_BROWSER_RESPONSE_BYTES) {
+                    try { await reader.cancel(); } catch { /* best effort */ }
+                    throw new Error(`${phaseLabel} exceeds the 50 MB browser preflight limit`);
+                }
+                chunks.push(value);
+            }
+
+            const bytes = new Uint8Array(totalBytes);
+            let offset = 0;
+            for (const chunk of chunks) {
+                bytes.set(chunk, offset);
+                offset += chunk.byteLength;
+            }
+            let text = new TextDecoder('utf-8').decode(bytes);
+            if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+            appendDetail(`✔ (Browser) ${phaseLabel} ${totalBytes.toLocaleString()} bytes`);
+            return text;
+        } catch (error) {
+            if (controller.signal.aborted) throw new Error(`${phaseLabel} request timed out`);
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    async function fetchTextServer(url, purpose) {
+        appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), SERVER_FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch('/api/prefetch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, purpose }),
+                signal: controller.signal
+            });
+            let payload = {};
+            try { payload = await response.json(); } catch { /* handled below */ }
+            if (!response.ok) {
+                const message = payload.error || `HTTP ${response.status}`;
+                const detail = payload.detail ? ` (${payload.detail})` : '';
+                throw new Error(`Server prefetch failed ${response.status} - ${message}${detail}`);
+            }
+            if (!payload.ok || typeof payload.content !== 'string' || !payload.content.length) {
+                throw new Error('Server prefetch returned empty content');
+            }
+            appendDetail(`✔ (Server) ${purpose} ${Number(payload.bytes || 0).toLocaleString()} bytes${payload.truncated ? ' (truncated)' : ''}`);
+            if (payload.truncated) {
+                throw new Error('Prefetch truncated: increase the server response limit or reduce the dataset.');
+            }
+            return payload.content;
+        } catch (error) {
+            if (controller.signal.aborted) throw new Error('Server prefetch request timed out');
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    async function robustFetch(url, purpose, browserFirst = true) {
+        const mixedContent = window.location.protocol === 'https:' && /^http:\/\//i.test(url);
+        if (browserFirst && !mixedContent) {
+            try {
+                return await fetchTextBrowser(url, purpose);
+            } catch (error) {
+                appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
+            }
+        }
+        return await fetchTextServer(url, purpose);
+    }
+
     async function buildUrls(config) {
         // Provider credentials must never be put into reversible Base64 JSON.
         // Fail closed unless the server returns an authenticated encrypted token.
@@ -264,6 +378,8 @@
         startPolling,
         buildUrls,
         prefillIfReconfigure,
+        robustFetch,
+        quickEpgStats,
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,
         appendDetail,
