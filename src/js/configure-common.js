@@ -185,14 +185,20 @@
 
     /* -------- Token / URL builder -------- */
 
-    function encodeConfigBase64Url(config) {
-        const json = JSON.stringify(config);
-        let b64 = btoa(unescape(encodeURIComponent(json)));
-        return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-    }
-
-    function buildUrls(config) {
-        const token = encodeConfigBase64Url(config);
+    async function buildUrls(config) {
+        // Provider credentials must never be put into reversible Base64 JSON.
+        // Fail closed unless the server returns an authenticated encrypted token.
+        const response = await fetch('/encrypt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config)
+        });
+        let payload = {};
+        try { payload = await response.json(); } catch { /* handled below */ }
+        if (!response.ok || typeof payload.token !== 'string' || !payload.token.startsWith('enc:')) {
+            throw new Error(payload.error || 'Secure token creation failed. Configure CONFIG_SECRET on the server (at least 16 characters) and redeploy.');
+        }
+        const token = payload.token;
         const origin = window.location.origin;
         manifestUrl = `${origin}/${token}/manifest.json`;
         const hostPart = origin.replace(/^https?:\/\//, '');
