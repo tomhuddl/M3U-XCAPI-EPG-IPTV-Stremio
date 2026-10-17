@@ -21,13 +21,16 @@
         buildUrls,
         setProgress,
         overlaySetMessage,
-        appendDetail
+        appendDetail,
+        prefillIfReconfigure
     } = window.ConfigureCommon || {};
 
     if (!window.ConfigureCommon) {
         console.error('[DIRECT-CONFIG] ConfigureCommon not loaded.');
         return;
     }
+
+    if (typeof prefillIfReconfigure === 'function') prefillIfReconfigure('direct');
 
     function validateUrl(u) {
         try {
@@ -138,7 +141,7 @@
         const m3uUrl = m3uInput.value.trim();
         const enableEpgInitial = enableEpgChk.checked;
         const epgUrl = epgInput.value.trim();
-        const epgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\\r?\\n/).map(u => u.trim()).filter(Boolean))] : [];
+        const epgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
         const epgOffsetHours = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
         const debug = !!(debugChk && debugChk.checked);
 
