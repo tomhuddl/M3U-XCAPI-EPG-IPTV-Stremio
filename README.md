@@ -3,7 +3,7 @@
 > A self‑hostable, token‑based, privacy‑friendly IPTV addon for **Stremio** supporting:
 > - Direct M3U playlists (TV + Movie + heuristic Series detection)
 > - Xtream Codes API (JSON mode + m3u_plus mode)
-> - Panel XMLTV or custom EPG feeds
+> - Panel XMLTV or custom EPG feeds, including multiple merged XMLTV sources
 > - Channel Logos, Live Now info, Upcoming programme snippets
 > - Movies & VOD catalog
 > - Series catalog (Xtream native + M3U heuristic grouping)
@@ -19,8 +19,8 @@
 
 1. Visit your hosted base URL (`https://your-host/`)
 2. Pick a mode:
-   - “Direct M3U / EPG” → paste playlist + optional XMLTV
-   - “Xtream Codes API” → enter panel URL + credentials (or toggle m3u_plus)
+   - “Direct M3U / EPG” → paste playlist + optional XMLTV feeds (one URL per line)
+   - “Xtream Codes API” → enter panel URL + credentials (or toggle m3u_plus), then add optional extra XMLTV feeds
 3. (Optional) Provide or override EPG source
 4. Pre‑flight runs:
    - Fetch + parse playlist (client; server fallback if CORS)
@@ -129,8 +129,10 @@ Decryption / parsing is done server-side before addon build.
 | `/` | GET | Landing + mode selection |
 | `/configure-direct` | GET | Direct config page (no token) |
 | `/configure-xtream` | GET | Xtream config page (no token) |
-| `/:token/configure-direct` | GET | Reconfigure direct (pre-filled if token decodes) |
-| `/:token/configure-xtream` | GET | Reconfigure Xtream |
+| `/:token/configure` | GET | Stremio Configure entry point; redirects to the matching prefilled form |
+| `/:token/configure-direct` | GET | Reconfigure direct (pre-filled from token) |
+| `/:token/configure-xtream` | GET | Reconfigure Xtream (pre-filled from token) |
+| `/:token/configuration.json` | GET | Token-specific configuration used to prefill the Configure page (no-store) |
 | `/:token/manifest.json` | GET | Stremio manifest |
 | `/:token/catalog/:type/:id/:extra?.json` | GET | Catalog resource (SDK handled) |
 | `/:token/stream/:type/:id.json` | GET | Stream resource |
@@ -156,7 +158,7 @@ curl -X POST http://localhost:7000/api/prefetch \
 | Live Channels Catalog | ✅ | ✅ | ✅ | Unified tv catalog |
 | Movies Catalog | Heuristic (by title/year/group) | ✅ | ✅ | Filtering rules |
 | Series Catalog | Heuristic (SxxEyy / Season X) | Native `get_series` + `get_series_info` | Heuristic | Per-episode videos |
-| EPG | XMLTV custom or provided | Panel xmltv.php or custom | Panel xmltv.php or custom | Offset supported |
+| EPG | One or more XMLTV URLs | Panel XMLTV/custom plus extra XMLTV URLs | Panel XMLTV/custom plus extra XMLTV URLs | Merged by channel ID; duplicate programmes removed; offset supported |
 | Logos | tvg-logo / fallback proxy | Uses stream_icon / cover | tvg-logo where present | Multiple sources attempted |
 | CORS Bypass | Yes (prefetch) | Yes (prefetch) | Yes (prefetch) | Browser first, fallback server |
 | Encryption | Token-level | Token-level | Token-level | Optional |
@@ -324,7 +326,8 @@ Cache key = `md5` of normalized config subset.
 
 - [ ] Genre filtering optimization
 - [ ] Optional transcode / proxy (HLS rewriting)
-- [ ] Multi-EPG merge & channel mapping UI
+- [x] Multi-EPG source merge
+- [ ] Channel-to-XMLTV ID mapping UI
 - [ ] Webhook or schedule-based background refresh
 - [ ] Token revocation list
 - [ ] Light theme toggle + user theme persistence
