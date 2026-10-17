@@ -28,6 +28,25 @@ if (process.env.REDIS_URL && CACHE_ENABLED) {
 const ADDON_NAME = "M3U/EPG TV Addon";
 const ADDON_ID = "org.stremio.m3u-epg-addon";
 
+/**
+ * Compare catalogue genre labels defensively. Xtream category names and
+ * Stremio's selected genre can differ only by casing or whitespace
+ * (including non-breaking spaces), which should not hide otherwise matching
+ * channels from a filtered catalogue.
+ */
+function normalizeGenre(value) {
+    return String(value ?? '')
+        .normalize('NFKC')
+        .trim()
+        .replace(/\\s+/g, ' ')
+        .toLowerCase();
+}
+
+function matchesGenre(category, selectedGenre) {
+    const selected = normalizeGenre(selectedGenre);
+    return selected.length > 0 && normalizeGenre(category) === selected;
+}
+
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 function makeLogger(cfgDebug) {
     const enabled = !!cfgDebug || DEBUG_ENV;
@@ -712,10 +731,10 @@ async function createAddon(config) {
                 let filtered = items;
                 
                 // If specific genre selected
-                if (extra.genre && extra.genre !== 'All Channels') {
+                if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
                     filtered = filtered.filter(i => {
                         const cat = i.category || i.attributes?.['group-title'];
-                        return cat === extra.genre;
+                        return matchesGenre(cat, extra.genre);
                     });
                 }
                 
@@ -909,3 +928,5 @@ async function createAddon(config) {
 }
 
 module.exports = createAddon;
+module.exports.normalizeGenre = normalizeGenre;
+module.exports.matchesGenre = matchesGenre;
