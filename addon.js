@@ -471,11 +471,8 @@ class M3UEPGAddon {
     generateMetaPreview(item) {
         const meta = { id: item.id, type: item.type, name: item.name };
         if (item.type === 'tv') {
-            const epgId = item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
-            const current = this.getCurrentProgram(epgId);
-            meta.description = current
-                ? `📡 Now: ${current.title}${current.description ? `\n${current.description}` : ''}`
-                : '📡 Live Channel';
+            // Native EPG data is supplied separately through scheduled videos.
+            // Keep programme information out of the channel description.
             meta.poster = this.deriveFallbackLogoUrl(item);
             meta.genres = item.category
                 ? [item.category]
@@ -602,28 +599,13 @@ class M3UEPGAddon {
         const item = all.find(i => i.id === id);
         if (!item) return null;
         if (item.type === 'tv') {
-            const epgId = item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
-            const current = this.getCurrentProgram(epgId);
-            const upcoming = this.getUpcomingPrograms(epgId, 3);
-            let description = `📺 CHANNEL: ${item.name}`;
-            if (current) {
-                const start = current.startTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
-                const end = current.stopTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
-                description += `\n\n📡 NOW: ${current.title}${start && end ? ` (${start}-${end})` : ''}`;
-                if (current.description) description += `\n\n${current.description}`;
-            }
-            if (upcoming.length) {
-                description += '\n\n📅 UPCOMING:\n';
-                for (const p of upcoming) {
-                    description += `${p.startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - ${p.title}\n`;
-                }
-            }
+            // Native EPG programmes are attached separately as scheduled videos.
+            // Do not duplicate programme information in the channel description.
             return {
                 id: item.id,
                 type: 'tv',
                 name: item.name,
                 poster: this.deriveFallbackLogoUrl(item),
-                description,
                 genres: item.category
                     ? [item.category]
                     : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']),
