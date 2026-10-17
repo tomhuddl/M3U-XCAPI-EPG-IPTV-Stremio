@@ -48,8 +48,8 @@ function testLegacyTokensRequireExplicitOptIn() {
 function testGenreMatchingIgnoresCaseAndWhitespace() {
     assert.strictEqual(normalizeGenre(" Peacock "), "peacock");
     assert.strictEqual(normalizeGenre("PEACOCK"), "peacock");
-    assert.strictEqual(normalizeGenre("Peacock\u00a0"), "peacock");
-    assert.strictEqual(matchesGenre("Peacock", "Peacock"), true);
+    assert.strictEqual(normalizeGenre("Peacock" + String.fromCharCode(160)), "peacock");
+    assert.strictEqual(matchesGenre("Peacock" + String.fromCharCode(160), "Peacock"), true);
     assert.strictEqual(matchesGenre("  PEACOCK  ", "Peacock"), true);
     assert.strictEqual(matchesGenre("Peacock\u00a0", "Peacock"), true);
     assert.strictEqual(matchesGenre("USA | Peacock", "Peacock"), false);
