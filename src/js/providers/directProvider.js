@@ -125,27 +125,45 @@ async function fetchData(addonInstance) {
         addonInstance.series = Array.from(seriesMap.values());
     }
 
-    // EPG (optional)
-    if (config.enableEpg && config.epgUrl) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 45000);
-            let epgResp;
+    // EPG sources are merged by XMLTV channel ID; an unavailable source does not disable the others.
+    if (config.enableEpg) {
+        const epgSources = [...new Set([...(config.epgUrl ? [config.epgUrl] : []), ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
+        const merged = {};
+        for (const sourceUrl of epgSources) {
             try {
-                epgResp = await fetch(config.epgUrl, {
-                    signal: controller.signal,
-                    headers: { 'User-Agent': 'Stremio M3U/EPG Addon (directProvider/epg)' }
-                });
-            } finally {
-                clearTimeout(timeout);
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 45000);
+                let epgResp;
+                try {
+                    epgResp = await fetch(sourceUrl, {
+                        signal: controller.signal,
+                        headers: { 'User-Agent': 'Stremio M3U/EPG Addon (directProvider/epg)' }
+                    });
+                } finally {
+                    clearTimeout(timeout);
+                }
+                if (!epgResp || !epgResp.ok) continue;
+                const parsed = await addonInstance.parseEPG(await epgResp.text());
+                for (const [channelId, programmes] of Object.entries(parsed)) {
+                    if (!merged[channelId]) merged[channelId] = [];
+                    merged[channelId].push(...programmes);
+                }
+            } catch {
+                // Keep any data already obtained from other feeds.
             }
-            if (epgResp && epgResp.ok) {
-                const epgContent = await epgResp.text();
-                addonInstance.epgData = await addonInstance.parseEPG(epgContent);
-            }
-        } catch {
-            // ignore EPG errors
         }
+        for (const channelId of Object.keys(merged)) {
+            const seen = new Set();
+            merged[channelId] = merged[channelId]
+                .filter(programme => {
+                    const key = [programme.start, programme.stop, programme.title].join('|');
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                })
+                .sort((a, b) => String(a.start).localeCompare(String(b.start)));
+        }
+        addonInstance.epgData = merged;
     }
 }
 
