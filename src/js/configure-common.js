@@ -209,7 +209,10 @@
 
     async function prefillIfReconfigure(provider) {
         const parts = window.location.pathname.split('/').filter(Boolean);
-        const token = parts[0];
+        // Stremio/browser URLs may expose the colon in `enc:` as `%3A`.
+        // Decode the path segment once before re-encoding it for the fetch URL.
+        let token = parts[0];
+        try { token = decodeURIComponent(token || ''); } catch { /* keep original segment */ }
         if (!token || token === 'configure-direct' || token === 'configure-xtream') return;
         try {
             const response = await fetch('/' + encodeURIComponent(token) + '/configuration.json', { cache: 'no-store' });
