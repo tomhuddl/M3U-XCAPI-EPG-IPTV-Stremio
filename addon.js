@@ -27,6 +27,37 @@ if (process.env.REDIS_URL) {
 const ADDON_NAME = "M3U/EPG TV Addon";
 const ADDON_ID = "org.stremio.m3u-epg-addon";
 
+// Map user-facing IPTVEditor4 genre labels to the provider's actual group-title values.
+const CATALOG_GENRE_ALIASES = {
+    tv: {
+        'uk | sky sports': ['Sky Sports'],
+        'uk | tnt sports': ['TNT Sports'],
+        'live ⚽️ | epl': ['EPL'],
+        'australia & new zealand sports': ['Sky Sport NZ', 'Stan Sports AU'],
+        'fubo sports': ['Fubo Sports CA'],
+        'now hk premier sports': ['Now Sports HK']
+    }
+};
+
+function normalizeGenre(value) {
+    return String(value || '').normalize('NFKC').trim().toLocaleLowerCase().replace(/\\s+/g, ' ');
+}
+
+function catalogGenreMatches(item, selectedGenre, type) {
+    const category = item.category || item.attributes?.['group-title'] || '';
+    const selected = normalizeGenre(selectedGenre);
+    const actual = normalizeGenre(category);
+
+    if (actual === selected) return true;
+
+    // Labels such as "UK | Sky Sports" can still match a source group named "Sky Sports".
+    const labelAfterPrefix = normalizeGenre(String(selectedGenre || '').split('|').pop());
+    if (labelAfterPrefix && actual === labelAfterPrefix) return true;
+
+    const aliases = CATALOG_GENRE_ALIASES[type]?.[selected] || [];
+    return aliases.some(alias => normalizeGenre(alias) === actual);
+}
+
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 function makeLogger(cfgDebug) {
     const enabled = !!cfgDebug || DEBUG_ENV;
@@ -743,12 +774,10 @@ async function createAddon(config) {
                 const extra = args.extra || {}; // Stremio passes filter/genre here
                 let filtered = items;
                 
-                // If specific genre selected
-                if (extra.genre && extra.genre !== 'All Channels') {
-                    filtered = filtered.filter(i => {
-                        const cat = i.category || i.attributes?.['group-title'];
-                        return cat === extra.genre;
-                    });
+                // If a genre is selected, match both its display label and the provider's
+                // underlying group-title. IPTVEditor4 labels do not always equal source groups.
+                if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
+                    filtered = filtered.filter(i => catalogGenreMatches(i, extra.genre, args.type));
                 }
                 
                 // If searching
