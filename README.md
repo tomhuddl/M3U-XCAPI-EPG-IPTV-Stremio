@@ -56,7 +56,7 @@ PORT=7000
 CACHE_ENABLED=true
 CACHE_TTL_MS=21600000
 MAX_CACHE_ENTRIES=300
-DEBUG_MODE=true
+DEBUG_MODE=false
 # Optional:
 # REDIS_URL=redis://localhost:6379
 # CONFIG_SECRET=super-long-random-string   (enables /encrypt)
@@ -301,7 +301,7 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 
 | Mode | How |
 |------|-----|
-| Enable debug globally | `DEBUG_MODE=true` |
+| Enable debug globally | `DEBUG_MODE=true` (only temporarily; avoid sharing logs) |
 | Per-token debug | Check “Enable Debug Logging” in UI |
 | Inspect parsing | Console shows playlist size, entries, EPG programmes |
 | Timeout fallback | Buttons enable after build timeout to allow manual retry |
@@ -378,7 +378,7 @@ Please include:
 - Hosting method (Docker / bare / serverless)
 - Provider type (direct / xtream-json / xtream-m3u)
 - Sample (sanitized) playlist or line count
-- Logs with `DEBUG_MODE=true` (scrub credentials)
+- Logs with debug enabled only when needed (scrub credentials and tokens before sharing)
 
 Create an issue: https://github.com/Inside4ndroid/IPTV-Stremio-Addon/issues
 
