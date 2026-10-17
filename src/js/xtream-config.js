@@ -201,7 +201,7 @@
     const enableEpgInitial = enableEpgChk.checked;
     const epgMode = enableEpgInitial ? selectedEpgMode() : "disabled";
     const customEpg = epgMode === "custom" ? customEpgUrlInp.value.trim() : "";
-    const additionalEpgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\\r?\\n/).map(u => u.trim()).filter(Boolean))] : [];
+    const additionalEpgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
     const epgOffset = epgOffsetInput.value
       ? parseFloat(epgOffsetInput.value)
       : 0;
