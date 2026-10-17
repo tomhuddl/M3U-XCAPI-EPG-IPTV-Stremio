@@ -70,7 +70,7 @@
             try {
                 return await fetchTextBrowser(url, purpose);
             } catch (e) {
-                appendDetail(`⚠ Browser fetch failed (${e.message}) → server fallback`);
+                appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
             }
         }
         return await fetchTextServer(url, purpose);
@@ -165,7 +165,7 @@
             try {
                 playlistText = await robustFetch(m3uUrl, 'playlist', true);
             } catch (bFail) {
-                appendDetail(`⚠ Playlist fetch initial attempt failed: ${bFail.message}`);
+                appendDetail('⚠ Playlist fetch failed in browser; trying server fallback.');
                 playlistText = await robustFetch(m3uUrl, 'playlist', false);
             }
 
@@ -190,11 +190,11 @@
                     try {
                         epgTxt = await robustFetch(epgUrl, 'epg', true);
                     } catch (epgFail) {
-                        appendDetail(`⚠ EPG browser fetch failed: ${epgFail.message} → server fallback`);
+                        appendDetail('⚠ EPG browser fetch failed → server fallback (details hidden for privacy).');
                         epgTxt = await robustFetch(epgUrl, 'epg', false);
                     }
                 } catch (finalEpgErr) {
-                    appendDetail(`✖ EPG fetch failed after both attempts (${finalEpgErr.message}) – continuing WITHOUT EPG`);
+                    appendDetail('✖ EPG fetch failed after both attempts – continuing WITHOUT EPG.');
                     enableEpgFinal = false;
                 }
 
