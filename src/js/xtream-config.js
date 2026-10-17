@@ -18,6 +18,7 @@
   const debugChk = document.getElementById("debugMode");
   const customEpgGroup = document.getElementById("customEpgGroup");
   const customEpgUrlInp = document.getElementById("customEpgUrl");
+  const epgUrlsInput = document.getElementById("epgUrls");
   const xtreamUseM3UChk = document.getElementById("xtreamUseM3U");
   const xtreamOutputGroup = document.getElementById("xtreamOutputGroup");
 
@@ -200,6 +201,7 @@
     const enableEpgInitial = enableEpgChk.checked;
     const epgMode = enableEpgInitial ? selectedEpgMode() : "disabled";
     const customEpg = epgMode === "custom" ? customEpgUrlInp.value.trim() : "";
+    const additionalEpgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
     const epgOffset = epgOffsetInput.value
       ? parseFloat(epgOffsetInput.value)
       : 0;
@@ -217,6 +219,10 @@
       password = pwdInput.dataset.original;
     }
 
+    if (enableEpgInitial && additionalEpgUrls.some(url => !validateUrl(url))) {
+      alert("One or more additional EPG URLs are invalid. Use HTTP(S) URLs, one per line.");
+      return;
+    }
     if (epgMode === "custom" && enableEpgInitial) {
       if (!customEpg) {
         alert("Custom EPG URL is empty");
@@ -311,38 +317,28 @@
         }
       }
 
-      // EPG (non-fatal)
+      // EPG feeds (each source fails independently; merge occurs on the server).
+      const primaryEpgUrl = enableEpgInitial
+        ? (epgMode === "custom" ? customEpg : `${baseUrl}/xmltv.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`)
+        : "";
+      const epgSources = [...new Set([...(primaryEpgUrl ? [primaryEpgUrl] : []), ...additionalEpgUrls])];
+      const validEpgSources = [];
       if (enableEpgInitial) {
-        const epgSourceUrl =
-          epgMode === "custom"
-            ? customEpgUrlInp.value.trim()
-            : `${baseUrl}/xmltv.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
-
-        setProgress(44, "Fetching EPG");
-        let epgTxt = null;
-        try {
+        for (let index = 0; index < epgSources.length; index++) {
           try {
-            epgTxt = await robustFetch(epgSourceUrl, "epg", true);
-          } catch (firstEpgErr) {
-            appendDetail(
-              '⚠ EPG browser fetch failed → server fallback (details hidden for privacy).',
-            );
-            epgTxt = await robustFetch(epgSourceUrl, "epg", false);
+            let epgTxt;
+            try { epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1), true); }
+            catch { epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1), false); }
+            const stats = quickEpgStats(epgTxt);
+            epgStats.programmes += stats.programmes;
+            epgStats.channels = Math.max(epgStats.channels, stats.channels);
+            validEpgSources.push(epgSources[index]);
+            appendDetail("✔ EPG source " + (index + 1) + ": " + stats.programmes.toLocaleString() + " programmes");
+          } catch {
+            appendDetail("⚠ EPG source " + (index + 1) + " failed; continuing with other sources.");
           }
-        } catch (finalEpgErr) {
-          appendDetail(
-            '✖ EPG fetch failed after both attempts – continuing WITHOUT EPG.',
-          );
-          enableEpgFinal = false;
         }
-
-        if (enableEpgFinal && epgTxt) {
-          setProgress(52, "Scanning EPG");
-          epgStats = quickEpgStats(epgTxt);
-          appendDetail(
-            `✔ EPG scan: ${epgStats.programmes.toLocaleString()} programmes / ${epgStats.channels.toLocaleString()} channels`,
-          );
-        }
+        if (!validEpgSources.length) enableEpgFinal = false;
       } else {
         appendDetail("EPG disabled by user.");
       }
@@ -365,12 +361,10 @@
         if (outVal) config.xtreamOutput = outVal;
       }
 
-      if (
-        enableEpgFinal &&
-        epgMode === "custom" &&
-        customEpgUrlInp.value.trim()
-      ) {
-        config.epgUrl = customEpgUrlInp.value.trim();
+      if (enableEpgFinal && validEpgSources.length) {
+        if (epgMode === "custom") config.epgUrl = validEpgSources[0];
+        else config.epgUrl = "";
+        config.epgUrls = epgMode === "custom" ? validEpgSources.slice(1) : validEpgSources.filter(url => url !== primaryEpgUrl);
       }
       if (isFinite(epgOffset) && epgOffset !== 0)
         config.epgOffsetHours = epgOffset;

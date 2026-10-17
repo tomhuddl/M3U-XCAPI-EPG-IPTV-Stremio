@@ -249,6 +249,22 @@ app.get("/:token/configure-xtream", (req, res) => {
   });
 });
 
+// Return the saved config to its token-specific Configure page so settings can be edited.
+// The encrypted token is a bearer secret; never request or log it separately.
+app.get("/:token/configuration.json", (req, res) => {
+  const token = req.params.token;
+  if (!isConfigToken(token)) return res.status(400).json({ error: "Invalid token" });
+  let config;
+  try {
+    config = maybeDecryptConfig(token);
+  } catch {
+    return res.status(400).json({ error: "Invalid configuration token" });
+  }
+  res.setHeader("Cache-Control", "no-store, private");
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.json(config);
+});
+
 // Token interface middleware
 app.use("/:token", async (req, res, next) => {
   const { token } = req.params;
@@ -361,11 +377,8 @@ app.get("/:token/manifest.json", (req, res) => {
 
   // Build a full manifest from the interface's manifest (which has genres populated)
   const manifest = JSON.parse(JSON.stringify(iface.manifest));
-  // Remove configurable/configurationRequired for installed addons
-  if (manifest.behaviorHints) {
-    delete manifest.behaviorHints.configurationRequired;
-    delete manifest.behaviorHints.configurable;
-  }
+  // Keep configurable enabled so Stremio can open /:token/configure.
+  if (manifest.behaviorHints) delete manifest.behaviorHints.configurationRequired;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.end(JSON.stringify(manifest));

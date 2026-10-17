@@ -9,6 +9,7 @@
 
     const m3uInput       = document.getElementById('m3uUrl');
     const epgInput       = document.getElementById('epgUrl');
+    const epgUrlsInput   = document.getElementById('epgUrls');
     const enableEpgChk   = document.getElementById('enableEpg');
     const epgOffsetInput = document.getElementById('epgOffsetHours');
     const debugChk       = document.getElementById('debugMode');
@@ -20,13 +21,16 @@
         buildUrls,
         setProgress,
         overlaySetMessage,
-        appendDetail
+        appendDetail,
+        prefillIfReconfigure
     } = window.ConfigureCommon || {};
 
     if (!window.ConfigureCommon) {
         console.error('[DIRECT-CONFIG] ConfigureCommon not loaded.');
         return;
     }
+
+    if (typeof prefillIfReconfigure === 'function') prefillIfReconfigure('direct');
 
     function validateUrl(u) {
         try {
@@ -137,6 +141,7 @@
         const m3uUrl = m3uInput.value.trim();
         const enableEpgInitial = enableEpgChk.checked;
         const epgUrl = epgInput.value.trim();
+        const epgUrls = epgUrlsInput ? [...new Set(epgUrlsInput.value.split(/\r?\n/).map(u => u.trim()).filter(Boolean))] : [];
         const epgOffsetHours = epgOffsetInput.value ? parseFloat(epgOffsetInput.value) : 0;
         const debug = !!(debugChk && debugChk.checked);
 
@@ -146,6 +151,10 @@
         }
         if (enableEpgInitial && epgUrl && !validateUrl(epgUrl)) {
             alert('Invalid EPG URL');
+            return;
+        }
+        if (enableEpgInitial && epgUrls.some(url => !validateUrl(url))) {
+            alert('One or more additional EPG URLs are invalid. Use HTTP(S) URLs, one per line.');
             return;
         }
 
@@ -181,28 +190,27 @@
             const approxTv = items.length - approxMovies;
             appendDetail(`Heuristic: ~${approxTv} TV / ~${approxMovies} Movie`);
 
-            // 3. Optional EPG (non-fatal)
+            // 3. Optional EPG feeds (each source fails independently)
             let epgStats = { programmes: 0, channels: 0 };
-            if (enableEpgInitial && epgUrl) {
-                let epgTxt = null;
-                setProgress(42, 'Fetching EPG');
-                try {
+            const epgSources = [...new Set([...(epgUrl ? [epgUrl] : []), ...epgUrls])];
+            const validEpgSources = [];
+            if (enableEpgInitial && epgSources.length) {
+                for (let index = 0; index < epgSources.length; index++) {
+                    const sourceUrl = epgSources[index];
                     try {
-                        epgTxt = await robustFetch(epgUrl, 'epg', true);
-                    } catch (epgFail) {
-                        appendDetail('⚠ EPG browser fetch failed → server fallback (details hidden for privacy).');
-                        epgTxt = await robustFetch(epgUrl, 'epg', false);
+                        let epgTxt;
+                        try { epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1), true); }
+                        catch { epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1), false); }
+                        const stats = quickEpgStats(epgTxt);
+                        epgStats.programmes += stats.programmes;
+                        epgStats.channels = Math.max(epgStats.channels, stats.channels);
+                        validEpgSources.push(sourceUrl);
+                        appendDetail('✔ EPG source ' + (index + 1) + ': ' + stats.programmes.toLocaleString() + ' programmes');
+                    } catch {
+                        appendDetail('⚠ EPG source ' + (index + 1) + ' failed; continuing with other sources.');
                     }
-                } catch (finalEpgErr) {
-                    appendDetail('✖ EPG fetch failed after both attempts – continuing WITHOUT EPG.');
-                    enableEpgFinal = false;
                 }
-
-                if (enableEpgFinal && epgTxt) {
-                    setProgress(50, 'Scanning EPG');
-                    epgStats = quickEpgStats(epgTxt);
-                    appendDetail(`✔ EPG scan: ${epgStats.programmes.toLocaleString()} programmes / ${epgStats.channels.toLocaleString()} channels`);
-                }
+                if (!validEpgSources.length) enableEpgFinal = false;
             } else if (enableEpgInitial) {
                 appendDetail('No EPG URL supplied; continuing without EPG.');
                 enableEpgFinal = false;
@@ -218,7 +226,10 @@
                 enableEpg: enableEpgFinal,
                 debug: debug || undefined
             };
-            if (enableEpgFinal && epgUrl) config.epgUrl = epgUrl;
+            if (enableEpgFinal && validEpgSources.length) {
+                config.epgUrl = validEpgSources[0];
+                config.epgUrls = validEpgSources.slice(1);
+            }
             if (isFinite(epgOffsetHours) && epgOffsetHours !== 0) config.epgOffsetHours = epgOffsetHours;
 
             config.prescan = {
