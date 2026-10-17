@@ -40,7 +40,7 @@ const CATALOG_GENRE_ALIASES = {
 };
 
 function normalizeGenre(value) {
-    return String(value || '').normalize('NFKC').trim().toLocaleLowerCase().replace(/\\s+/g, ' ');
+    return String(value || '').normalize('NFKC').trim().toLocaleLowerCase().replace(/\s+/g, ' ');
 }
 
 function catalogGenreMatches(item, selectedGenre, type) {
