@@ -154,7 +154,7 @@
       try {
         return await fetchTextBrowser(url, purpose);
       } catch (e) {
-        appendDetail(`⚠ Browser fetch failed (${e.message}) → server fallback`);
+        appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
       }
     }
     return await fetchTextServer(url, purpose);
@@ -257,7 +257,7 @@
           true,
         );
       } catch (lErr) {
-        appendDetail(`⚠ Live streams browser fetch failed: ${lErr.message}`);
+        appendDetail('⚠ Live streams browser fetch failed; trying server fallback.');
         liveJsonText = await robustFetch(
           `${base}&action=get_live_streams`,
           "live_streams",
@@ -282,7 +282,7 @@
           true,
         );
       } catch (vErr) {
-        appendDetail(`⚠ VOD browser fetch failed: ${vErr.message}`);
+        appendDetail('⚠ VOD browser fetch failed; trying server fallback.');
         vodJsonText = await robustFetch(
           `${base}&action=get_vod_streams`,
           "vod_streams",
@@ -325,13 +325,13 @@
             epgTxt = await robustFetch(epgSourceUrl, "epg", true);
           } catch (firstEpgErr) {
             appendDetail(
-              `⚠ EPG browser fetch failed: ${firstEpgErr.message} → server fallback`,
+              '⚠ EPG browser fetch failed → server fallback (details hidden for privacy).',
             );
             epgTxt = await robustFetch(epgSourceUrl, "epg", false);
           }
         } catch (finalEpgErr) {
           appendDetail(
-            `✖ EPG fetch failed after both attempts (${finalEpgErr.message}) – continuing WITHOUT EPG`,
+            '✖ EPG fetch failed after both attempts – continuing WITHOUT EPG.',
           );
           enableEpgFinal = false;
         }
@@ -391,7 +391,7 @@
 
       config.instanceId = config.instanceId || uuid();
 
-const { manifestUrl, stremioUrl } = await buildUrls(config);
+      const { manifestUrl, stremioUrl } = await buildUrls(config);
       appendDetail("✔ Token built");
       appendDetail("Secure manifest and Stremio links created (links hidden for privacy).");
 
