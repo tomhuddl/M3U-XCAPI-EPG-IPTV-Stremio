@@ -21,7 +21,7 @@ function encryptConfig(jsonStr) {
     const ciphertext = Buffer.concat([cipher.update(jsonStr, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     const payload = Buffer.concat([iv, tag, ciphertext]);
-    return 'enc:' + payload.toString('base64');
+    return 'enc:' + payload.toString('base64url');
 }
 
 /**
@@ -32,7 +32,7 @@ function decryptConfig(token) {
     const key = getSecret();
     if (!key) throw new Error('Encryption disabled');
     const b64 = token.slice(4);
-    const buf = Buffer.from(b64, 'base64');
+    const buf = Buffer.from(b64.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
     if (buf.length < 12 + 16 + 1) throw new Error('Bad payload');
     const iv = buf.subarray(0, 12);
     const tag = buf.subarray(12, 28);

@@ -107,7 +107,7 @@
         "Mixed content blocked (forcing server prefetch fallback)",
       );
     }
-    appendDetail(`→ (Browser) Fetching ${phaseLabel}: ${url}`);
+    appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
     const res = await fetch(url, { method: "GET" });
     if (!res.ok) throw new Error(`${phaseLabel} HTTP ${res.status}`);
     const txt = await res.text();
@@ -118,7 +118,7 @@
   }
 
   async function fetchTextServer(url, purpose) {
-    appendDetail(`→ (Server) Prefetch ${purpose}: ${url}`);
+    appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
     const res = await fetch("/api/prefetch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -154,7 +154,7 @@
       try {
         return await fetchTextBrowser(url, purpose);
       } catch (e) {
-        appendDetail(`⚠ Browser fetch failed (${e.message}) → server fallback`);
+        appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
       }
     }
     return await fetchTextServer(url, purpose);
@@ -257,7 +257,7 @@
           true,
         );
       } catch (lErr) {
-        appendDetail(`⚠ Live streams browser fetch failed: ${lErr.message}`);
+        appendDetail('⚠ Live streams browser fetch failed; trying server fallback.');
         liveJsonText = await robustFetch(
           `${base}&action=get_live_streams`,
           "live_streams",
@@ -282,7 +282,7 @@
           true,
         );
       } catch (vErr) {
-        appendDetail(`⚠ VOD browser fetch failed: ${vErr.message}`);
+        appendDetail('⚠ VOD browser fetch failed; trying server fallback.');
         vodJsonText = await robustFetch(
           `${base}&action=get_vod_streams`,
           "vod_streams",
@@ -325,13 +325,13 @@
             epgTxt = await robustFetch(epgSourceUrl, "epg", true);
           } catch (firstEpgErr) {
             appendDetail(
-              `⚠ EPG browser fetch failed: ${firstEpgErr.message} → server fallback`,
+              '⚠ EPG browser fetch failed → server fallback (details hidden for privacy).',
             );
             epgTxt = await robustFetch(epgSourceUrl, "epg", false);
           }
         } catch (finalEpgErr) {
           appendDetail(
-            `✖ EPG fetch failed after both attempts (${finalEpgErr.message}) – continuing WITHOUT EPG`,
+            '✖ EPG fetch failed after both attempts – continuing WITHOUT EPG.',
           );
           enableEpgFinal = false;
         }
@@ -391,13 +391,9 @@
 
       config.instanceId = config.instanceId || uuid();
 
-      const passHash = await sha256Fragment(password);
-      appendDetail(`Password hash fragment: ${passHash}`);
-
-      const { manifestUrl, stremioUrl } = buildUrls(config);
+      const { manifestUrl, stremioUrl } = await buildUrls(config);
       appendDetail("✔ Token built");
-      appendDetail("Manifest URL: " + manifestUrl);
-      appendDetail("Stremio URL: " + stremioUrl);
+      appendDetail("Secure manifest and Stremio links created (links hidden for privacy).");
 
       setProgress(70, "Waiting for manifest");
       appendDetail("== SERVER BUILD PHASE ==");
