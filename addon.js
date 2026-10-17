@@ -520,13 +520,7 @@ class M3UEPGAddon {
         return {
             url: item.url,
             title: item.type === 'tv' ? `${item.name} - Live` : item.name,
-            behaviorHints: item.type === 'tv'
-                ? {
-                    notWebReady: true,
-                    // Diagnostic: tell Stremio's stream proxy the upstream live response is MPEG-TS.
-                    proxyHeaders: { response: { 'Content-Type': 'video/mp2t' } }
-                }
-                : { notWebReady: true }
+            behaviorHints: { notWebReady: true }
         };
     }
 
