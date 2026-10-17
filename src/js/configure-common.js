@@ -206,6 +206,51 @@
         return { token, manifestUrl, stremioUrl };
     }
 
+
+    async function prefillIfReconfigure(provider) {
+        const parts = window.location.pathname.split('/').filter(Boolean);
+        const token = parts[0];
+        if (!token || token === 'configure-direct' || token === 'configure-xtream') return;
+        try {
+            const response = await fetch('/' + encodeURIComponent(token) + '/configuration.json', { cache: 'no-store' });
+            if (!response.ok) throw new Error('Could not load saved configuration');
+            const config = await response.json();
+            const setValue = (id, value) => {
+                const el = document.getElementById(id);
+                if (el && value !== undefined && value !== null) el.value = value;
+            };
+            const setChecked = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = !!value;
+            };
+            setValue('m3uUrl', config.m3uUrl);
+            setValue('epgUrl', config.epgUrl);
+            setValue('epgUrls', Array.isArray(config.epgUrls) ? config.epgUrls.join('\n') : '');
+            setValue('epgOffsetHours', config.epgOffsetHours);
+            setChecked('enableEpg', config.enableEpg !== false);
+            setChecked('debugMode', config.debug);
+            setValue('xtreamUrl', config.xtreamUrl);
+            setValue('xtreamUsername', config.xtreamUsername);
+            setValue('xtreamPassword', config.xtreamPassword);
+            setChecked('xtreamUseM3U', config.xtreamUseM3U);
+            setValue('xtreamOutput', config.xtreamOutput);
+            const mode = config.provider === 'xtream' ? (config.epgUrl ? 'custom' : 'xtream') : 'custom';
+            document.querySelectorAll('input[name="epgMode"]').forEach(el => { el.checked = el.value === mode; });
+            const pwd = document.getElementById('xtreamPassword');
+            if (pwd) pwd.dataset.original = config.xtreamPassword || '';
+            const outputGroup = document.getElementById('xtreamOutputGroup');
+            if (outputGroup) outputGroup.classList.toggle('hidden', !config.xtreamUseM3U);
+            const customGroup = document.getElementById('customEpgGroup');
+            if (customGroup) customGroup.classList.toggle('hidden', !(config.enableEpg !== false && mode === 'custom'));
+            const submit = document.querySelector('#directForm button[type="submit"], #xtreamForm button[type="submit"]');
+            if (submit) submit.textContent = provider === 'xtream' ? 'Save / Update Addon' : 'Save / Update Addon';
+            appendDetail('Existing settings loaded. You can edit them and generate an updated addon link.');
+        } catch (error) {
+            console.warn('[CONFIGURE] Could not prefill settings:', error.message);
+            appendDetail('Could not load saved settings. You can still configure a new addon.');
+        }
+    }
+
     /* -------- Public API -------- */
 
     window.ConfigureCommon = {
@@ -213,6 +258,7 @@
         hideOverlay,
         startPolling,
         buildUrls,
+        prefillIfReconfigure,
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,
         appendDetail,
