@@ -38,7 +38,7 @@ function normalizeGenre(value) {
     return String(value ?? '')
         .normalize('NFKC')
         .trim()
-        .replace(/\\s+/g, ' ')
+        .replace(/\s+/g, ' ')
         .toLowerCase();
 }
 
