@@ -38,7 +38,7 @@
     }
 
     async function fetchTextBrowser(url, phaseLabel) {
-        appendDetail(`→ (Browser) Fetching ${phaseLabel}: ${url}`);
+        appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
         const res = await fetch(url, { method: 'GET' });
         if (!res.ok) throw new Error(`${phaseLabel} HTTP ${res.status}`);
         const txt = await res.text();
@@ -47,7 +47,7 @@
     }
 
     async function fetchTextServer(url, purpose) {
-        appendDetail(`→ (Server) Prefetch ${purpose}: ${url}`);
+        appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
         const res = await fetch('/api/prefetch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -153,8 +153,8 @@
         overlaySetMessage('Pre-flight: Validating inputs…');
         setProgress(4, 'Starting');
         appendDetail('== PRE-FLIGHT CHECKS ==');
-        appendDetail(`M3U URL: ${m3uUrl}`);
-        if (enableEpgInitial && epgUrl) appendDetail(`EPG URL: ${epgUrl}`);
+        appendDetail('M3U URL supplied (hidden for privacy).');
+        if (enableEpgInitial && epgUrl) appendDetail('EPG URL supplied (hidden for privacy).');
         appendDetail(`Debug logging: ${debug ? 'enabled' : 'disabled'}`);
 
         let enableEpgFinal = enableEpgInitial;
@@ -231,10 +231,9 @@
 
             config.instanceId = config.instanceId || uuid();
 
-            const { manifestUrl, stremioUrl } = buildUrls(config);
+            const { manifestUrl, stremioUrl } = await buildUrls(config);
             appendDetail('✔ Token built');
-            appendDetail('Manifest URL: ' + manifestUrl);
-            appendDetail('Stremio URL: ' + stremioUrl);
+            appendDetail('Secure manifest and Stremio links created (links hidden for privacy).');
 
             // 5. Start manifest polling
             setProgress(70, 'Waiting for manifest');
