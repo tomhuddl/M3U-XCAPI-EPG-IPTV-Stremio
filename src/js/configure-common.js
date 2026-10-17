@@ -225,6 +225,8 @@
             };
             setValue('m3uUrl', config.m3uUrl);
             setValue('epgUrl', config.epgUrl);
+            // Xtream uses a separate input for the primary custom EPG URL.
+            setValue('customEpgUrl', config.epgUrl);
             setValue('epgUrls', Array.isArray(config.epgUrls) ? config.epgUrls.join('\n') : '');
             setValue('epgOffsetHours', config.epgOffsetHours);
             setChecked('enableEpg', config.enableEpg !== false);
