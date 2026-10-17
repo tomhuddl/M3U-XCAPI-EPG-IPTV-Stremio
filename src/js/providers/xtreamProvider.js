@@ -205,25 +205,38 @@ async function fetchData(addonInstance) {
     }
   }
 
-  // EPG handling:
+  // Merge the selected primary XMLTV feed with any additional feeds.
   if (config.enableEpg) {
-    const customEpgUrl =
-      config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
-        ? config.epgUrl.trim()
-        : null;
-    const epgSource = customEpgUrl
-      ? customEpgUrl
-      : `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
-
-    try {
-      const epgResp = await fetch(epgSource, { timeout: 45000 });
-      if (epgResp.ok) {
-        const epgContent = await epgResp.text();
-        addonInstance.epgData = await addonInstance.parseEPG(epgContent);
+    const customEpgUrl = config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
+      ? config.epgUrl.trim() : null;
+    const primaryEpgUrl = customEpgUrl || `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
+    const epgSources = [...new Set([primaryEpgUrl, ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
+    const merged = {};
+    for (const sourceUrl of epgSources) {
+      try {
+        const epgResp = await fetch(sourceUrl, { timeout: 45000 });
+        if (!epgResp.ok) continue;
+        const parsed = await addonInstance.parseEPG(await epgResp.text());
+        for (const [channelId, programmes] of Object.entries(parsed)) {
+          if (!merged[channelId]) merged[channelId] = [];
+          merged[channelId].push(...programmes);
+        }
+      } catch {
+        // Keep data from other feeds if this source is unavailable.
       }
-    } catch {
-      // Ignore EPG errors
     }
+    for (const channelId of Object.keys(merged)) {
+      const seen = new Set();
+      merged[channelId] = merged[channelId]
+        .filter(programme => {
+          const key = [programme.start, programme.stop, programme.title].join('|');
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .sort((a, b) => String(a.start).localeCompare(String(b.start)));
+    }
+    addonInstance.epgData = merged;
   }
 }
 
