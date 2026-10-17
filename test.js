@@ -5,6 +5,7 @@ const { encryptConfig, decryptConfig, tryParseConfigToken } = require("./cryptoC
 const LRUCache = require("./lruCache");
 const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSafety");
 const { validateConfig } = require("./configValidation");
+const { normalizeGenre, matchesGenre } = require("./addon");
 
 function testEncryptedConfigRoundTrip() {
     const config = {
@@ -42,6 +43,19 @@ function testLegacyTokensRequireExplicitOptIn() {
     process.env.ALLOW_LEGACY_CONFIG_TOKENS = "true";
     assert.deepStrictEqual(tryParseConfigToken(legacy), { provider: "direct", m3uUrl: "https://example.com/list.m3u" });
     delete process.env.ALLOW_LEGACY_CONFIG_TOKENS;
+}
+
+function testGenreMatchingIgnoresCaseAndWhitespace() {
+    assert.strictEqual(normalizeGenre(" Peacock "), "peacock");
+    assert.strictEqual(normalizeGenre("PEACOCK"), "peacock");
+    assert.strictEqual(normalizeGenre("Peacock\\u00a0"), "peacock");
+    assert.strictEqual(matchesGenre("Peacock", "Peacock"), true);
+    assert.strictEqual(matchesGenre("  PEACOCK  ", "Peacock"), true);
+    assert.strictEqual(matchesGenre("Peacock\\u00a0", "Peacock"), true);
+    assert.strictEqual(matchesGenre("USA | Peacock", "Peacock"), false);
+    assert.strictEqual(matchesGenre("Peacock Plus", "Peacock"), false);
+    assert.strictEqual(matchesGenre("TNT Sports", "Peacock"), false);
+    assert.strictEqual(normalizeGenre("All   Channels"), "all channels");
 }
 
 function testConfigValidation() {
@@ -127,6 +141,7 @@ async function main() {
         testMalformedTokensAreRejected,
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
+        testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
         testLruEvictionAndPromotion,
         testLruExpiry,
