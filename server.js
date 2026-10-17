@@ -65,15 +65,16 @@ app.use((req, res, next) => {
 
 // Encryption endpoint
 app.post("/encrypt", (req, res) => {
-  if (!process.env.CONFIG_SECRET) {
-    return res
-      .status(400)
-      .json({
-        error: "Encryption not enabled on server (CONFIG_SECRET missing)",
-      });
+  if (!process.env.CONFIG_SECRET || process.env.CONFIG_SECRET.length < 16) {
+    return res.status(503).json({
+      error: "Secure token creation is unavailable. CONFIG_SECRET must be at least 16 characters.",
+    });
+  }
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    return res.status(400).json({ error: "Config payload must be a JSON object" });
   }
   try {
-    const jsonStr = JSON.stringify(req.body || {});
+    const jsonStr = JSON.stringify(req.body);
     const token = encryptConfig(jsonStr);
     if (!token) return res.status(500).json({ error: "Encrypt failed" });
     res.json({ token });
@@ -113,7 +114,7 @@ app.post("/api/prefetch", async (req, res) => {
       return res.status(400).json({ error: "Blocked host" });
     }
 
-    dlog("Prefetch start", { url, purpose });
+    dlog("Prefetch start", { purpose });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 45000);
@@ -130,7 +131,7 @@ app.post("/api/prefetch", async (req, res) => {
     }
 
     if (!fetched.ok) {
-      dlog("Prefetch non-OK", fetched.status, url);
+      dlog("Prefetch non-OK", fetched.status);
       return res
         .status(502)
         .json({ error: `Fetch failed (${fetched.status})` });
@@ -258,7 +259,7 @@ app.use("/:token", async (req, res, next) => {
   try {
     config = maybeDecryptConfig(token);
   } catch (e) {
-    dlog("Config parse failed", token, e.message);
+    dlog("Config parse failed", e.message);
     return res.status(400).json({ error: "Invalid configuration token" });
   }
   if (!config.provider)
@@ -303,7 +304,7 @@ app.use("/:token", async (req, res, next) => {
 
   req.addonInterface = iface;
   req.configToken = token;
-  dlog("Request", req.method, req.originalUrl);
+  dlog("Addon request", req.method, req.path);
   next();
 });
 
