@@ -69,6 +69,7 @@ function createCacheKey(config) {
         provider: config.provider,
         m3uUrl: config.m3uUrl,
         epgUrl: config.epgUrl,
+        epgUrls: Array.isArray(config.epgUrls) ? config.epgUrls : [],
         enableEpg: !!config.enableEpg,
         xtreamUrl: config.xtreamUrl,
         xtreamUsername: config.xtreamUsername,
