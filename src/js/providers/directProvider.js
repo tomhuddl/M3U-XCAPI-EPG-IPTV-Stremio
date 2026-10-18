@@ -51,7 +51,7 @@ async function fetchData(addonInstance) {
     let playlistText;
     {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000);
+        const timeout = setTimeout(() => controller.abort(), 120000);
         try {
             const resp = await fetch(m3uUrl, {
                 signal: controller.signal,
