@@ -37,6 +37,7 @@
     forceDisableActions,
     prefillIfReconfigure,
     robustFetch,
+    checkEpgStats,
     quickEpgStats,
   } = window.ConfigureCommon || {};
 
@@ -214,12 +215,10 @@
       if (enableEpgInitial) {
         for (let index = 0; index < epgSources.length; index++) {
           try {
-            const epgTxt = await robustFetch(epgSources[index], "epg " + (index + 1));
-            const stats = quickEpgStats(epgTxt);
+            const stats = await checkEpgStats(epgSources[index], index + 1);
             validEpgSources.push(epgSources[index]);
-            appendDetail("✔ EPG source " + (index + 1) + ": " + stats.programmes.toLocaleString() + " programmes");
-          } catch {
-            appendDetail("⚠ EPG source " + (index + 1) + " failed; continuing with other sources.");
+          } catch (error) {
+            appendDetail("⚠ EPG source " + (index + 1) + " failed: " + (error.message || "check failed") + "; continuing with other sources.");
           }
         }
         if (!validEpgSources.length) enableEpgFinal = false;
