@@ -4,6 +4,7 @@
 // - fetchSeriesInfo lazily queries per-series episodes (get_series_info)
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
+const { parseEPGStream } = require("../epgStreamParser");
 
 async function fetchData(addonInstance) {
   const { config } = addonInstance;
@@ -214,9 +215,16 @@ async function fetchData(addonInstance) {
     const merged = {};
     for (const sourceUrl of epgSources) {
       try {
-        const epgResp = await fetch(sourceUrl, { timeout: 45000 });
-        if (!epgResp.ok) continue;
-        const parsed = await addonInstance.parseEPG(await epgResp.text());
+        const epgResp = await fetch(sourceUrl, { timeout: 120000 });
+        if (!epgResp.ok || !epgResp.body) {
+          if (epgResp.body) epgResp.body.destroy();
+          continue;
+        }
+        const allowedIds = new Set(addonInstance.channels
+          .map(channel => channel.attributes?.["tvg-id"] || channel.attributes?.["tvg-name"])
+          .filter(Boolean)
+          .map(String));
+        const parsed = await parseEPGStream(epgResp.body, allowedIds);
         for (const [channelId, programmes] of Object.entries(parsed)) {
           if (!merged[channelId]) merged[channelId] = [];
           merged[channelId].push(...programmes);
