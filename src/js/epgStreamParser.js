@@ -64,7 +64,7 @@ function parseEPGStream(readable, allowedChannelIds) {
         });
         xml.on('cdata', (value) => {
             if (current && current.keep && field) {
-                if (field === 'title') current.title = current.title === 'Unknown' ? value : current.title + value;
+                if (field === 'title') { titleText += value; current.title = titleText; }
                 else current.desc += value;
             }
         });
@@ -77,7 +77,7 @@ function parseEPGStream(readable, allowedChannelIds) {
             if (current.keep && current.start && current.stop) {
                 programmeCount += 1;
                 if (programmeCount > MAX_PROGRAMMES_PER_SOURCE) {
-                    finish(new Error('EPG source exceeds the 250,000 retained-programme safety limit'));
+                    finish(new Error('EPG source exceeds the 150,000 retained-programme safety limit'));
                     readable.destroy();
                     return;
                 }
