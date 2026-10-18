@@ -406,6 +406,7 @@
         buildUrls,
         prefillIfReconfigure,
         robustFetch,
+        checkEpgStats,
         quickEpgStats,
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,
