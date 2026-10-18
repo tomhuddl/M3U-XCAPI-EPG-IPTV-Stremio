@@ -97,6 +97,86 @@ app.post("/encrypt", (req, res) => {
 
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
 
+// Stream-count XMLTV programmes without retaining the feed in memory.
+app.post("/api/epg-stats", async (req, res) => {
+  const { url } = req.body || {};
+  if (typeof url !== "string" || !url || url.length > 8192) {
+    return res.status(400).json({ error: "A valid EPG URL is required" });
+  }
+
+  const controller = new AbortController();
+  let totalBytes = 0;
+  let programmeCount = 0;
+  let tail = "";
+  const MAX_EPG_SCAN_BYTES = 800 * 1024 * 1024;
+  try {
+    const response = await safeFetch(url, {
+      method: "GET",
+      timeout: 120000,
+      signal: controller.signal,
+      headers: { "User-Agent": "IPTV-Stremio-Addon EPG preflight/1.0" },
+    });
+    if (!response.ok) {
+      if (response.body) response.body.destroy();
+      return res.status(502).json({ error: "EPG source returned HTTP " + response.status });
+    }
+    if (!response.body) return res.status(502).json({ error: "EPG source returned an empty response" });
+
+    const body = response.body;
+    const countTags = (text, cutoff) => {
+      const re = /<programme(?:\\s|>)/gi;
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        if (match.index >= cutoff) break;
+        programmeCount++;
+      }
+    };
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        error ? reject(error) : resolve();
+      };
+      body.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_EPG_SCAN_BYTES) {
+          controller.abort();
+          body.destroy();
+          finish(new Error("EPG source exceeds the 800 MB preflight scan limit"));
+          return;
+        }
+        const combined = tail + chunk.toString("utf8");
+        const cutoff = Math.max(0, combined.length - 40);
+        countTags(combined, cutoff);
+        tail = combined.slice(cutoff);
+      });
+      body.on("end", () => {
+        countTags(tail, tail.length + 1);
+        finish();
+      });
+      body.on("error", (error) => finish(error));
+      body.on("close", () => {
+        if (!settled) finish(new Error("EPG response closed before completion"));
+      });
+    });
+
+    res.json({ ok: true, bytes: totalBytes, programmes: programmeCount });
+  } catch (error) {
+    const tooLarge = error && /800 MB/.test(error.message || "");
+    const timedOut = error && error.name === "AbortError";
+    if (!res.headersSent) {
+      res.status(tooLarge ? 413 : timedOut ? 504 : 502).json({
+        error: tooLarge ? "EPG source exceeds the 800 MB preflight scan limit"
+          : timedOut ? "EPG preflight timed out after 120 seconds"
+          : "EPG source could not be checked",
+      });
+    }
+  }
+});
+
+
 /**
  * Server-side prefetch for playlist / EPG pre-flight.
  * Every redirect is checked separately; the timeout covers DNS and body reads.
