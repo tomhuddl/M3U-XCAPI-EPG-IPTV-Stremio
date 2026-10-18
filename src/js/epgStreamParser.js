@@ -2,7 +2,8 @@
 
 const sax = require('sax');
 
-const MAX_PROGRAMMES_PER_SOURCE = 250000;
+const MAX_PROGRAMMES_PER_SOURCE = 150000;
+const MAX_EPG_BYTES = 800 * 1024 * 1024;
 
 /**
  * Parse XMLTV from a Node readable stream. XML bytes are consumed incrementally;
@@ -15,6 +16,8 @@ function parseEPGStream(readable, allowedChannelIds) {
         let current = null;
         let field = null;
         let programmeCount = 0;
+        let bytesRead = 0;
+        let titleText = '';
         let settled = false;
         const xml = sax.createStream(true, { trim: true, normalize: true });
 
@@ -35,7 +38,7 @@ function parseEPGStream(readable, allowedChannelIds) {
                         channel: String(channel),
                         start: attrs.start || '',
                         stop: attrs.stop || '',
-                        title: 'Unknown',
+                        title: '',
                         desc: '',
                         keep: true
                     }
@@ -49,12 +52,13 @@ function parseEPGStream(readable, allowedChannelIds) {
                 if (name === 'title') current.hasTitle = true;
                 else current.hasDesc = true;
                 field = name;
+                if (name === 'title') titleText = '';
             }
         });
 
         xml.on('text', (value) => {
             if (current && current.keep && field) {
-                if (field === 'title') current.title = current.title === 'Unknown' ? value : current.title + value;
+                if (field === 'title') { titleText += value; current.title = titleText; }
                 else current.desc += value;
             }
         });
@@ -94,9 +98,16 @@ function parseEPGStream(readable, allowedChannelIds) {
             finish(new Error('Invalid XMLTV data: ' + error.message));
         });
         xml.on('end', () => finish());
+        readable.on('data', (chunk) => {
+            bytesRead += chunk.length;
+            if (bytesRead > MAX_EPG_BYTES) {
+                finish(new Error('EPG source exceeds the 800 MB streaming limit'));
+                readable.destroy();
+            }
+        });
         readable.on('error', finish);
         readable.pipe(xml);
     });
 }
 
-module.exports = { parseEPGStream, MAX_PROGRAMMES_PER_SOURCE };
+module.exports = { parseEPGStream, MAX_PROGRAMMES_PER_SOURCE, MAX_EPG_BYTES };
