@@ -287,6 +287,33 @@
         }
     }
 
+
+    async function checkEpgStats(url, sourceNumber) {
+        appendDetail(`→ Streaming EPG source ${sourceNumber} (URL hidden for privacy)`);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 125000);
+        try {
+            const response = await fetch('/api/epg-stats', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url }),
+                signal: controller.signal
+            });
+            let payload = {};
+            try { payload = await response.json(); } catch { /* report HTTP status below */ }
+            if (!response.ok || !payload.ok) {
+                throw new Error(payload.error || `EPG check failed (HTTP ${response.status})`);
+            }
+            appendDetail(`✔ EPG source ${sourceNumber}: ${Number(payload.programmes || 0).toLocaleString()} programmes (${Number(payload.bytes || 0).toLocaleString()} bytes streamed)`);
+            return { programmes: Number(payload.programmes || 0), bytes: Number(payload.bytes || 0) };
+        } catch (error) {
+            if (controller.signal.aborted) throw new Error('EPG preflight timed out');
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
     async function robustFetch(url, purpose, browserFirst = true) {
         const mixedContent = window.location.protocol === 'https:' && /^http:\/\//i.test(url);
         if (browserFirst && !mixedContent) {
@@ -310,7 +337,7 @@
         let payload = {};
         try { payload = await response.json(); } catch { /* handled below */ }
         if (!response.ok || typeof payload.token !== 'string' || !payload.token.startsWith('enc:')) {
-            throw new Error(payload.error || 'Secure token creation failed. Configure CONFIG_SECRET on the server (at least 16 characters) and redeploy.');
+            throw new Error(payload.error || (response.ok ? 'Token endpoint returned an invalid response.' : `Token endpoint failed (HTTP ${response.status}). Check the server logs before changing CONFIG_SECRET.`));
         }
         const token = payload.token;
         const origin = window.location.origin;
@@ -379,6 +406,7 @@
         buildUrls,
         prefillIfReconfigure,
         robustFetch,
+        checkEpgStats,
         quickEpgStats,
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,

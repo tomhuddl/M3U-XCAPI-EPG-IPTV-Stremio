@@ -5,6 +5,8 @@ const { encryptConfig, decryptConfig, tryParseConfigToken } = require("./cryptoC
 const LRUCache = require("./lruCache");
 const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSafety");
 const { validateConfig } = require("./configValidation");
+const { Readable } = require("stream");
+const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { normalizeGenre, matchesGenre } = require("./addon");
 
 function testEncryptedConfigRoundTrip() {
@@ -134,6 +136,24 @@ async function testPrivateDestinationsAreRejected() {
     assert.strictEqual(withCredentials[0].address, "8.8.8.8");
 }
 
+async function testStreamingEpgParser() {
+    const xml = [
+        '<?xml version="1.0"?>',
+        '<tv>',
+        '<programme start="20261018120000 +0000" stop="20261018130000 +0000" channel="channel.one">',
+        '<title lang="en">News &amp; Weather</title><desc>First <![CDATA[and second]]> part.</desc>',
+        '</programme>',
+        '<programme start="20261018130000 +0000" stop="20261018140000 +0000" channel="unused.channel">',
+        '<title>Should not be retained</title></programme>',
+        '</tv>'
+    ].join('');
+    const parsed = await parseEPGStream(Readable.from([xml.slice(0, 37), xml.slice(37, 112), xml.slice(112)]), new Set(['channel.one']));
+    assert.deepStrictEqual(Object.keys(parsed), ['channel.one']);
+    assert.strictEqual(parsed['channel.one'].length, 1);
+    assert.strictEqual(parsed['channel.one'][0].title, 'News & Weather');
+    assert.strictEqual(parsed['channel.one'][0].desc, 'First and second part.');
+}
+
 async function main() {
     const tests = [
         testEncryptedConfigRoundTrip,
@@ -141,6 +161,7 @@ async function main() {
         testMalformedTokensAreRejected,
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
+        testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
         testLruEvictionAndPromotion,

@@ -4,6 +4,7 @@
 // Episodes are stored in addonInstance.directSeriesEpisodeIndex for quick meta/stream resolution.
 
 const { safeFetch: fetch } = require('../../../urlSafety');
+const { parseEPGStream } = require('../epgStreamParser');
 const crypto = require('crypto');
 
 function hash(str) {
@@ -50,7 +51,7 @@ async function fetchData(addonInstance) {
     let playlistText;
     {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45000);
+        const timeout = setTimeout(() => controller.abort(), 120000);
         try {
             const resp = await fetch(m3uUrl, {
                 signal: controller.signal,
@@ -132,27 +133,31 @@ async function fetchData(addonInstance) {
         for (const sourceUrl of epgSources) {
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 45000);
+                const timeout = setTimeout(() => controller.abort(), 120000);
                 let epgResp;
-                let epgText;
                 try {
                     epgResp = await fetch(sourceUrl, {
                         signal: controller.signal,
+                        timeout: 120000,
                         headers: { 'User-Agent': 'Stremio M3U/EPG Addon (directProvider/epg)' }
                     });
-                    if (!epgResp || !epgResp.ok) {
+                    if (!epgResp || !epgResp.ok || !epgResp.body) {
                         if (epgResp?.body) epgResp.body.destroy();
                         continue;
                     }
-                    epgText = await epgResp.text();
+                    const allowedIds = new Set(addonInstance.channels
+                        .map(channel => channel.attributes?.['tvg-id'] || channel.attributes?.['tvg-name'])
+                        .filter(Boolean)
+                        .map(String));
+                    const parsed = await parseEPGStream(epgResp.body, allowedIds);
+                    for (const [channelId, programmes] of Object.entries(parsed)) {
+                        if (!merged[channelId]) merged[channelId] = [];
+                        merged[channelId].push(...programmes);
+                    }
                 } finally {
                     clearTimeout(timeout);
                 }
-                const parsed = await addonInstance.parseEPG(epgText);
-                for (const [channelId, programmes] of Object.entries(parsed)) {
-                    if (!merged[channelId]) merged[channelId] = [];
-                    merged[channelId].push(...programmes);
-                }
+                continue;
             } catch {
                 // Keep any data already obtained from other feeds.
             }
