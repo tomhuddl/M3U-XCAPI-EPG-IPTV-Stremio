@@ -133,7 +133,7 @@ async function fetchData(addonInstance) {
         for (const sourceUrl of epgSources) {
             try {
                 const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 45000);
+                const timeout = setTimeout(() => controller.abort(), 120000);
                 let epgResp;
                 try {
                     epgResp = await fetch(sourceUrl, {
