@@ -19,7 +19,7 @@ function parseEPGStream(readable, allowedChannelIds) {
         let bytesRead = 0;
         let titleText = '';
         let settled = false;
-        const xml = sax.createStream(true, { trim: true, normalize: true });
+        const xml = sax.createStream(true, { trim: false, normalize: false });
 
         const finish = (error) => {
             if (settled) return;
@@ -85,8 +85,8 @@ function parseEPGStream(readable, allowedChannelIds) {
                 epgData[current.channel].push({
                     start: current.start,
                     stop: current.stop,
-                    title: current.title || 'Unknown',
-                    desc: current.desc || ''
+                    title: (current.title || 'Unknown').trim(),
+                    desc: (current.desc || '').trim()
                 });
             }
             current = null;
