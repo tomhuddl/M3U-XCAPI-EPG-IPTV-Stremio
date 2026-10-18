@@ -124,7 +124,7 @@ app.post("/api/epg-stats", async (req, res) => {
 
     const body = response.body;
     const countTags = (text, cutoff) => {
-      const re = /<programme(?:\\s|>)/gi;
+      const re = /<programme(?:\s|>)/gi;
       let match;
       while ((match = re.exec(text)) !== null) {
         if (match.index >= cutoff) break;
