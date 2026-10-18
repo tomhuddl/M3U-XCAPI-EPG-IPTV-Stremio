@@ -99,11 +99,19 @@ const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlS
 
 // Stream-count XMLTV programmes without retaining the feed in memory.
 app.post("/api/epg-stats", async (req, res) => {
+  if (!PREFETCH_ENABLED) {
+    return res.status(403).json({ error: "Prefetch disabled by server" });
+  }
+  if (activePrefetches >= MAX_ACTIVE_PREFETCHES) {
+    res.setHeader("Retry-After", "5");
+    return res.status(503).json({ error: "EPG preflight capacity reached; retry shortly" });
+  }
   const { url } = req.body || {};
   if (typeof url !== "string" || !url || url.length > 8192) {
     return res.status(400).json({ error: "A valid EPG URL is required" });
   }
 
+  activePrefetches += 1;
   const controller = new AbortController();
   let totalBytes = 0;
   let programmeCount = 0;
@@ -173,6 +181,8 @@ app.post("/api/epg-stats", async (req, res) => {
           : "EPG source could not be checked",
       });
     }
+  } finally {
+    activePrefetches = Math.max(0, activePrefetches - 1);
   }
 });
 
