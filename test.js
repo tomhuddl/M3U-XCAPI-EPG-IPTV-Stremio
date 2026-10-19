@@ -7,7 +7,8 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSaf
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
-const { normalizeGenre, matchesGenre } = require("./addon");
+const { normalizeGenre, matchesGenre, applyCinemaMetadata } = require("./addon");
+const { normalizeXtreamInfo } = require("./src/js/providers/xtreamProvider");
 
 function testEncryptedConfigRoundTrip() {
     const config = {
@@ -58,6 +59,56 @@ function testGenreMatchingIgnoresCaseAndWhitespace() {
     assert.strictEqual(matchesGenre("Peacock Plus", "Peacock"), false);
     assert.strictEqual(matchesGenre("TNT Sports", "Peacock"), false);
     assert.strictEqual(normalizeGenre("All   Channels"), "all channels");
+}
+
+
+function testXtreamMovieMetadataNormalization() {
+    const metadata = normalizeXtreamInfo({
+        duration: "123.5",
+        releaseDate: "2024-06-15",
+        rating: "8.4",
+        plot: "A test plot",
+        genre: "Drama, Mystery",
+        cast: "Actor One, Actor Two",
+        director: "Director One",
+        backdrop_path: ["https://example.com/backdrop.jpg"]
+    }, {
+        stream_icon: "https://example.com/poster.jpg",
+        imdb_id: "tt1234567"
+    });
+
+    assert.strictEqual(metadata.runtime, "124 min");
+    assert.strictEqual(metadata.year, 2024);
+    assert.strictEqual(metadata.imdbRating, "8.4");
+    assert.strictEqual(metadata.description, "A test plot");
+    assert.deepStrictEqual(metadata.genres, ["Drama", "Mystery"]);
+    assert.deepStrictEqual(metadata.cast, ["Actor One", "Actor Two"]);
+    assert.deepStrictEqual(metadata.director, ["Director One"]);
+    assert.strictEqual(metadata.poster, "https://example.com/poster.jpg");
+    assert.strictEqual(metadata.background, "https://example.com/backdrop.jpg");
+    assert.strictEqual(metadata.imdbId, "tt1234567");
+}
+
+function testCinemaMetadataAppliedToStremioMeta() {
+    const meta = applyCinemaMetadata({ id: "iptv_vod_1", type: "movie", name: "Example" }, {
+        year: 2022,
+        runtime: "01:45:00",
+        rating: 7.7,
+        actors: "Actor One, Actor Two",
+        directors: ["Director One"],
+        genres: "Action, Thriller",
+        plot: "Example synopsis"
+    });
+
+    assert.strictEqual(meta.year, 2022);
+    assert.strictEqual(meta.releaseInfo, "2022");
+    assert.strictEqual(meta.runtime, "105 min");
+    assert.strictEqual(meta.imdbRating, "7.7");
+    assert.deepStrictEqual(meta.cast, ["Actor One", "Actor Two"]);
+    assert.deepStrictEqual(meta.director, ["Director One"]);
+    assert.deepStrictEqual(meta.genres, ["Action", "Thriller"]);
+    assert.strictEqual(meta.description, "Example synopsis");
+    assert.ok(meta.links.some(link => link.category === "actor" && link.name === "Actor One"));
 }
 
 function testConfigValidation() {
@@ -161,6 +212,8 @@ async function main() {
         testMalformedTokensAreRejected,
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
+        testXtreamMovieMetadataNormalization,
+        testCinemaMetadataAppliedToStremioMeta,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
