@@ -118,6 +118,49 @@ function createCacheKey(config) {
     return crypto.createHash('sha256').update(stableStringify(minimal)).digest('hex');
 }
 
+function metadataNames(value) {
+    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+    if (typeof value !== 'string') return [];
+    return value.split(/[,|;]/).map(v => v.trim()).filter(Boolean);
+}
+
+function metadataRuntime(value) {
+    if (value == null || value === '') return undefined;
+    if (typeof value === 'number' && Number.isFinite(value)) return `${Math.round(value)}m`;
+    const raw = String(value).trim();
+    if (!raw) return undefined;
+    if (/^\\d+$/.test(raw)) return `${raw}m`;
+    return raw;
+}
+
+function applyCinemaMetadata(meta, item) {
+    const year = Number(item.year);
+    if (Number.isInteger(year) && year >= 1888 && year <= 2200) {
+        meta.year = year;
+        meta.releaseInfo = String(year);
+    }
+    const rating = Number(item.rating);
+    if (item.rating != null && item.rating !== '' && Number.isFinite(rating) && rating >= 0 && rating <= 10) {
+        meta.imdbRating = rating.toFixed(1);
+    }
+    const runtime = metadataRuntime(item.runtime);
+    if (runtime) meta.runtime = runtime;
+    const directors = metadataNames(item.director || item.directors);
+    const cast = metadataNames(item.cast || item.actors);
+    const genres = metadataNames(item.genre || item.genres);
+    if (directors.length) meta.director = directors;
+    if (cast.length) meta.cast = cast;
+    if (genres.length) meta.genres = genres;
+    const links = [
+        ...cast.map(name => ({ name, category: 'actor', url: name })),
+        ...directors.map(name => ({ name, category: 'director', url: name })),
+        ...genres.map(name => ({ name, category: 'genre', url: name }))
+    ];
+    if (links.length) meta.links = links;
+    if (item.backdrop) meta.background = Array.isArray(item.backdrop) ? item.backdrop[0] : item.backdrop;
+    return meta;
+}
+
 class M3UEPGAddon {
     constructor(config = {}, manifestRef) {
         if (!config.provider) {
@@ -576,7 +619,7 @@ class M3UEPGAddon {
             return video;
         });
 
-        return {
+        return applyCinemaMetadata({
             id: seriesItem.id,
             type: 'series',
             name: seriesItem.name,
@@ -584,11 +627,11 @@ class M3UEPGAddon {
                 seriesItem.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
             description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-            genres: seriesItem.category
+            genres: metadataNames(seriesItem.genre).length ? metadataNames(seriesItem.genre) : (seriesItem.category
                 ? [seriesItem.category]
-                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series'])),
             videos
-        };
+        }, seriesItem);
     }
 
     async getDetailedMetaAsync(id, type) {
@@ -625,16 +668,16 @@ class M3UEPGAddon {
                 if (m) year = parseInt(m[1]);
             }
             const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
-            return {
+            return applyCinemaMetadata({
                 id: item.id,
                 type: 'movie',
                 name: item.name,
                 poster: item.poster || item.attributes?.['tvg-logo'] ||
                     `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`,
                 description,
-                genres: item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'],
+                genres: metadataNames(item.genre).length ? metadataNames(item.genre) : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie']),
                 year
-            };
+            }, item);
         }
     }
 }
