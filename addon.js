@@ -126,38 +126,61 @@ function metadataNames(value) {
 
 function metadataRuntime(value) {
     if (value == null || value === '') return undefined;
-    if (typeof value === 'number' && Number.isFinite(value)) return `${Math.round(value)}m`;
+    if (typeof value === 'number' && Number.isFinite(value)) return value > 0 ? `${Math.round(value)} min` : undefined;
     const raw = String(value).trim();
     if (!raw) return undefined;
-    if (/^\\d+$/.test(raw)) return `${raw}m`;
+    if (/^\d+(?:\.\d+)?$/.test(raw)) {
+        const minutes = Number(raw);
+        return minutes > 0 ? `${Math.round(minutes)} min` : undefined;
+    }
+    const clock = raw.match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/);
+    if (clock) {
+        const minutes = clock[3] !== undefined
+            ? Number(clock[1]) * 60 + Number(clock[2]) + Number(clock[3]) / 60
+            : Number(clock[1]) + Number(clock[2]) / 60;
+        return minutes > 0 ? `${Math.round(minutes)} min` : undefined;
+    }
     return raw;
 }
 
-function applyCinemaMetadata(meta, item) {
-    const year = Number(item.year);
+function applyCinemaMetadata(meta, item = {}) {
+    const rawYear = item.year ?? item.releaseInfo ?? item.released ?? item.releasedate ?? item.releaseDate;
+    const yearMatch = rawYear == null ? null : String(rawYear).match(/(?:19|20)\d{2}/);
+    const year = Number.isInteger(Number(rawYear)) ? Number(rawYear) : (yearMatch ? Number(yearMatch[0]) : NaN);
     if (Number.isInteger(year) && year >= 1888 && year <= 2200) {
         meta.year = year;
         meta.releaseInfo = String(year);
     }
-    const rating = Number(item.rating);
-    if (item.rating != null && item.rating !== '' && Number.isFinite(rating) && rating >= 0 && rating <= 10) {
+
+    const ratingValue = item.imdbRating ?? item.rating;
+    const rating = Number(ratingValue);
+    if (ratingValue != null && ratingValue !== '' && Number.isFinite(rating) && rating >= 0 && rating <= 10) {
         meta.imdbRating = rating.toFixed(1);
     }
+
     const runtime = metadataRuntime(item.runtime);
     if (runtime) meta.runtime = runtime;
-    const directors = metadataNames(item.director || item.directors);
-    const cast = metadataNames(item.cast || item.actors);
-    const genres = metadataNames(item.genre || item.genres);
-    if (directors.length) meta.director = directors;
+
+    const cast = metadataNames(item.cast ?? item.actors);
+    const directors = metadataNames(item.director ?? item.directors);
+    const genres = metadataNames(item.genres ?? item.genre);
     if (cast.length) meta.cast = cast;
+    if (directors.length) meta.director = directors;
     if (genres.length) meta.genres = genres;
+
     const links = [
         ...cast.map(name => ({ name, category: 'actor', url: name })),
         ...directors.map(name => ({ name, category: 'director', url: name })),
         ...genres.map(name => ({ name, category: 'genre', url: name }))
     ];
     if (links.length) meta.links = links;
-    if (item.backdrop) meta.background = Array.isArray(item.backdrop) ? item.backdrop[0] : item.backdrop;
+
+    const description = item.description || item.plot || item.plot_outline;
+    if (description) meta.description = description;
+    const poster = item.poster || item.movie_image || item.cover_big;
+    if (poster) meta.poster = poster;
+    const background = item.background || item.backdrop || item.backdrop_path;
+    if (background) meta.background = Array.isArray(background) ? background[0] : background;
     return meta;
 }
 
@@ -177,6 +200,7 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        this.movieInfoCache = new LRUCache({ max: 200, ttl: CACHE_TTL_MS });
         this.epgData = {};
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
@@ -626,12 +650,12 @@ class M3UEPGAddon {
             poster: seriesItem.poster ||
                 seriesItem.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-            description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-            genres: metadataNames(seriesItem.genre).length ? metadataNames(seriesItem.genre) : (seriesItem.category
+            description: seriesItem.plot || seriesItem.attributes?.['plot'] || info?.description || 'Series / Show',
+            genres: seriesItem.category
                 ? [seriesItem.category]
-                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series'])),
+                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
             videos
-        }, seriesItem);
+        }, { ...seriesItem, ...(info || {}) });
     }
 
     async getDetailedMetaAsync(id, type) {
@@ -640,8 +664,31 @@ class M3UEPGAddon {
             if (!seriesItem) return null;
             return await this.buildSeriesMeta(seriesItem);
         }
-        // fallback sync path
-        return this.getDetailedMeta(id);
+
+        const meta = this.getDetailedMeta(id);
+        if (!meta || meta.type !== 'movie') return meta;
+
+        const item = this.movies.find(movie => movie.id === id);
+        if (!item || this.providerName !== 'xtream' || this.config.xtreamUseM3U) {
+            return applyCinemaMetadata(meta, item || {});
+        }
+
+        let details = this.movieInfoCache.get(id);
+        if (!details) {
+            try {
+                const provider = require('./src/js/providers/xtreamProvider.js');
+                const streamId = item.stream_id || String(item.id).replace(/^iptv_vod_/, '');
+                details = typeof provider.fetchMovieInfo === 'function'
+                    ? await provider.fetchMovieInfo(this, streamId)
+                    : {};
+            } catch (e) {
+                this.log.warn('Movie info fetch failed', id, e && e.name ? e.name : 'Error');
+                details = {};
+            }
+            this.movieInfoCache.set(id, details || {});
+        }
+
+        return applyCinemaMetadata(meta, { ...item, ...(details || {}) });
     }
 
     getDetailedMeta(id) {
@@ -668,16 +715,16 @@ class M3UEPGAddon {
                 if (m) year = parseInt(m[1]);
             }
             const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
-            return applyCinemaMetadata({
+            return {
                 id: item.id,
                 type: 'movie',
                 name: item.name,
                 poster: item.poster || item.attributes?.['tvg-logo'] ||
                     `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`,
                 description,
-                genres: metadataNames(item.genre).length ? metadataNames(item.genre) : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie']),
+                genres: item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'],
                 year
-            }, item);
+            };
         }
     }
 }
@@ -910,7 +957,7 @@ async function createAddon(config) {
                     }
                     return { meta: meta || null };
                 }
-                const meta = addonInstance.getDetailedMeta(id);
+                const meta = await addonInstance.getDetailedMetaAsync(id, type);
                 if (meta && type === 'tv' && meta.type === 'tv') {
                     const channel = addonInstance.channels.find(item => item.id === id);
                     if (channel) {
@@ -973,3 +1020,4 @@ async function createAddon(config) {
 module.exports = createAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
+module.exports.applyCinemaMetadata = applyCinemaMetadata;
