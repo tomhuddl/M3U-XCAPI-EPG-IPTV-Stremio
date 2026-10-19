@@ -144,19 +144,13 @@ async function fetchData(addonInstance) {
         type: "movie",
         url: `${xtreamUrl}/movie/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.${s.container_extension}`,
         poster: s.stream_icon,
-        plot: s.plot || s.plot_outline || s.description || s.info?.plot || "",
-        year: s.releasedate ? new Date(s.releasedate).getFullYear() : (s.year ? Number(s.year) : null),
-        rating: s.rating || s.rating_5based || s.info?.rating || null,
-        runtime: s.duration || s.info?.duration || null,
-        genre: s.genre || s.info?.genre || null,
-        director: s.director || s.info?.director || null,
-        cast: s.cast || s.info?.cast || null,
-        backdrop: s.backdrop_path || s.info?.backdrop_path || null,
+        plot: s.plot,
+        year: s.releasedate ? new Date(s.releasedate).getFullYear() : null,
         category: cat,
         attributes: {
           "tvg-logo": s.stream_icon,
           "group-title": cat,
-          plot: s.plot || s.plot_outline || s.description || s.info?.plot || "",
+          plot: s.plot,
         },
       };
     });
@@ -194,20 +188,13 @@ async function fetchData(addonInstance) {
                 series_id: s.series_id,
                 name: s.name,
                 type: "series",
-                poster: s.cover || s.cover_big,
-                plot: s.plot || s.plot_outline || s.description || "",
-                year: s.releaseDate ? Number(String(s.releaseDate).slice(0, 4)) : (s.year ? Number(s.year) : null),
-                rating: s.rating || null,
-                runtime: s.episode_run_time || s.duration || null,
-                genre: s.genre || null,
-                director: s.director || null,
-                cast: s.cast || null,
-                backdrop: Array.isArray(s.backdrop_path) ? s.backdrop_path[0] : s.backdrop_path || null,
+                poster: s.cover,
+                plot: s.plot,
                 category: cat,
                 attributes: {
-                  "tvg-logo": s.cover || s.cover_big,
+                  "tvg-logo": s.cover,
                   "group-title": cat,
-                  plot: s.plot || s.plot_outline || s.description || "",
+                  plot: s.plot,
                 },
               };
             });
@@ -261,6 +248,69 @@ async function fetchData(addonInstance) {
   }
 }
 
+
+async function fetchMovieInfo(addonInstance, streamId) {
+  const { config } = addonInstance;
+  if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword || config.xtreamUseM3U) return {};
+  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  try {
+    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, { timeout: 20000 });
+    if (!response.ok) return {};
+    const payload = await response.json();
+    return normalizeXtreamInfo(payload?.info || {}, payload?.movie_data || {});
+  } catch { return {}; }
+}
+
+function normalizeXtreamInfo(info = {}, data = {}) {
+  const first = (...values) => values.find(value => value !== undefined && value !== null && String(value).trim() !== '');
+  const list = value => Array.isArray(value)
+    ? value.filter(Boolean).map(String)
+    : (typeof value === 'string' ? value.split(/[,|;]/).map(v => v.trim()).filter(Boolean) : []);
+
+  const runtimeRaw = first(
+    info.duration,
+    info.duration_secs != null ? Number(info.duration_secs) / 60 : null,
+    data.duration,
+    data.duration_secs != null ? Number(data.duration_secs) / 60 : null
+  );
+  let runtime;
+  if (runtimeRaw != null && String(runtimeRaw).trim() !== '') {
+    const raw = String(runtimeRaw).trim();
+    const clock = raw.match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/);
+    if (clock) {
+      const minutes = clock[3] !== undefined
+        ? Number(clock[1]) * 60 + Number(clock[2]) + Number(clock[3]) / 60
+        : Number(clock[1]) + Number(clock[2]) / 60;
+      if (minutes > 0) runtime = `${Math.round(minutes)} min`;
+    } else if (/^\d+(?:\.\d+)?$/.test(raw)) {
+      const minutes = Number(raw);
+      if (minutes > 0) runtime = `${Math.round(minutes)} min`;
+    } else {
+      runtime = raw;
+    }
+  }
+
+  const rawYear = first(info.releaseDate, info.releasedate, data.releaseDate, data.releasedate, info.year, data.year);
+  const yearMatch = rawYear == null ? null : String(rawYear).match(/(?:19|20)\d{2}/);
+  const rawRating = first(info.rating, data.rating, info.rating_5based != null ? Number(info.rating_5based) * 2 : null,
+    data.rating_5based != null ? Number(data.rating_5based) * 2 : null);
+  const rating = rawRating == null ? NaN : Number(rawRating);
+  const backdrop = first(info.backdrop_path, info.backdrop, data.backdrop_path);
+  return {
+    description: first(info.plot, info.description, data.plot, data.description, data.plot_outline),
+    poster: first(info.movie_image, info.cover_big, data.stream_icon, data.cover, data.cover_big),
+    background: Array.isArray(backdrop) ? backdrop[0] : backdrop,
+    year: yearMatch ? Number(yearMatch[0]) : undefined,
+    released: first(info.releasedate, info.releaseDate, data.releasedate, data.releaseDate),
+    runtime,
+    imdbRating: Number.isFinite(rating) && rating >= 0 && rating <= 10 ? rating.toFixed(1) : undefined,
+    genres: list(first(info.genre, info.genres, data.genre, data.genres)),
+    cast: list(first(info.cast, info.actors, data.cast, data.actors)),
+    director: list(first(info.director, data.director)),
+    imdbId: first(info.imdb_id, data.imdb_id)
+  };
+}
+
 async function fetchSeriesInfo(addonInstance, seriesId) {
   // For xtream JSON API only
   const { config } = addonInstance;
@@ -282,6 +332,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     if (!infoResp.ok) return { videos: [] };
     const infoJson = await infoResp.json();
     const videos = [];
+    const metadata = normalizeXtreamInfo(infoJson.info || {}, infoJson.info || {});
     // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
     const episodesObj = infoJson.episodes || {};
     Object.keys(episodesObj).forEach((seasonKey) => {
@@ -330,7 +381,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     });
     // Sort by season then episode
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
-    return { videos, fetchedAt: Date.now() };
+    return { ...metadata, videos, fetchedAt: Date.now() };
   } catch {
     return { videos: [] };
   }
@@ -346,5 +397,7 @@ function cryptoHash(text) {
 
 module.exports = {
   fetchData,
+  fetchMovieInfo,
   fetchSeriesInfo,
+  normalizeXtreamInfo,
 };
