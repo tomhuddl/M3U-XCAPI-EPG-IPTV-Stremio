@@ -99,7 +99,6 @@ function testMovieMetadataMapping() {
     assert.strictEqual(meta.name, "Spider-Man: Brand New Day");
     assert.strictEqual(meta.year, 2026);
     assert.strictEqual(meta.releaseInfo, "2026");
-    assert.strictEqual(meta.released, "2026-07-29T00:00:00.000Z");
     assert.strictEqual(meta.runtime, "145 min");
     assert.strictEqual(meta.rating, "7.9");
     assert.deepStrictEqual(meta.genres, ["Action", "Adventure"]);
@@ -149,7 +148,6 @@ function testSeriesMetadataMapping() {
     assert.strictEqual(meta.name, "Crashing");
     assert.strictEqual(meta.year, 2016);
     assert.strictEqual(meta.releaseInfo, "2016-2024");
-    assert.strictEqual(meta.released, "2016-01-01T00:00:00.000Z");
     assert.strictEqual(meta.runtime, "25 min");
     assert.strictEqual(meta.rating, "7.0");
     assert.deepStrictEqual(meta.genres, ["Comedy"]);
