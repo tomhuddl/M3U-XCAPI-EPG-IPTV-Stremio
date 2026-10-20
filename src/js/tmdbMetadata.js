@@ -123,10 +123,6 @@ async function getMovieMetadata(tmdbId) {
 
 function mapSeriesMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.name)) return null;
-  const directors = uniqueNames(credits?.crew, person => {
-    const jobs = Array.isArray(person.jobs) ? person.jobs.map(job => job.job) : [];
-    return jobs.some(job => /director/i.test(job)) ? person.name : null;
-  }, 10);
   const cast = uniqueNames(credits?.cast, person => person.name, 20);
   const trailer = Array.isArray(videos?.results)
     ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
@@ -149,7 +145,6 @@ function mapSeriesMetadata(details, credits, videos) {
     releaseInfo,
     runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
-    director: directors,
     cast,
     trailer: trailer ? { id: trailer.key, title: nonEmpty(trailer.name) || "Trailer", site: "YouTube" } : undefined,
   });
