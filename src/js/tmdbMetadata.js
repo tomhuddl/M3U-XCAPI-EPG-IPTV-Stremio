@@ -128,7 +128,7 @@ function metadataLinks(details, credits, mediaType) {
   const crew = Array.isArray(credits?.crew) ? credits.crew : [];
   // Only include explicit writing credits. Creator/developed-by and editorial
   // roles can identify people who did not write episodes or scripts themselves.
-  const writerJobs = new Set(["Writer", "Screenplay", "Story", "Teleplay"]);
+  const writerJobs = new Set(["Writer"]);
   const seenWriters = new Set();
   for (const person of crew) {
     // Movie credits use person.job; TV aggregate credits use person.jobs[].
