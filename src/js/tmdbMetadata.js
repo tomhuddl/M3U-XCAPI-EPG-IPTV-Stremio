@@ -10,6 +10,7 @@ const cache = new LRUCache({
   ttl: CACHE_TTL_MS,
 });
 const pending = new Map();
+const MAX_MAIN_CAST = 8;
 
 function parsePositiveInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
@@ -86,7 +87,6 @@ async function request(path) {
 
 function metadataLinks(details, credits, mediaType) {
   const links = [];
-  const genreType = mediaType === "tv" ? "tv" : "movie";
   for (const genre of Array.isArray(details?.genres) ? details.genres : []) {
     if (nonEmpty(genre?.name) && Number.isSafeInteger(genre.id) && genre.id > 0) {
       links.push({
@@ -97,7 +97,7 @@ function metadataLinks(details, credits, mediaType) {
     }
   }
   const cast = Array.isArray(credits?.cast) ? credits.cast : [];
-  for (const person of cast.slice(0, 20)) {
+  for (const person of cast.slice(0, MAX_MAIN_CAST)) {
     if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0) {
       links.push({
         name: person.name,
@@ -106,17 +106,21 @@ function metadataLinks(details, credits, mediaType) {
       });
     }
   }
-  const crew = Array.isArray(credits?.crew) ? credits.crew : [];
-  const directors = mediaType === "movie"
-    ? crew.filter(person => person?.job === "Director")
-    : crew.filter(person => Array.isArray(person?.jobs) && person.jobs.some(job => /director/i.test(String(job?.job || ""))));
-  for (const person of directors.slice(0, 10)) {
-    if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0) {
-      links.push({
-        name: person.name,
-        category: "Director",
-        url: "https://www.themoviedb.org/person/" + person.id,
-      });
+  // Directors are shown for movies only; use the plural category so multiple
+  // credited directors are grouped under the correct label in Stremio.
+  if (mediaType === "movie") {
+    const crew = Array.isArray(credits?.crew) ? credits.crew : [];
+    const directors = crew.filter(person => person?.job === "Director");
+    const seen = new Set();
+    for (const person of directors.slice(0, 10)) {
+      if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0 && !seen.has(person.id)) {
+        seen.add(person.id);
+        links.push({
+          name: person.name,
+          category: "Directors",
+          url: "https://www.themoviedb.org/person/" + person.id,
+        });
+      }
     }
   }
   return links;
@@ -125,7 +129,7 @@ function metadataLinks(details, credits, mediaType) {
 function mapMovieMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.title)) return null;
   const directors = uniqueNames(credits?.crew, person => person.job === "Director" ? person.name : null, 10);
-  const cast = uniqueNames(credits?.cast, person => person.name, 20);
+  const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
     ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
       || videos.results.find(video => video.site === "YouTube" && video.key)
@@ -162,7 +166,7 @@ async function getMovieMetadata(tmdbId) {
 
 function mapSeriesMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.name)) return null;
-  const cast = uniqueNames(credits?.cast, person => person.name, 20);
+  const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
     ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
       || videos.results.find(video => video.site === "YouTube" && video.key)
