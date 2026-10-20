@@ -10,7 +10,7 @@ const cache = new LRUCache({
   ttl: CACHE_TTL_MS,
 });
 const pending = new Map();
-const MAX_MAIN_CAST = 8;
+const MAX_MAIN_CAST = 4;
 
 function parsePositiveInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(value, 10);
