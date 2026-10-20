@@ -398,7 +398,9 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
         addon.queueCatalogMetaEnrichment({ id: "movie-" + i, type: "movie", name: "Movie " + i });
     }
 
+    const drainDeadline = Date.now() + 5000;
     while (addon.catalogMetaWorkers > 0 || addon.catalogMetaQueueHead < addon.catalogMetaQueue.length) {
+        assert.ok(Date.now() < drainDeadline, "metadata enrichment queue should drain within five seconds");
         await new Promise(resolve => setImmediate(resolve));
     }
 
