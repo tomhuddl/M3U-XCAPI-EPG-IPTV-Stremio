@@ -146,7 +146,7 @@ async function fetchData(addonInstance) {
         poster: s.stream_icon,
         plot: s.plot,
         // TMDb ID is an identifier only; display metadata is fetched from TMDb.
-        tmdbId: s.tmdb_id || s.tmdb || null,
+        tmdbId: normalizeTmdbId(s.tmdb_id || s.tmdb),
         category: cat,
         attributes: {
           "tvg-logo": s.stream_icon,
@@ -187,7 +187,7 @@ async function fetchData(addonInstance) {
               return {
                 id: `iptv_series_${s.series_id}`,
                 series_id: s.series_id,
-                tmdbId: s.tmdb || s.tmdb_id || null,
+                tmdbId: normalizeTmdbId(s.tmdb || s.tmdb_id),
                 name: s.name,
                 type: "series",
                 poster: s.cover,
