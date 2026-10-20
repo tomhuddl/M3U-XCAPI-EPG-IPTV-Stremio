@@ -177,12 +177,12 @@ function testMovieMetadataMapping() {
     assert.deepStrictEqual(meta.director, ["Sample Director", "Co-Director"]);
     assert.deepStrictEqual(meta.cast, ["Actor 1", "Actor 2", "Actor 3", "Actor 4"]);
     assert.deepStrictEqual(meta.links, [
-        { name: "Action", category: "Genre", url: "https://www.themoviedb.org/genre/28" },
-        { name: "Adventure", category: "Genre", url: "https://www.themoviedb.org/genre/12" },
-        { name: "Actor 1", category: "Actor", url: "https://www.themoviedb.org/person/101" },
-        { name: "Actor 2", category: "Actor", url: "https://www.themoviedb.org/person/102" },
-        { name: "Actor 3", category: "Actor", url: "https://www.themoviedb.org/person/103" },
-        { name: "Actor 4", category: "Actor", url: "https://www.themoviedb.org/person/104" },
+        { name: "Action", category: "Genres", url: "https://www.themoviedb.org/genre/28" },
+        { name: "Adventure", category: "Genres", url: "https://www.themoviedb.org/genre/12" },
+        { name: "Actor 1", category: "Cast", url: "https://www.themoviedb.org/person/101" },
+        { name: "Actor 2", category: "Cast", url: "https://www.themoviedb.org/person/102" },
+        { name: "Actor 3", category: "Cast", url: "https://www.themoviedb.org/person/103" },
+        { name: "Actor 4", category: "Cast", url: "https://www.themoviedb.org/person/104" },
         { name: "Sample Director", category: "Directors", url: "https://www.themoviedb.org/person/55" },
         { name: "Co-Director", category: "Directors", url: "https://www.themoviedb.org/person/56" }
     ]);
@@ -222,8 +222,8 @@ function testSeriesMetadataMapping() {
     assert.strictEqual(meta.director, undefined);
     assert.deepStrictEqual(meta.cast, ["Series Actor"]);
     assert.deepStrictEqual(meta.links, [
-        { name: "Comedy", category: "Genre", url: "https://www.themoviedb.org/genre/35" },
-        { name: "Series Actor", category: "Actor", url: "https://www.themoviedb.org/person/202" }
+        { name: "Comedy", category: "Genres", url: "https://www.themoviedb.org/genre/35" },
+        { name: "Series Actor", category: "Cast", url: "https://www.themoviedb.org/person/202" }
     ]);
     assert.strictEqual(meta.trailer, undefined);
 }
