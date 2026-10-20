@@ -116,6 +116,8 @@ function testSeriesMetadataMapping() {
             name: "Crashing",
             overview: "Series overview.",
             first_air_date: "2016-01-01",
+            last_air_date: "2024-12-31",
+            status: "Ended",
             episode_run_time: [25],
             poster_path: "/series.jpg",
             backdrop_path: "/series-backdrop.jpg",
@@ -131,6 +133,7 @@ function testSeriesMetadataMapping() {
     );
     assert.strictEqual(meta.name, "Crashing");
     assert.strictEqual(meta.year, 2016);
+    assert.strictEqual(meta.releaseInfo, "2016-2024");
     assert.strictEqual(meta.runtime, "25 min");
     assert.strictEqual(meta.rating, "7.0");
     assert.deepStrictEqual(meta.director, ["Sample Director"]);
@@ -152,7 +155,7 @@ function testEpisodeMetadataMapping() {
                 vote_average: 8.1,
                 vote_count: 30,
                 guest_stars: [{ name: "Guest Actor" }],
-                crew: [{ name: "Episode Director" }]
+                crew: [{ name: "Episode Director", job: "Director" }, { name: "Episode Writer", job: "Writer" }]
             },
             { season_number: 1, episode_number: 0, name: "Invalid episode" }
         ]
@@ -166,7 +169,7 @@ function testEpisodeMetadataMapping() {
     assert.strictEqual(episodes[0].runtime, "44 min");
     assert.strictEqual(episodes[0].rating, "8.1");
     assert.deepStrictEqual(episodes[0].guestStars, ["Guest Actor"]);
-    assert.deepStrictEqual(episodes[0].crew, ["Episode Director"]);
+    assert.deepStrictEqual(episodes[0].directors, ["Episode Director"]);
     assert.strictEqual(mapSeasonEpisodes(null, 1), null);
 }
 
