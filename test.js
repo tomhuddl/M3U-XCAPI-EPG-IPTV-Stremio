@@ -8,7 +8,7 @@ const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { normalizeGenre, matchesGenre } = require("./addon");
-const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata } = require("./src/js/tmdbMetadata");
+const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
 function testEncryptedConfigRoundTrip() {
@@ -138,6 +138,38 @@ function testSeriesMetadataMapping() {
     assert.strictEqual(meta.trailer, undefined);
 }
 
+function testEpisodeMetadataMapping() {
+    const episodes = mapSeasonEpisodes({
+        episodes: [
+            {
+                season_number: 1,
+                episode_number: 2,
+                name: "The Example",
+                overview: "Episode overview.",
+                air_date: "2026-03-01",
+                still_path: "/episode.jpg",
+                runtime: 44,
+                vote_average: 8.1,
+                vote_count: 30,
+                guest_stars: [{ name: "Guest Actor" }],
+                crew: [{ name: "Episode Director" }]
+            },
+            { season_number: 1, episode_number: 0, name: "Invalid episode" }
+        ]
+    }, 1);
+    assert.strictEqual(episodes.length, 1);
+    assert.strictEqual(episodes[0].season, 1);
+    assert.strictEqual(episodes[0].episode, 2);
+    assert.strictEqual(episodes[0].title, "The Example");
+    assert.strictEqual(episodes[0].description, "Episode overview.");
+    assert.strictEqual(episodes[0].thumbnail, "https://image.tmdb.org/t/p/w500/episode.jpg");
+    assert.strictEqual(episodes[0].runtime, "44 min");
+    assert.strictEqual(episodes[0].rating, "8.1");
+    assert.deepStrictEqual(episodes[0].guestStars, ["Guest Actor"]);
+    assert.deepStrictEqual(episodes[0].crew, ["Episode Director"]);
+    assert.strictEqual(mapSeasonEpisodes(null, 1), null);
+}
+
 function testXtreamTmdbIdNormalization() {
     assert.strictEqual(normalizeTmdbId("969681"), "969681");
     assert.strictEqual(normalizeTmdbId(94997), "94997");
@@ -254,6 +286,7 @@ async function main() {
         testXtreamTmdbIdNormalization,
         testMovieMetadataMapping,
         testSeriesMetadataMapping,
+        testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
