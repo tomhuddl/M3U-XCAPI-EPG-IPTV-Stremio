@@ -84,6 +84,44 @@ async function request(path) {
   return task;
 }
 
+function metadataLinks(details, credits, mediaType) {
+  const links = [];
+  const genreType = mediaType === "tv" ? "tv" : "movie";
+  for (const genre of Array.isArray(details?.genres) ? details.genres : []) {
+    if (nonEmpty(genre?.name) && Number.isSafeInteger(genre.id) && genre.id > 0) {
+      links.push({
+        name: genre.name,
+        category: "Genre",
+        url: "https://www.themoviedb.org/genre/" + genre.id,
+      });
+    }
+  }
+  const cast = Array.isArray(credits?.cast) ? credits.cast : [];
+  for (const person of cast.slice(0, 20)) {
+    if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0) {
+      links.push({
+        name: person.name,
+        category: "Actor",
+        url: "https://www.themoviedb.org/person/" + person.id,
+      });
+    }
+  }
+  const crew = Array.isArray(credits?.crew) ? credits.crew : [];
+  const directors = mediaType === "movie"
+    ? crew.filter(person => person?.job === "Director")
+    : crew.filter(person => Array.isArray(person?.jobs) && person.jobs.some(job => /director/i.test(String(job?.job || ""))));
+  for (const person of directors.slice(0, 10)) {
+    if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0) {
+      links.push({
+        name: person.name,
+        category: "Director",
+        url: "https://www.themoviedb.org/person/" + person.id,
+      });
+    }
+  }
+  return links;
+}
+
 function mapMovieMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.title)) return null;
   const directors = uniqueNames(credits?.crew, person => person.job === "Director" ? person.name : null, 10);
@@ -106,6 +144,7 @@ function mapMovieMetadata(details, credits, videos) {
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     director: directors,
     cast,
+    links: metadataLinks(details, credits, "movie"),
     trailer: trailer ? { id: trailer.key, title: nonEmpty(trailer.name) || "Trailer", site: "YouTube" } : undefined,
   });
 }
@@ -146,6 +185,7 @@ function mapSeriesMetadata(details, credits, videos) {
     runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     cast,
+    links: metadataLinks(details, credits, "tv"),
     trailer: trailer ? { id: trailer.key, title: nonEmpty(trailer.name) || "Trailer", site: "YouTube" } : undefined,
   });
 }
