@@ -255,6 +255,7 @@ class M3UEPGAddon {
         });
         this.catalogMetaPending = new Map();
         this.catalogMetaQueue = [];
+        this.catalogMetaQueueHead = 0;
         this.catalogMetaWorkers = 0;
         this.epgData = {};
         // XMLTV programme timestamps are immutable after parsing; cache their parsed
@@ -786,8 +787,8 @@ class M3UEPGAddon {
         this.catalogMetaQueue.push(item);
 
         const runNext = () => {
-            while (this.catalogMetaWorkers < 3 && this.catalogMetaQueue.length) {
-                const next = this.catalogMetaQueue.shift();
+            while (this.catalogMetaWorkers < 3 && this.catalogMetaQueueHead < this.catalogMetaQueue.length) {
+                const next = this.catalogMetaQueue[this.catalogMetaQueueHead++];
                 this.catalogMetaWorkers++;
                 (async () => {
                     try {
@@ -814,6 +815,10 @@ class M3UEPGAddon {
                     } finally {
                         this.catalogMetaPending.delete(next.id);
                         this.catalogMetaWorkers--;
+                        if (this.catalogMetaQueueHead >= this.catalogMetaQueue.length) {
+                            this.catalogMetaQueue = [];
+                            this.catalogMetaQueueHead = 0;
+                        }
                         runNext();
                     }
                 })();
