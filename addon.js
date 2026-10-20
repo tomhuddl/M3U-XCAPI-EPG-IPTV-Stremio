@@ -135,6 +135,15 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Cached catalogue enrichment lets later home/search requests return
+        // rich cards without waiting on TMDb/Xtream for every item.
+        this.catalogMetaCache = new LRUCache({
+            max: parsePositiveInteger(process.env.CATALOG_META_CACHE_MAX, 1000, 50, 5000),
+            ttl: parsePositiveInteger(process.env.CATALOG_META_CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
+        });
+        this.catalogMetaPending = new Map();
+        this.catalogMetaQueue = [];
+        this.catalogMetaWorkers = 0;
         this.epgData = {};
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
@@ -638,6 +647,48 @@ class M3UEPGAddon {
         };
     }
 
+    queueCatalogMetaEnrichment(item) {
+        if (!item || this.catalogMetaCache.has(item.id) || this.catalogMetaPending.has(item.id)) return;
+        this.catalogMetaPending.set(item.id, true);
+        this.catalogMetaQueue.push(item);
+
+        const runNext = () => {
+            while (this.catalogMetaWorkers < 3 && this.catalogMetaQueue.length) {
+                const next = this.catalogMetaQueue.shift();
+                this.catalogMetaWorkers++;
+                (async () => {
+                    try {
+                        const detailed = await this.getDetailedMetaAsync(next.id, next.type);
+                        if (detailed) {
+                            const preview = { ...detailed };
+                            delete preview.tmdbRating;
+                            if (Array.isArray(preview.links)) {
+                                preview.links = preview.links.filter(link => link?.category !== 'Rating');
+                            }
+                            const providerGenre = next.category || next.attributes?.['group-title'];
+                            if (!Array.isArray(preview.genres) || !preview.genres.length) {
+                                const base = this.generateMetaPreview(next);
+                                preview.genres = base.genres?.length ? base.genres : (providerGenre ? [providerGenre] : []);
+                            }
+                            if (!Array.isArray(preview.cast) || !preview.cast.length) {
+                                const base = this.generateMetaPreview(next);
+                                if (Array.isArray(base.cast) && base.cast.length) preview.cast = base.cast;
+                            }
+                            this.catalogMetaCache.set(next.id, preview);
+                        }
+                    } catch (error) {
+                        this.log.warn('Background catalogue metadata enrichment failed for', next.id, error?.message || error);
+                    } finally {
+                        this.catalogMetaPending.delete(next.id);
+                        this.catalogMetaWorkers--;
+                        runNext();
+                    }
+                })();
+            }
+        };
+        runNext();
+    }
+
     async getDetailedMetaAsync(id, type) {
         if (type === 'series' || id.startsWith('iptv_series_')) {
             const seriesItem = this.series.find(s => s.id === id);
@@ -865,15 +916,22 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                // Keep catalogue responses fast: do not make per-item TMDb/Xtream
-                // detail requests while Stremio is waiting for a page of cards.
-                // Full metadata remains available when an individual item is opened.
+                // Return cached enriched cards immediately. Missing metadata is
+                // fetched in a small background queue, so cold catalogue loads stay
+                // fast and subsequent requests can use the richer cached previews.
                 const metas = page.map(i => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
                         meta.behaviorHints = { isLive: true };
                         meta.posterShape = 'square';
+                        return meta;
                     }
+                    if (i.type !== 'movie' && i.type !== 'series') return meta;
+
+                    const cached = addonInstance.catalogMetaCache.get(i.id);
+                    if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
+
+                    addonInstance.queueCatalogMetaEnrichment(i);
                     return meta;
                 });
                 
