@@ -260,7 +260,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
     const payload = await response.json();
     const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
     const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;
-    return { tmdbId: /^\\d{1,12}$/.test(String(tmdbId || "")) && Number(tmdbId) > 0 ? String(tmdbId) : null };
+    return { tmdbId: /^\d{1,12}$/.test(String(tmdbId || "")) && Number(tmdbId) > 0 ? String(tmdbId) : null };
   } catch {
     return null;
   }
@@ -289,7 +289,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     const videos = [];
     const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
     const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
-    const tmdbId = /^\\d{1,12}$/.test(String(rawTmdbId || "")) && Number(rawTmdbId) > 0 ? String(rawTmdbId) : null;
+    const tmdbId = /^\d{1,12}$/.test(String(rawTmdbId || "")) && Number(rawTmdbId) > 0 ? String(rawTmdbId) : null;
     // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
     const episodesObj = infoJson.episodes || {};
     Object.keys(episodesObj).forEach((seasonKey) => {
