@@ -578,8 +578,8 @@ app.get("/:token/manifest.json", (req, res) => {
 
 // Apply platform-specific metadata presentation at the HTTP boundary. The SDK's
 // metadata handler arguments do not expose request headers, so keep this logic
-// outside the shared metadata builder and fail conservatively when the client
-// cannot be identified.
+// outside the shared metadata builder. The SDK router writes serialized JSON via
+// res.end(), so intercept that boundary rather than res.json().
 app.use("/:token", (req, res, next) => {
   const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
   const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
@@ -588,31 +588,44 @@ app.use("/:token", (req, res, next) => {
     /iphone|ipad|ipod|ios/.test(userAgent);
 
   if (pathIsMeta) {
-    const originalJson = res.json.bind(res);
-    res.json = (body) => {
-      if (body && body.meta && typeof body.meta === "object") {
-        const meta = body.meta;
-        const links = Array.isArray(meta.links) ? meta.links : [];
-        if (isIosStremioClient) {
-          // Stremio clients commonly render the displayed date from releaseInfo,
-          // while some use year. Set both explicitly from the canonical year.
-          const releaseText = String(meta.releaseInfo || "");
-          const yearFromRelease = releaseText.match(/\b(18\d{2}|19\d{2}|20\d{2}|21\d{2})\b/);
-          const year = Number.isInteger(meta.year) && meta.year > 0
-            ? meta.year
-            : yearFromRelease ? Number(yearFromRelease[1]) : undefined;
-          if (year && (meta.type === "movie" || meta.type === "series")) {
-            meta.year = year;
-            // iOS should show a series' start year only, never a year range.
-            meta.releaseInfo = String(year);
+    const originalEnd = res.end.bind(res);
+    res.end = function (chunk, encoding, callback) {
+      const contentType = String(res.getHeader("content-type") || "").toLowerCase();
+      if (chunk != null && contentType.includes("application/json")) {
+        try {
+          const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+          const body = JSON.parse(jsonText);
+          if (body && body.meta && typeof body.meta === "object") {
+            const meta = body.meta;
+            const links = Array.isArray(meta.links) ? meta.links : [];
+            if (isIosStremioClient) {
+              const releaseText = String(meta.releaseInfo || "");
+              const yearFromRelease = releaseText.match(/\b(18\d{2}|19\d{2}|20\d{2}|21\d{2})\b/);
+              const year = Number.isInteger(meta.year) && meta.year > 0
+                ? meta.year
+                : yearFromRelease ? Number(yearFromRelease[1]) : undefined;
+              if (year && (meta.type === "movie" || meta.type === "series")) {
+                meta.year = year;
+                // iOS should show a series' start year only, never a year range.
+                meta.releaseInfo = String(year);
+              }
+              meta.links = links.filter(link => link?.category !== "Rating");
+              delete meta.tmdbRating;
+            } else {
+              meta.links = links.filter(link => link?.category !== "Writers");
+            }
+            const output = JSON.stringify(body);
+            if (Buffer.isBuffer(chunk)) {
+              chunk = Buffer.from(output, "utf8");
+            } else {
+              chunk = output;
+            }
           }
-          meta.links = links.filter(link => link?.category !== "Rating");
-          delete meta.tmdbRating;
-        } else {
-          meta.links = links.filter(link => link?.category !== "Writers");
+        } catch {
+          // Leave non-JSON or unexpected SDK responses untouched.
         }
       }
-      return originalJson(body);
+      return originalEnd(chunk, encoding, callback);
     };
   }
   next();
