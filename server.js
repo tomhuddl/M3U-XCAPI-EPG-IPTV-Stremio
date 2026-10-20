@@ -594,8 +594,17 @@ app.use("/:token", (req, res, next) => {
         const meta = body.meta;
         const links = Array.isArray(meta.links) ? meta.links : [];
         if (isIosStremioClient) {
-          if (meta.type === "series" && meta.year) {
-            meta.releaseInfo = String(meta.year);
+          // Stremio clients commonly render the displayed date from releaseInfo,
+          // while some use year. Set both explicitly from the canonical year.
+          const releaseText = String(meta.releaseInfo || "");
+          const yearFromRelease = releaseText.match(/\\b(18\\d{2}|19\\d{2}|20\\d{2}|21\\d{2})\\b/);
+          const year = Number.isInteger(meta.year) && meta.year > 0
+            ? meta.year
+            : yearFromRelease ? Number(yearFromRelease[1]) : undefined;
+          if (year && (meta.type === "movie" || meta.type === "series")) {
+            meta.year = year;
+            // iOS should show a series' start year only, never a year range.
+            meta.releaseInfo = String(year);
           }
           meta.links = links.filter(link => link?.category !== "Rating");
           delete meta.tmdbRating;
