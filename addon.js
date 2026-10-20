@@ -561,16 +561,9 @@ class M3UEPGAddon {
             const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
             // Prefer TMDb episode details, retaining the provider listing if a season/episode has no match.
             let released = v.released || undefined;
-            const episodeTitle = tmdbEpisode?.title || v.title || `Episode ${v.episode || ''}`.trim();
-            const episodeDetails = [];
-            if (tmdbEpisode?.runtime) episodeDetails.push(tmdbEpisode.runtime);
-            if (tmdbEpisode?.rating) episodeDetails.push('★ ' + tmdbEpisode.rating);
             const video = {
                 id: v.id,
-                // Some Stremio clients omit Video.runtime and numerical rating
-                // metadata from episode lists. Include both in the visible title
-                // as well, while retaining the structured runtime field below.
-                title: episodeDetails.length ? episodeTitle + ' · ' + episodeDetails.join(' · ') : episodeTitle,
+                title: tmdbEpisode?.title || v.title || `Episode ${v.episode || ''}`.trim(),
                 season: v.season,
                 episode: v.episode,
                 thumbnail: tmdbEpisode?.thumbnail || v.thumbnail || seriesItem.poster || undefined
