@@ -571,7 +571,10 @@ class M3UEPGAddon {
             if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
             if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
             if (tmdbEpisode?.rating) {
-                video.ratings = [{ value: tmdbEpisode.rating, system: 'TMDb' }];
+                // Episode ratings are scores, not maturity/content ratings.
+                // Expose the score as a clearly labelled TMDb link, matching
+                // the series/movie metadata convention rather than misusing
+                // Stremio's ContentRating field.
                 video.links = [{
                     name: 'TMDb rating: ' + tmdbEpisode.rating,
                     category: 'Rating',
