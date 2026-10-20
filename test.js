@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSaf
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
-const { normalizeGenre, matchesGenre, normalizeSearchText } = require("./addon");
+const { normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
@@ -55,7 +55,23 @@ function testSearchNormalisationIgnoresPunctuationAndExtraWhitespace() {
     assert.strictEqual(normalizeSearchText("  SPIDER   MAN  "), "spider man");
     assert.strictEqual(normalizeSearchText("Spider—Man: Brand New Day"), "spider man brand new day");
     assert.strictEqual(normalizeSearchText("Café"), normalizeSearchText("CAFÉ"));
+    assert.strictEqual(normalizeSearchText("Amélie"), "amelie");
     assert.strictEqual(normalizeSearchText("   ---   "), "");
+}
+
+function testSearchSupportsReorderedWordsAndPartialTyping() {
+    assert.strictEqual(matchesSearchText("man spider", "Spider-Man: Brand New Day"), true);
+    assert.strictEqual(matchesSearchText("spid man", "Spider-Man"), true);
+    assert.strictEqual(matchesSearchText("brand day", "Spider-Man: Brand New Day"), true);
+    assert.strictEqual(matchesSearchText("man man", "Spider-Man"), false);
+}
+
+function testSearchAllowsConservativeSingleCharacterTypos() {
+    assert.strictEqual(matchesSearchText("spidr man", "Spider-Man"), true);
+    assert.strictEqual(matchesSearchText("Amelie", "Amélie"), true);
+    assert.strictEqual(matchesSearchText("spxxr man", "Spider-Man"), false);
+    assert.strictEqual(matchesSearchText("spi", "Spider-Man"), true);
+    assert.strictEqual(matchesSearchText("   ", "Spider-Man"), false);
 }
 
 function testGenreMatchingIgnoresCaseAndWhitespace() {
@@ -321,6 +337,8 @@ async function main() {
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
         testSearchNormalisationIgnoresPunctuationAndExtraWhitespace,
+        testSearchSupportsReorderedWordsAndPartialTyping,
+        testSearchAllowsConservativeSingleCharacterTypos,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
         testLruEvictionAndPromotion,
