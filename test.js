@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSaf
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
-const { normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText } = require("./addon");
+const { normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
@@ -64,6 +64,26 @@ function testSearchSupportsReorderedWordsAndPartialTyping() {
     assert.strictEqual(matchesSearchText("spid man", "Spider-Man"), true);
     assert.strictEqual(matchesSearchText("brand day", "Spider-Man: Brand New Day"), true);
     assert.strictEqual(matchesSearchText("man man", "Spider-Man"), false);
+}
+
+function testNormalizedSearchMatcherPreservesSearchBehaviour() {
+    const normalize = normalizeSearchText;
+    const cases = [
+        ["man spider", "Spider-Man: Brand New Day", true],
+        ["spid man", "Spider-Man", true],
+        ["spidr man", "Spider-Man", true],
+        ["spxxr man", "Spider-Man", false],
+        ["man man", "Spider-Man", false],
+        ["", "Spider-Man", false]
+    ];
+    for (const [query, title, expected] of cases) {
+        assert.strictEqual(
+            matchesNormalizedSearchText(normalize(query), normalize(title)),
+            matchesSearchText(query, title),
+            "normalized and standard matching should agree for " + query + " / " + title
+        );
+        assert.strictEqual(matchesNormalizedSearchText(normalize(query), normalize(title)), expected);
+    }
 }
 
 function testSearchAllowsConservativeSingleCharacterTypos() {
@@ -333,6 +353,7 @@ async function main() {
         testXtreamTmdbIdNormalization,
         testSearchNormalisationIgnoresPunctuationAndExtraWhitespace,
         testSearchSupportsReorderedWordsAndPartialTyping,
+        testNormalizedSearchMatcherPreservesSearchBehaviour,
         testSearchAllowsConservativeSingleCharacterTypos,
         testMovieMetadataMapping,
         testSeriesMetadataMapping,
