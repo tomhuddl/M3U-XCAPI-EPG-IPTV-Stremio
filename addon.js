@@ -881,7 +881,7 @@ async function createAddon(config) {
                             const detailed = await addonInstance.getDetailedMetaAsync(i.id, i.type);
                             if (detailed) return { ...meta, ...detailed, id: i.id, type: i.type };
                         } catch (error) {
-                            addonInstance.log.w('Catalog metadata enrichment failed for', i.id, error?.message || error);
+                            addonInstance.log.warn('Catalog metadata enrichment failed for', i.id, error?.message || error);
                         }
                     }
                     return meta;
