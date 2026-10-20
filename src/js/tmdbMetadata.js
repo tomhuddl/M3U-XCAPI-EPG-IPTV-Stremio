@@ -126,8 +126,17 @@ function metadataLinks(details, credits, mediaType) {
   return links;
 }
 
-function mapMovieMetadata(details, credits, videos) {
+function selectLogo(images) {
+  const logos = Array.isArray(images?.logos) ? images.logos : [];
+  const selected = logos.find(item => item?.iso_639_1 === "en" && typeof item.file_path === "string" && item.file_path.startsWith("/"))
+    || logos.find(item => item?.iso_639_1 == null && typeof item.file_path === "string" && item.file_path.startsWith("/"))
+    || logos.find(item => typeof item?.file_path === "string" && item.file_path.startsWith("/"));
+  return imageUrl(selected?.file_path, "w500");
+}
+
+function mapMovieMetadata(details, credits, videos, images) {
   if (!details || !nonEmpty(details.title)) return null;
+  const logo = selectLogo(images);
   const directors = uniqueNames(credits?.crew, person => person.job === "Director" ? person.name : null, 10);
   const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
@@ -141,6 +150,7 @@ function mapMovieMetadata(details, credits, videos) {
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
+    logo,
     genres,
     year,
     releaseInfo: year ? String(year) : undefined,
@@ -156,16 +166,18 @@ function mapMovieMetadata(details, credits, videos) {
 async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  const [details, credits, videos] = await Promise.all([
+  const [details, credits, videos, images] = await Promise.all([
     request("/movie/" + id + "?language=en-GB"),
     request("/movie/" + id + "/credits?language=en-GB"),
     request("/movie/" + id + "/videos?language=en-GB"),
+    request("/movie/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapMovieMetadata(details, credits, videos);
+  return mapMovieMetadata(details, credits, videos, images);
 }
 
-function mapSeriesMetadata(details, credits, videos) {
+function mapSeriesMetadata(details, credits, videos, images) {
   if (!details || !nonEmpty(details.name)) return null;
+  const logo = selectLogo(images);
   const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
     ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
@@ -183,6 +195,7 @@ function mapSeriesMetadata(details, credits, videos) {
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
+    logo,
     genres: Array.isArray(details.genres) ? uniqueNames(details.genres, genre => genre.name, 20) : [],
     year,
     releaseInfo,
@@ -197,12 +210,13 @@ function mapSeriesMetadata(details, credits, videos) {
 async function getSeriesMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  const [details, credits, videos] = await Promise.all([
+  const [details, credits, videos, images] = await Promise.all([
     request("/tv/" + id + "?language=en-GB"),
     request("/tv/" + id + "/aggregate_credits?language=en-GB"),
     request("/tv/" + id + "/videos?language=en-GB"),
+    request("/tv/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapSeriesMetadata(details, credits, videos);
+  return mapSeriesMetadata(details, credits, videos, images);
 }
 
 function mapSeasonEpisodes(data, season) {
