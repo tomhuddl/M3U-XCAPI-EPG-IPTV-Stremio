@@ -69,9 +69,30 @@ function normalizeSearchText(value) {
  * reordered words, partial words while typing, and a single-character typo
  * in words of at least five characters.
  */
+// Search normalization is repeated for every catalogue item and every query.
+// Keep a bounded cache so large libraries avoid re-normalizing the same titles.
+const normalizedSearchCache = new LRUCache({
+    max: parsePositiveInteger(process.env.SEARCH_TEXT_CACHE_MAX, 20000, 1000, 100000),
+    ttl: 30 * 60 * 1000
+});
+
+function getNormalizedSearchText(value) {
+    const original = String(value ?? '');
+    const cached = normalizedSearchCache.get(original);
+    if (cached !== undefined) return cached;
+    const normalized = normalizeSearchText(original);
+    normalizedSearchCache.set(original, normalized);
+    return normalized;
+}
+
 function matchesSearchText(query, title) {
-    const q = normalizeSearchText(query);
-    const text = normalizeSearchText(title);
+    return matchesNormalizedSearchText(
+        getNormalizedSearchText(query),
+        getNormalizedSearchText(title)
+    );
+}
+
+function matchesNormalizedSearchText(q, text) {
     if (!q || !text) return false;
     if (text.includes(q)) return true;
 
@@ -952,7 +973,11 @@ async function createAddon(config) {
                 // Normalise both sides so punctuation and spacing differences
                 // (e.g. "Spider-Man" vs "spider   man") do not hide matches.
                 if (extra.search) {
-                    filtered = filtered.filter(i => matchesSearchText(extra.search, i.name));
+                    // Normalize the query once per catalogue request, not once per title.
+                    const normalizedQuery = getNormalizedSearchText(extra.search);
+                    filtered = filtered.filter(i =>
+                        matchesNormalizedSearchText(normalizedQuery, getNormalizedSearchText(i.name))
+                    );
                 }
                 
                 // Pagination / Skip
@@ -1159,3 +1184,4 @@ module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
 module.exports.normalizeSearchText = normalizeSearchText;
 module.exports.matchesSearchText = matchesSearchText;
+module.exports.matchesNormalizedSearchText = matchesNormalizedSearchText;
