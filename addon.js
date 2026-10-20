@@ -559,22 +559,8 @@ class M3UEPGAddon {
         }
         const videos = (info?.videos || []).map(v => {
             const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
-            // Ensure released is a valid ISO date or omit it
-            let released = v.released || undefined;
-            if (released && typeof released === 'string') {
-                // If it's a unix timestamp string, convert
-                if (/^\d{9,13}$/.test(released)) {
-                    const ts = released.length <= 10
-                        ? parseInt(released, 10) * 1000
-                        : parseInt(released, 10);
-                    const d = new Date(ts);
-                    released = !isNaN(d.getTime()) ? d.toISOString() : undefined;
-                } else if (!released.includes('T') && !released.includes('Z')) {
-                    // Try parsing non-ISO date strings
-                    const d = new Date(released);
-                    released = !isNaN(d.getTime()) ? d.toISOString() : undefined;
-                }
-            }
+            // Episode display metadata must come from TMDb, never Xtream.
+            let released = undefined;
             const video = {
                 id: v.id,
                 title: tmdbEpisode?.title || `Episode ${v.episode || ''}`.trim(),
