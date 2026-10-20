@@ -889,8 +889,7 @@ class M3UEPGAddon {
     }
 
     getDetailedMeta(id) {
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
+        const item = findCatalogueItemById(this.channels, id) || findCatalogueItemById(this.movies, id);
         if (!item) return null;
         if (item.type === 'tv') {
             // Native EPG programmes are attached separately as scheduled videos.
