@@ -570,7 +570,16 @@ class M3UEPGAddon {
             };
             if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
             if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
-            if (tmdbEpisode?.rating) video.tmdbRating = tmdbEpisode.rating;
+            if (tmdbEpisode?.rating) {
+                video.tmdbRating = tmdbEpisode.rating;
+                video.links = [{
+                    name: 'TMDb rating: ' + tmdbEpisode.rating,
+                    category: 'Rating',
+                    url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) +
+                        '/season/' + encodeURIComponent(String(v.season)) +
+                        '/episode/' + encodeURIComponent(String(v.episode))
+                }];
+            }
             if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
             if (tmdbEpisode?.crew?.length) video.crew = tmdbEpisode.crew;
             if (tmdbEpisode?.released) {
@@ -617,6 +626,7 @@ class M3UEPGAddon {
             director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
+            trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
             links: [
                 ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
@@ -658,6 +668,7 @@ class M3UEPGAddon {
                 director: tmdb.director,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
+                trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
                 links: [
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
