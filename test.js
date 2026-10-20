@@ -8,6 +8,7 @@ const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { normalizeGenre, matchesGenre } = require("./addon");
+const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata } = require("./src/js/tmdbMetadata");
 
 function testEncryptedConfigRoundTrip() {
     const config = {
@@ -58,6 +59,21 @@ function testGenreMatchingIgnoresCaseAndWhitespace() {
     assert.strictEqual(matchesGenre("Peacock Plus", "Peacock"), false);
     assert.strictEqual(matchesGenre("TNT Sports", "Peacock"), false);
     assert.strictEqual(normalizeGenre("All   Channels"), "all channels");
+}
+
+function testTmdbIdValidationAndMissingKeyGracefulHandling() {
+    assert.strictEqual(validTmdbId("969681"), "969681");
+    assert.strictEqual(validTmdbId(94997), "94997");
+    assert.strictEqual(validTmdbId("0"), null);
+    assert.strictEqual(validTmdbId(""), null);
+    assert.strictEqual(validTmdbId("tt1234567"), null);
+    assert.strictEqual(validTmdbId("../1"), null);
+    if (!tmdbConfigured()) {
+        return Promise.all([
+            getMovieMetadata("969681").then(value => assert.strictEqual(value, null)),
+            getSeriesMetadata("65251").then(value => assert.strictEqual(value, null))
+        ]);
+    }
 }
 
 function testConfigValidation() {
@@ -161,6 +177,7 @@ async function main() {
         testMalformedTokensAreRejected,
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
+        testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
