@@ -123,6 +123,24 @@ function metadataLinks(details, credits, mediaType) {
       }
     }
   }
+  // Writers are supplied in TMDb credit order. The HTTP response layer
+  // keeps this category visible only to the iOS Stremio client.
+  const crew = Array.isArray(credits?.crew) ? credits.crew : [];
+  const writerJobs = new Set(["Writer", "Screenplay", "Story", "Teleplay", "Creator", "Developed by"]);
+  const seenWriters = new Set();
+  for (const person of crew) {
+    if (writerJobs.has(String(person?.job || "")) &&
+        nonEmpty(person?.name) &&
+        Number.isSafeInteger(person.id) && person.id > 0 &&
+        !seenWriters.has(person.id)) {
+      seenWriters.add(person.id);
+      links.push({
+        name: person.name,
+        category: "Writers",
+        url: "https://www.themoviedb.org/person/" + person.id,
+      });
+    }
+  }
   return links;
 }
 
