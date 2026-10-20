@@ -865,14 +865,27 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                const metas = page.map(i => {
+                const metas = await Promise.all(page.map(async i => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
                         meta.behaviorHints = { isLive: true };
                         meta.posterShape = 'square';
+                        return meta;
+                    }
+
+                    // Enrich catalogue previews with the same TMDb fields used
+                    // by detailed metadata, so home/search cards have useful
+                    // descriptions, years, runtimes, genres, cast and artwork.
+                    if (i.type === 'movie' || i.type === 'series') {
+                        try {
+                            const detailed = await addonInstance.getDetailedMetaAsync(i.id, i.type);
+                            if (detailed) return { ...meta, ...detailed, id: i.id, type: i.type };
+                        } catch (error) {
+                            addonInstance.log.w('Catalog metadata enrichment failed for', i.id, error?.message || error);
+                        }
                     }
                     return meta;
-                });
+                }));
                 
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
