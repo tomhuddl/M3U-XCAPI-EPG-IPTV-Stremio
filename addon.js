@@ -43,6 +43,23 @@ function normalizeGenre(value) {
         .toLowerCase();
 }
 
+// Cache exact ID lookups for immutable provider catalogue arrays. When a refresh
+// replaces an array, its new identity naturally gets a fresh index.
+const catalogueIdIndexes = new WeakMap();
+
+function findCatalogueItemById(items, id) {
+    if (!Array.isArray(items) || !id) return undefined;
+    let index = catalogueIdIndexes.get(items);
+    if (!index) {
+        index = new Map();
+        for (const item of items) {
+            if (item && item.id != null && !index.has(item.id)) index.set(item.id, item);
+        }
+        catalogueIdIndexes.set(items, index);
+    }
+    return index.get(id);
+}
+
 function matchesGenre(category, selectedGenre) {
     const selected = normalizeGenre(selectedGenre);
     return selected.length > 0 && normalizeGenre(category) === selected;
@@ -655,8 +672,7 @@ class M3UEPGAddon {
                 behaviorHints: { notWebReady: true }
             };
         }
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
+        const item = findCatalogueItemById(this.channels, id) || findCatalogueItemById(this.movies, id);
         if (!item) return null;
         return {
             url: item.url,
@@ -829,11 +845,11 @@ class M3UEPGAddon {
 
     async getDetailedMetaAsync(id, type) {
         if (type === 'series' || id.startsWith('iptv_series_')) {
-            const seriesItem = this.series.find(s => s.id === id);
+            const seriesItem = findCatalogueItemById(this.series, id);
             if (!seriesItem) return null;
             return await this.buildSeriesMeta(seriesItem);
         }
-        const item = this.movies.find(movie => movie.id === id);
+        const item = findCatalogueItemById(this.movies, id);
         if (item) {
             const providerModule = require('./src/js/providers/xtreamProvider.js');
             const idCacheKey = 'movie-tmdb:' + id;
