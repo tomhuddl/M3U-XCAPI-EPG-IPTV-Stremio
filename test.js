@@ -9,6 +9,7 @@ const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { normalizeGenre, matchesGenre } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata } = require("./src/js/tmdbMetadata");
+const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
 function testEncryptedConfigRoundTrip() {
     const config = {
@@ -74,6 +75,18 @@ function testTmdbIdValidationAndMissingKeyGracefulHandling() {
             getSeriesMetadata("65251").then(value => assert.strictEqual(value, null))
         ]);
     }
+}
+
+function testXtreamTmdbIdNormalization() {
+    assert.strictEqual(normalizeTmdbId("969681"), "969681");
+    assert.strictEqual(normalizeTmdbId(94997), "94997");
+    assert.strictEqual(normalizeTmdbId(" 65251 "), "65251");
+    assert.strictEqual(normalizeTmdbId("0"), null);
+    assert.strictEqual(normalizeTmdbId(0), null);
+    assert.strictEqual(normalizeTmdbId("tt1234567"), null);
+    assert.strictEqual(normalizeTmdbId("../1"), null);
+    assert.strictEqual(normalizeTmdbId("1e5"), null);
+    assert.strictEqual(normalizeTmdbId(""), null);
 }
 
 function testConfigValidation() {
@@ -177,6 +190,7 @@ async function main() {
         testMalformedTokensAreRejected,
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
+        testXtreamTmdbIdNormalization,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
