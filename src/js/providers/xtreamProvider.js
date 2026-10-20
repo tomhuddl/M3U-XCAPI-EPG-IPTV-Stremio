@@ -287,6 +287,9 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     if (!infoResp.ok) return { videos: [] };
     const infoJson = await infoResp.json();
     const videos = [];
+    const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
+    const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
+    const tmdbId = /^\\d{1,12}$/.test(String(rawTmdbId || "")) && Number(rawTmdbId) > 0 ? String(rawTmdbId) : null;
     // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
     const episodesObj = infoJson.episodes || {};
     Object.keys(episodesObj).forEach((seasonKey) => {
@@ -335,7 +338,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     });
     // Sort by season then episode
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
-    return { videos, fetchedAt: Date.now() };
+    return { videos, tmdbId, fetchedAt: Date.now() };
   } catch {
     return { videos: [] };
   }
