@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSaf
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
-const { normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
@@ -325,6 +325,33 @@ async function testPrivateDestinationsAreRejected() {
     assert.strictEqual(withCredentials[0].address, "8.8.8.8");
 }
 
+function testScheduledProgramsCacheParsedTimestamps() {
+    const addon = new M3UEPGAddon({ provider: "direct", epgOffsetHours: 0 });
+    const channel = {
+        id: "iptv_test_channel",
+        type: "tv",
+        attributes: { "tvg-id": "test.channel" }
+    };
+    const programme = {
+        start: "20261018120000 +0000",
+        stop: "20261018130000 +0000",
+        title: "Test programme"
+    };
+    addon.epgData = { "test.channel": [programme] };
+    let parseCalls = 0;
+    const originalParse = addon.parseEPGTime.bind(addon);
+    addon.parseEPGTime = (value) => {
+        parseCalls++;
+        return originalParse(value);
+    };
+
+    const first = addon.getScheduledPrograms(channel, Date.parse("2026-10-18T11:00:00Z"), Date.parse("2026-10-18T14:00:00Z"));
+    const second = addon.getScheduledPrograms(channel, Date.parse("2026-10-18T11:00:00Z"), Date.parse("2026-10-18T14:00:00Z"));
+    assert.strictEqual(first.length, 1);
+    assert.deepStrictEqual(second, first);
+    assert.strictEqual(parseCalls, 2, "start and stop timestamps should only be parsed once per programme");
+}
+
 async function testStreamingEpgParser() {
     const xml = [
         '<?xml version="1.0"?>',
@@ -359,6 +386,7 @@ async function main() {
         testSeriesMetadataMapping,
         testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
+        testScheduledProgramsCacheParsedTimestamps,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
