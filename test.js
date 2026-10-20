@@ -136,7 +136,8 @@ function testSeriesMetadataMapping() {
     assert.strictEqual(meta.releaseInfo, "2016-2024");
     assert.strictEqual(meta.runtime, "25 min");
     assert.strictEqual(meta.rating, "7.0");
-    assert.deepStrictEqual(meta.director, ["Sample Director"]);
+    assert.deepStrictEqual(meta.genres, ["Comedy"]);
+    assert.strictEqual(meta.director, undefined);
     assert.deepStrictEqual(meta.cast, ["Series Actor"]);
     assert.strictEqual(meta.trailer, undefined);
 }
