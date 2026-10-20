@@ -581,7 +581,7 @@ class M3UEPGAddon {
                 }];
             }
             if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
-            if (tmdbEpisode?.crew?.length) video.directors = tmdbEpisode.crew;
+            if (tmdbEpisode?.directors?.length) video.directors = tmdbEpisode.directors;
             if (tmdbEpisode?.released) {
                 const d = new Date(tmdbEpisode.released);
                 if (!isNaN(d.getTime())) released = d.toISOString();
