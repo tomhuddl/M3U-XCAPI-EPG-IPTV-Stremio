@@ -126,10 +126,9 @@ function metadataLinks(details, credits, mediaType) {
   // Writers are supplied in TMDb credit order. The HTTP response layer
   // keeps this category visible only to the iOS Stremio client.
   const crew = Array.isArray(credits?.crew) ? credits.crew : [];
-  const writerJobs = new Set([
-    "Writer", "Screenplay", "Story", "Teleplay", "Creator", "Developed by",
-    "Story Editor", "Staff Writer", "Head Writer", "Executive Story Editor",
-  ]);
+  // Only include explicit writing credits. Creator/developed-by and editorial
+  // roles can identify people who did not write episodes or scripts themselves.
+  const writerJobs = new Set(["Writer", "Screenplay", "Story", "Teleplay"]);
   const seenWriters = new Set();
   for (const person of crew) {
     // Movie credits use person.job; TV aggregate credits use person.jobs[].
