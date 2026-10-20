@@ -931,8 +931,20 @@ async function createAddon(config) {
                     const cached = addonInstance.catalogMetaCache.get(i.id);
                     if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
 
+                    // Warm the cache without blocking catalogue delivery. Until
+                    // authoritative TMDb data is ready, avoid showing provider
+                    // genres/cast/plot as if they were the final metadata; otherwise
+                    // Stremio can appear to switch from one set of details to another.
                     addonInstance.queueCatalogMetaEnrichment(i);
-                    return meta;
+                    const firstPass = { ...meta, id: i.id, type: i.type };
+                    delete firstPass.genres;
+                    delete firstPass.cast;
+                    delete firstPass.description;
+                    delete firstPass.runtime;
+                    delete firstPass.releaseInfo;
+                    delete firstPass.year;
+                    delete firstPass.links;
+                    return firstPass;
                 });
                 
                 if (addonInstance.config.debug) {
