@@ -257,6 +257,9 @@ class M3UEPGAddon {
         this.catalogMetaQueue = [];
         this.catalogMetaWorkers = 0;
         this.epgData = {};
+        // XMLTV programme timestamps are immutable after parsing; cache their parsed
+        // Date values per addon instance to avoid reparsing large guides on each request.
+        this.epgTimeCache = new WeakMap();
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
 
@@ -516,10 +519,19 @@ class M3UEPGAddon {
         for (const program of sourcePrograms) {
             if (!program || !program.start || !program.stop) continue;
 
-            const start = this.parseEPGTime(program.start);
-            const end = this.parseEPGTime(program.stop);
-            const startMs = start instanceof Date ? start.getTime() : NaN;
-            const endMs = end instanceof Date ? end.getTime() : NaN;
+            let times = this.epgTimeCache.get(program);
+            if (!times) {
+                const start = this.parseEPGTime(program.start);
+                const end = this.parseEPGTime(program.stop);
+                times = {
+                    start,
+                    end,
+                    startMs: start instanceof Date ? start.getTime() : NaN,
+                    endMs: end instanceof Date ? end.getTime() : NaN
+                };
+                this.epgTimeCache.set(program, times);
+            }
+            const { start, end, startMs, endMs } = times;
             if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
             if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
 
@@ -1191,6 +1203,7 @@ async function createAddon(config) {
 }
 
 module.exports = createAddon;
+module.exports.M3UEPGAddon = M3UEPGAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
 module.exports.normalizeSearchText = normalizeSearchText;
