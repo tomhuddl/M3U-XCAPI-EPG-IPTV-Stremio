@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSaf
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
-const { normalizeGenre, matchesGenre } = require("./addon");
+const { normalizeGenre, matchesGenre, normalizeSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
@@ -47,6 +47,15 @@ function testLegacyTokensRequireExplicitOptIn() {
     process.env.ALLOW_LEGACY_CONFIG_TOKENS = "true";
     assert.deepStrictEqual(tryParseConfigToken(legacy), { provider: "direct", m3uUrl: "https://example.com/list.m3u" });
     delete process.env.ALLOW_LEGACY_CONFIG_TOKENS;
+}
+
+function testSearchNormalisationIgnoresPunctuationAndExtraWhitespace() {
+    assert.strictEqual(normalizeSearchText("Spider-Man"), "spider man");
+    assert.strictEqual(normalizeSearchText("spider man"), "spider man");
+    assert.strictEqual(normalizeSearchText("  SPIDER   MAN  "), "spider man");
+    assert.strictEqual(normalizeSearchText("Spider—Man: Brand New Day"), "spider man brand new day");
+    assert.strictEqual(normalizeSearchText("Café"), normalizeSearchText("CAFÉ"));
+    assert.strictEqual(normalizeSearchText("   ---   "), "");
 }
 
 function testGenreMatchingIgnoresCaseAndWhitespace() {
@@ -311,6 +320,7 @@ async function main() {
         testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
+        testSearchNormalisationIgnoresPunctuationAndExtraWhitespace,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
         testLruEvictionAndPromotion,
