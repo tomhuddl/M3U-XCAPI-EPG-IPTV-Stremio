@@ -8,7 +8,7 @@ const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { normalizeGenre, matchesGenre } = require("./addon");
-const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata } = require("./src/js/tmdbMetadata");
+const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
 function testEncryptedConfigRoundTrip() {
@@ -75,6 +75,67 @@ function testTmdbIdValidationAndMissingKeyGracefulHandling() {
             getSeriesMetadata("65251").then(value => assert.strictEqual(value, null))
         ]);
     }
+}
+
+function testMovieMetadataMapping() {
+    const meta = mapMovieMetadata(
+        {
+            title: "Spider-Man: Brand New Day",
+            overview: "A sample overview.",
+            release_date: "2026-07-29",
+            runtime: 145,
+            poster_path: "/poster.jpg",
+            backdrop_path: "/backdrop.jpg",
+            vote_average: 7.9,
+            vote_count: 1200,
+            genres: [{ name: "Action" }, { name: "Adventure" }]
+        },
+        {
+            crew: [{ job: "Director", name: "Sample Director" }, { job: "Writer", name: "Sample Writer" }],
+            cast: [{ name: "Actor One" }, { name: "Actor Two" }]
+        },
+        { results: [{ site: "YouTube", type: "Trailer", key: "abc123", name: "Official Trailer" }] }
+    );
+    assert.strictEqual(meta.name, "Spider-Man: Brand New Day");
+    assert.strictEqual(meta.year, 2026);
+    assert.strictEqual(meta.releaseInfo, "2026");
+    assert.strictEqual(meta.runtime, "145 min");
+    assert.strictEqual(meta.rating, "7.9");
+    assert.deepStrictEqual(meta.genres, ["Action", "Adventure"]);
+    assert.deepStrictEqual(meta.director, ["Sample Director"]);
+    assert.deepStrictEqual(meta.cast, ["Actor One", "Actor Two"]);
+    assert.strictEqual(meta.poster, "https://image.tmdb.org/t/p/w500/poster.jpg");
+    assert.strictEqual(meta.background, "https://image.tmdb.org/t/p/w1280/backdrop.jpg");
+    assert.strictEqual(meta.trailer.id, "abc123");
+    assert.strictEqual(mapMovieMetadata({ title: "Unknown", vote_average: 9.9, vote_count: 0 }, {}, {}).rating, undefined);
+}
+
+function testSeriesMetadataMapping() {
+    const meta = mapSeriesMetadata(
+        {
+            name: "Crashing",
+            overview: "Series overview.",
+            first_air_date: "2016-01-01",
+            episode_run_time: [25],
+            poster_path: "/series.jpg",
+            backdrop_path: "/series-backdrop.jpg",
+            vote_average: 7,
+            vote_count: 50,
+            genres: [{ name: "Comedy" }]
+        },
+        {
+            crew: [{ name: "Sample Director", jobs: [{ job: "Director" }] }],
+            cast: [{ name: "Series Actor" }]
+        },
+        { results: [] }
+    );
+    assert.strictEqual(meta.name, "Crashing");
+    assert.strictEqual(meta.year, 2016);
+    assert.strictEqual(meta.runtime, "25 min");
+    assert.strictEqual(meta.rating, "7.0");
+    assert.deepStrictEqual(meta.director, ["Sample Director"]);
+    assert.deepStrictEqual(meta.cast, ["Series Actor"]);
+    assert.strictEqual(meta.trailer, undefined);
 }
 
 function testXtreamTmdbIdNormalization() {
@@ -191,6 +252,8 @@ async function main() {
         testLegacyTokensRequireExplicitOptIn,
         testConfigValidation,
         testXtreamTmdbIdNormalization,
+        testMovieMetadataMapping,
+        testSeriesMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
