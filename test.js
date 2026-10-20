@@ -88,11 +88,11 @@ function testMovieMetadataMapping() {
             backdrop_path: "/backdrop.jpg",
             vote_average: 7.9,
             vote_count: 1200,
-            genres: [{ name: "Action" }, { name: "Adventure" }]
+            genres: [{ id: 28, name: "Action" }, { id: 12, name: "Adventure" }]
         },
         {
-            crew: [{ job: "Director", name: "Sample Director" }, { job: "Writer", name: "Sample Writer" }],
-            cast: [{ name: "Actor One" }, { name: "Actor Two" }]
+            crew: [{ id: 55, job: "Director", name: "Sample Director" }, { job: "Writer", name: "Sample Writer" }],
+            cast: [{ id: 101, name: "Actor One" }, { id: 102, name: "Actor Two" }]
         },
         { results: [{ site: "YouTube", type: "Trailer", key: "abc123", name: "Official Trailer" }] }
     );
@@ -104,6 +104,13 @@ function testMovieMetadataMapping() {
     assert.deepStrictEqual(meta.genres, ["Action", "Adventure"]);
     assert.deepStrictEqual(meta.director, ["Sample Director"]);
     assert.deepStrictEqual(meta.cast, ["Actor One", "Actor Two"]);
+    assert.deepStrictEqual(meta.links, [
+        { name: "Action", category: "Genre", url: "https://www.themoviedb.org/genre/28" },
+        { name: "Adventure", category: "Genre", url: "https://www.themoviedb.org/genre/12" },
+        { name: "Actor One", category: "Actor", url: "https://www.themoviedb.org/person/101" },
+        { name: "Actor Two", category: "Actor", url: "https://www.themoviedb.org/person/102" },
+        { name: "Sample Director", category: "Director", url: "https://www.themoviedb.org/person/55" }
+    ]);
     assert.strictEqual(meta.poster, "https://image.tmdb.org/t/p/w500/poster.jpg");
     assert.strictEqual(meta.background, "https://image.tmdb.org/t/p/w1280/backdrop.jpg");
     assert.strictEqual(meta.trailer.id, "abc123");
@@ -123,11 +130,11 @@ function testSeriesMetadataMapping() {
             backdrop_path: "/series-backdrop.jpg",
             vote_average: 7,
             vote_count: 50,
-            genres: [{ name: "Comedy" }]
+            genres: [{ id: 35, name: "Comedy" }]
         },
         {
             crew: [{ name: "Sample Director", jobs: [{ job: "Director" }] }],
-            cast: [{ name: "Series Actor" }]
+            cast: [{ id: 202, name: "Series Actor" }]
         },
         { results: [] }
     );
@@ -139,6 +146,10 @@ function testSeriesMetadataMapping() {
     assert.deepStrictEqual(meta.genres, ["Comedy"]);
     assert.strictEqual(meta.director, undefined);
     assert.deepStrictEqual(meta.cast, ["Series Actor"]);
+    assert.deepStrictEqual(meta.links, [
+        { name: "Comedy", category: "Genre", url: "https://www.themoviedb.org/genre/35" },
+        { name: "Series Actor", category: "Actor", url: "https://www.themoviedb.org/person/202" }
+    ]);
     assert.strictEqual(meta.trailer, undefined);
 }
 
