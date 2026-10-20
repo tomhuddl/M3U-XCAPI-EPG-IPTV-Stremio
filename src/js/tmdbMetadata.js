@@ -163,11 +163,7 @@ async function getSeriesMetadata(tmdbId) {
   return mapSeriesMetadata(details, credits, videos);
 }
 
-async function getSeasonEpisodes(tmdbId, seasonNumber) {
-  const id = validTmdbId(tmdbId);
-  const season = Number(seasonNumber);
-  if (!id || !Number.isSafeInteger(season) || season < 0 || season > 100) return null;
-  const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB");
+function mapSeasonEpisodes(data, season) {
   if (!data || !Array.isArray(data.episodes)) return null;
   return data.episodes.map(episode => ({
     season: Number.isSafeInteger(episode.season_number) ? episode.season_number : season,
@@ -181,6 +177,14 @@ async function getSeasonEpisodes(tmdbId, seasonNumber) {
     guestStars: uniqueNames(episode.guest_stars, person => person.name, 15),
     crew: uniqueNames(episode.crew, person => person.name, 15),
   })).filter(episode => Number.isSafeInteger(episode.episode) && episode.episode > 0);
+}
+
+async function getSeasonEpisodes(tmdbId, seasonNumber) {
+  const id = validTmdbId(tmdbId);
+  const season = Number(seasonNumber);
+  if (!id || !Number.isSafeInteger(season) || season < 0 || season > 100) return null;
+  const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB");
+  return mapSeasonEpisodes(data, season);
 }
 
 function stripEmpty(value) {
@@ -197,6 +201,7 @@ module.exports = {
   getSeasonEpisodes,
   mapMovieMetadata,
   mapSeriesMetadata,
+  mapSeasonEpisodes,
   validTmdbId,
   tmdbConfigured,
 };
