@@ -352,6 +352,36 @@ function testScheduledProgramsCacheParsedTimestamps() {
     assert.strictEqual(parseCalls, 2, "start and stop timestamps should only be parsed once per programme");
 }
 
+async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    const count = 75;
+    let active = 0;
+    let maxActive = 0;
+    const processed = [];
+    addon.getDetailedMetaAsync = async (id) => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await Promise.resolve();
+        processed.push(id);
+        active--;
+        return { id, type: "movie", name: id };
+    };
+
+    for (let i = 0; i < count; i++) {
+        addon.queueCatalogMetaEnrichment({ id: "movie-" + i, type: "movie", name: "Movie " + i });
+    }
+
+    while (addon.catalogMetaWorkers > 0 || addon.catalogMetaQueueHead < addon.catalogMetaQueue.length) {
+        await new Promise(resolve => setImmediate(resolve));
+    }
+
+    assert.strictEqual(processed.length, count);
+    assert.strictEqual(new Set(processed).size, count);
+    assert.ok(maxActive <= 3, "metadata enrichment concurrency should remain capped at three");
+    assert.deepStrictEqual(addon.catalogMetaQueue, []);
+    assert.strictEqual(addon.catalogMetaQueueHead, 0);
+}
+
 async function testStreamingEpgParser() {
     const xml = [
         '<?xml version="1.0"?>',
@@ -387,6 +417,7 @@ async function main() {
         testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testScheduledProgramsCacheParsedTimestamps,
+        testCatalogMetadataQueueDrainsWithoutLosingItems,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
