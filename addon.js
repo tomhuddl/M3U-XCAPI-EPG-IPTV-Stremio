@@ -623,13 +623,11 @@ class M3UEPGAddon {
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
             runtime: tmdb.runtime,
-            director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
             links: [
-                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
-                ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : [])
             ],
             videos
         };
@@ -670,8 +668,7 @@ class M3UEPGAddon {
                 tmdbRating: tmdb.rating,
                 trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
                 links: [
-                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
-                    ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : [])
                 ]
             };
         }
