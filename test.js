@@ -11,6 +11,14 @@ const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesS
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 
+function testDirectEpisodeLookupUsesExactIndex() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    const episode = { id: "iptv_series_ep_example", title: "Example episode", url: "https://example.com/episode.m3u8" };
+    addon.directSeriesEpisodeById.set(episode.id, episode);
+    assert.strictEqual(addon.lookupEpisodeById(episode.id), episode);
+    assert.strictEqual(addon.lookupEpisodeById("iptv_series_ep_missing"), null);
+}
+
 function testEncryptedConfigRoundTrip() {
     const config = {
         provider: "xtream",
@@ -417,6 +425,7 @@ async function main() {
         testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testScheduledProgramsCacheParsedTimestamps,
+        testDirectEpisodeLookupUsesExactIndex,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
