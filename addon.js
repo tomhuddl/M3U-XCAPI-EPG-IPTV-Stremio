@@ -594,27 +594,27 @@ class M3UEPGAddon {
             return video;
         });
 
-        const meta = {
+        if (!tmdb) return null;
+        return {
             id: seriesItem.id,
             type: 'series',
-            name: tmdb?.name || seriesItem.name,
+            name: tmdb.name,
+            poster: tmdb.poster,
+            background: tmdb.background,
+            description: tmdb.description,
+            genres: tmdb.genres,
+            releaseInfo: tmdb.releaseInfo,
+            year: tmdb.year,
+            runtime: tmdb.runtime,
+            director: tmdb.director,
+            cast: tmdb.cast,
+            tmdbRating: tmdb.rating,
+            links: [
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(seriesItem.tmdbId)) }] : []),
+                ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
+            ],
             videos
         };
-        if (tmdb) {
-            Object.assign(meta, {
-                poster: tmdb.poster,
-                background: tmdb.background,
-                description: tmdb.description,
-                genres: tmdb.genres,
-                releaseInfo: tmdb.releaseInfo,
-                year: tmdb.year,
-                runtime: tmdb.runtime,
-                director: tmdb.director,
-                cast: tmdb.cast,
-                tmdbRating: tmdb.rating
-            });
-        }
-        return meta;
     }
 
     async getDetailedMetaAsync(id, type) {
@@ -626,11 +626,13 @@ class M3UEPGAddon {
         const item = this.movies.find(movie => movie.id === id);
         if (item) {
             const providerModule = require('./src/js/providers/xtreamProvider.js');
-            let tmdbId = item.tmdbId;
+            const idCacheKey = 'movie-tmdb:' + id;
+            let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
             if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
                 const streamId = id.replace(/^iptv_vod_/, '');
                 const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
                 tmdbId = providerInfo?.tmdbId || null;
+                if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
             }
             const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
             if (!tmdb) return null;
@@ -648,7 +650,10 @@ class M3UEPGAddon {
                 director: tmdb.director,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
-                links: tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : undefined
+                links: [
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
+                    ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
+                ]
             };
         }
         // Live-channel metadata remains unchanged; it is not film/series metadata.
@@ -904,13 +909,7 @@ async function createAddon(config) {
                             const fallbackMeta = {
                                 id: seriesItem.id,
                                 type: 'series',
-                                name: seriesItem.name,
-                                poster: seriesItem.poster || seriesItem.attributes?.['tvg-logo'] ||
-                                    `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-                                description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-                                genres: seriesItem.category
-                                    ? [seriesItem.category]
-                                    : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+                                name: 'Metadata unavailable',
                                 videos: []
                             };
                             if (addonInstance.config.debug) {
