@@ -10,12 +10,31 @@ const { parseEPGStream } = require("./src/js/epgStreamParser");
 const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
+const { rebuildDirectEpisodeIndexes } = require("./src/js/providers/directProvider");
 
 function testDirectEpisodeLookupUsesExactIndex() {
     const addon = new M3UEPGAddon({ provider: "direct" });
-    const episode = { id: "iptv_series_ep_example", title: "Example episode", url: "https://example.com/episode.m3u8" };
-    addon.directSeriesEpisodeById.set(episode.id, episode);
-    assert.strictEqual(addon.lookupEpisodeById(episode.id), episode);
+    const staleEpisode = { id: "iptv_series_ep_stale", title: "Old episode" };
+    addon.directSeriesEpisodeIndex.set("old-series", [staleEpisode]);
+    addon.directSeriesEpisodeById.set(staleEpisode.id, staleEpisode);
+
+    const firstEpisode = { id: "iptv_series_ep_example", title: "Example episode", season: 1, episode: 1, url: "https://example.com/episode.m3u8" };
+    const duplicateIdEpisode = { id: firstEpisode.id, title: "Duplicate ID episode", season: 1, episode: 2, url: "https://example.com/duplicate.m3u8" };
+    const secondEpisode = { id: "iptv_series_ep_second", title: "Second episode", season: 1, episode: 2, url: "https://example.com/second.m3u8" };
+    const episodesBySeries = new Map([
+        ["iptv_series_example", [firstEpisode, duplicateIdEpisode]],
+        ["iptv_series_other", [secondEpisode]]
+    ]);
+
+    rebuildDirectEpisodeIndexes(addon, episodesBySeries);
+
+    assert.strictEqual(addon.directSeriesEpisodeIndex.get("example")[0], firstEpisode);
+    assert.strictEqual(addon.directSeriesEpisodeIndex.get("example").length, 2);
+    assert.strictEqual(addon.directSeriesEpisodeIndex.get("other")[0], secondEpisode);
+    assert.strictEqual(addon.directSeriesEpisodeById.get(firstEpisode.id), firstEpisode, "first duplicate ID should be preserved");
+    assert.strictEqual(addon.directSeriesEpisodeById.get(secondEpisode.id), secondEpisode);
+    assert.strictEqual(addon.directSeriesEpisodeById.has(staleEpisode.id), false, "rebuilding indexes should remove stale IDs");
+    assert.strictEqual(addon.lookupEpisodeById(firstEpisode.id), firstEpisode);
     assert.strictEqual(addon.lookupEpisodeById("iptv_series_ep_missing"), null);
 }
 
