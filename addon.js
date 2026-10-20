@@ -581,7 +581,28 @@ class M3UEPGAddon {
             return video;
         });
 
-        if (!tmdb) return null;
+        if (!tmdb) {
+            // Keep Xtream's playable episode catalogue when a TMDb ID is absent or unmatched.
+            return {
+                id: seriesItem.id,
+                type: 'series',
+                name: seriesItem.name,
+                poster: seriesItem.poster || seriesItem.attributes?.['tvg-logo'] ||
+                    `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
+                description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
+                genres: seriesItem.category
+                    ? [seriesItem.category]
+                    : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+                videos: (info?.videos || []).map(v => ({
+                    id: v.id,
+                    title: v.title || `Episode ${v.episode || ''}`.trim(),
+                    season: v.season,
+                    episode: v.episode,
+                    thumbnail: v.thumbnail || seriesItem.poster || undefined,
+                    ...(v.released ? { released: v.released } : {})
+                }))
+            };
+        }
         return {
             id: seriesItem.id,
             type: 'series',
@@ -622,7 +643,7 @@ class M3UEPGAddon {
                 if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
             }
             const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
-            if (!tmdb) return null;
+            if (!tmdb) return this.getDetailedMeta(id);
             return {
                 id: item.id,
                 type: 'movie',
