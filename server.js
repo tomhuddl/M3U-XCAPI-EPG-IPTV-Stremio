@@ -597,7 +597,7 @@ app.use("/:token", (req, res, next) => {
           // Stremio clients commonly render the displayed date from releaseInfo,
           // while some use year. Set both explicitly from the canonical year.
           const releaseText = String(meta.releaseInfo || "");
-          const yearFromRelease = releaseText.match(/\\b(18\\d{2}|19\\d{2}|20\\d{2}|21\\d{2})\\b/);
+          const yearFromRelease = releaseText.match(/\b(18\d{2}|19\d{2}|20\d{2}|21\d{2})\b/);
           const year = Number.isInteger(meta.year) && meta.year > 0
             ? meta.year
             : yearFromRelease ? Number(yearFromRelease[1]) : undefined;
