@@ -5,6 +5,7 @@ require('dotenv').config();
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
+const tmdbMetadata = require("./src/js/tmdbMetadata");
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
@@ -548,7 +549,15 @@ class M3UEPGAddon {
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
         const info = await this.ensureSeriesInfo(seriesIdRaw);
+        const tmdb = await tmdbMetadata.getSeriesMetadata(seriesItem.tmdbId);
+        const tmdbSeasons = new Map();
+        if (tmdb && tmdbMetadata.validTmdbId(seriesItem.tmdbId)) {
+            const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
+            const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(seriesItem.tmdbId, season)]));
+            for (const [season, episodes] of seasonResults) if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
+        }
         const videos = (info?.videos || []).map(v => {
+            const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
             // Ensure released is a valid ISO date or omit it
             let released = v.released || undefined;
             if (released && typeof released === 'string') {
@@ -567,28 +576,45 @@ class M3UEPGAddon {
             }
             const video = {
                 id: v.id,
-                title: v.title,
+                title: tmdbEpisode?.title || `Episode ${v.episode || ''}`.trim(),
                 season: v.season,
                 episode: v.episode,
-                thumbnail: v.thumbnail || seriesItem.poster || seriesItem.attributes?.['tvg-logo']
+                thumbnail: tmdbEpisode?.thumbnail || (tmdb ? undefined : v.thumbnail)
             };
+            if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
+            if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
+            if (tmdbEpisode?.rating) video.tmdbRating = tmdbEpisode.rating;
+            if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
+            if (tmdbEpisode?.crew?.length) video.crew = tmdbEpisode.crew;
+            if (tmdbEpisode?.released) {
+                const d = new Date(tmdbEpisode.released);
+                if (!isNaN(d.getTime())) released = d.toISOString();
+            }
             if (released) video.released = released;
             return video;
         });
 
-        return {
+        const meta = {
             id: seriesItem.id,
             type: 'series',
-            name: seriesItem.name,
-            poster: seriesItem.poster ||
-                seriesItem.attributes?.['tvg-logo'] ||
-                `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-            description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-            genres: seriesItem.category
-                ? [seriesItem.category]
-                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+            name: tmdb?.name || seriesItem.name,
             videos
         };
+        if (tmdb) {
+            Object.assign(meta, {
+                poster: tmdb.poster,
+                background: tmdb.background,
+                description: tmdb.description,
+                genres: tmdb.genres,
+                releaseInfo: tmdb.releaseInfo,
+                year: tmdb.year,
+                runtime: tmdb.runtime,
+                director: tmdb.director,
+                cast: tmdb.cast,
+                tmdbRating: tmdb.rating
+            });
+        }
+        return meta;
     }
 
     async getDetailedMetaAsync(id, type) {
@@ -597,7 +623,35 @@ class M3UEPGAddon {
             if (!seriesItem) return null;
             return await this.buildSeriesMeta(seriesItem);
         }
-        // fallback sync path
+        const item = this.movies.find(movie => movie.id === id);
+        if (item) {
+            const providerModule = require('./src/js/providers/xtreamProvider.js');
+            let tmdbId = item.tmdbId;
+            if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+                const streamId = id.replace(/^iptv_vod_/, '');
+                const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
+                tmdbId = providerInfo?.tmdbId || null;
+            }
+            const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
+            if (!tmdb) return null;
+            return {
+                id: item.id,
+                type: 'movie',
+                name: tmdb.name,
+                poster: tmdb.poster,
+                background: tmdb.background,
+                description: tmdb.description,
+                genres: tmdb.genres,
+                releaseInfo: tmdb.releaseInfo,
+                year: tmdb.year,
+                runtime: tmdb.runtime,
+                director: tmdb.director,
+                cast: tmdb.cast,
+                tmdbRating: tmdb.rating,
+                links: tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : undefined
+            };
+        }
+        // Live-channel metadata remains unchanged; it is not film/series metadata.
         return this.getDetailedMeta(id);
     }
 
