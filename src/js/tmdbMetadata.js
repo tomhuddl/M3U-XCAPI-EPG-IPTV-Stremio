@@ -133,6 +133,9 @@ function mapSeriesMetadata(details, credits, videos) {
       || videos.results.find(video => video.site === "YouTube" && video.key)
     : null;
   const year = dateYear(details.first_air_date);
+  const endYear = dateYear(details.last_air_date);
+  const stillRunning = details.status === "Returning Series" || details.status === "In Production";
+  const releaseInfo = year ? String(year) + (endYear ? "-" + endYear : stillRunning ? "-" : "") : undefined;
   const episodeRuntime = Array.isArray(details.episode_run_time)
     ? details.episode_run_time.find(n => Number.isFinite(n) && n > 0)
     : undefined;
@@ -143,7 +146,7 @@ function mapSeriesMetadata(details, credits, videos) {
     background: imageUrl(details.backdrop_path, "w1280"),
     genres: Array.isArray(details.genres) ? uniqueNames(details.genres, genre => genre.name, 20) : [],
     year,
-    releaseInfo: year ? String(year) : undefined,
+    releaseInfo,
     runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     director: directors,
@@ -175,7 +178,7 @@ function mapSeasonEpisodes(data, season) {
     runtime: Number.isFinite(episode.runtime) && episode.runtime > 0 ? episode.runtime + " min" : undefined,
     rating: Number.isFinite(episode.vote_average) && episode.vote_count > 0 ? Number(episode.vote_average).toFixed(1) : undefined,
     guestStars: uniqueNames(episode.guest_stars, person => person.name, 15),
-    crew: uniqueNames(episode.crew, person => person.name, 15),
+    directors: uniqueNames(episode.crew, person => /director/i.test(String(person.job || "")) ? person.name : null, 10),
   })).filter(episode => Number.isSafeInteger(episode.episode) && episode.episode > 0);
 }
 
