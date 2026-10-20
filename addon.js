@@ -57,8 +57,8 @@ function normalizeSearchText(value) {
     return String(value ?? '')
         .normalize('NFKC')
         .toLowerCase()
-        .replace(/[\\p{P}\\p{S}]+/gu, ' ')
-        .replace(/\\s+/g, ' ')
+        .replace(/[\p{P}\p{S}]+/gu, ' ')
+        .replace(/\s+/g, ' ')
         .trim();
 }
 
