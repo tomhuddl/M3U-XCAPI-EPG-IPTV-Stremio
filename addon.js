@@ -547,7 +547,8 @@ class M3UEPGAddon {
             if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
             videos.push(video);
         }
-        return videos.sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime));
+        // startTime values are normalized ISO-8601 UTC strings, so lexical order is chronological.
+        return videos.sort((a, b) => a.startTime.localeCompare(b.startTime));
     }
 
     async ensureSeriesInfo(seriesId) {
@@ -690,8 +691,16 @@ class M3UEPGAddon {
             const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(tmdbId, season)]));
             for (const [season, episodes] of seasonResults) if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
         }
+        // Index each season's episodes once. A repeated Array.find for every
+        // provider episode scales poorly for long-running series with many episodes.
+        const tmdbEpisodesByKey = new Map();
+        for (const [season, episodes] of tmdbSeasons) {
+            for (const episode of episodes) {
+                tmdbEpisodesByKey.set(`${season}:${Number(episode.episode)}`, episode);
+            }
+        }
         const videos = (info?.videos || []).map(v => {
-            const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
+            const tmdbEpisode = tmdbEpisodesByKey.get(`${Number(v.season)}:${Number(v.episode)}`);
             // Prefer TMDb episode details, retaining the provider listing if a season/episode has no match.
             let released = v.released || undefined;
             const video = {
