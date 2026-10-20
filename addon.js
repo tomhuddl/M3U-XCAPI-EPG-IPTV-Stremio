@@ -48,6 +48,20 @@ function matchesGenre(category, selectedGenre) {
     return selected.length > 0 && normalizeGenre(category) === selected;
 }
 
+/**
+ * Normalise catalogue search text without changing the displayed title.
+ * Unicode punctuation/symbols become spaces, and repeated whitespace collapses,
+ * making hyphenated and unhyphenated title variants equivalent.
+ */
+function normalizeSearchText(value) {
+    return String(value ?? '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/[\\p{P}\\p{S}]+/gu, ' ')
+        .replace(/\\s+/g, ' ')
+        .trim();
+}
+
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
 function makeLogger(cfgDebug) {
     const enabled = !!cfgDebug || DEBUG_ENV;
@@ -871,10 +885,13 @@ async function createAddon(config) {
                     });
                 }
                 
-                // If searching
+                // Normalise both sides so punctuation and spacing differences
+                // (e.g. "Spider-Man" vs "spider   man") do not hide matches.
                 if (extra.search) {
-                    const q = extra.search.toLowerCase();
-                    filtered = filtered.filter(i => i.name.toLowerCase().includes(q));
+                    const q = normalizeSearchText(extra.search);
+                    filtered = q
+                        ? filtered.filter(i => normalizeSearchText(i.name).includes(q))
+                        : [];
                 }
                 
                 // Pagination / Skip
@@ -1079,3 +1096,4 @@ async function createAddon(config) {
 module.exports = createAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
+module.exports.normalizeSearchText = normalizeSearchText;
