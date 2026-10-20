@@ -84,14 +84,7 @@ async function request(path) {
   return task;
 }
 
-async function getMovieMetadata(tmdbId) {
-  const id = validTmdbId(tmdbId);
-  if (!id) return null;
-  const [details, credits, videos] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB"),
-    request("/movie/" + id + "/credits?language=en-GB"),
-    request("/movie/" + id + "/videos?language=en-GB"),
-  ]);
+function mapMovieMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.title)) return null;
   const directors = uniqueNames(credits?.crew, person => person.job === "Director" ? person.name : null, 10);
   const cast = uniqueNames(credits?.cast, person => person.name, 20);
@@ -101,7 +94,7 @@ async function getMovieMetadata(tmdbId) {
     : null;
   const genres = Array.isArray(details.genres) ? uniqueNames(details.genres, genre => genre.name, 20) : [];
   const year = dateYear(details.release_date);
-  const meta = {
+  return stripEmpty({
     name: details.title,
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
@@ -114,18 +107,21 @@ async function getMovieMetadata(tmdbId) {
     director: directors,
     cast,
     trailer: trailer ? { id: trailer.key, title: nonEmpty(trailer.name) || "Trailer", site: "YouTube" } : undefined,
-  };
-  return stripEmpty(meta);
+  });
 }
 
-async function getSeriesMetadata(tmdbId) {
+async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
   const [details, credits, videos] = await Promise.all([
-    request("/tv/" + id + "?language=en-GB"),
-    request("/tv/" + id + "/aggregate_credits?language=en-GB"),
-    request("/tv/" + id + "/videos?language=en-GB"),
+    request("/movie/" + id + "?language=en-GB"),
+    request("/movie/" + id + "/credits?language=en-GB"),
+    request("/movie/" + id + "/videos?language=en-GB"),
   ]);
+  return mapMovieMetadata(details, credits, videos);
+}
+
+function mapSeriesMetadata(details, credits, videos) {
   if (!details || !nonEmpty(details.name)) return null;
   const directors = uniqueNames(credits?.crew, person => {
     const jobs = Array.isArray(person.jobs) ? person.jobs.map(job => job.job) : [];
@@ -137,7 +133,10 @@ async function getSeriesMetadata(tmdbId) {
       || videos.results.find(video => video.site === "YouTube" && video.key)
     : null;
   const year = dateYear(details.first_air_date);
-  const meta = {
+  const episodeRuntime = Array.isArray(details.episode_run_time)
+    ? details.episode_run_time.find(n => Number.isFinite(n) && n > 0)
+    : undefined;
+  return stripEmpty({
     name: details.name,
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
@@ -145,15 +144,23 @@ async function getSeriesMetadata(tmdbId) {
     genres: Array.isArray(details.genres) ? uniqueNames(details.genres, genre => genre.name, 20) : [],
     year,
     releaseInfo: year ? String(year) : undefined,
-    runtime: Array.isArray(details.episode_run_time) && details.episode_run_time.find(n => Number.isFinite(n) && n > 0)
-      ? details.episode_run_time.find(n => Number.isFinite(n) && n > 0) + " min"
-      : undefined,
+    runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     director: directors,
     cast,
     trailer: trailer ? { id: trailer.key, title: nonEmpty(trailer.name) || "Trailer", site: "YouTube" } : undefined,
-  };
-  return stripEmpty(meta);
+  });
+}
+
+async function getSeriesMetadata(tmdbId) {
+  const id = validTmdbId(tmdbId);
+  if (!id) return null;
+  const [details, credits, videos] = await Promise.all([
+    request("/tv/" + id + "?language=en-GB"),
+    request("/tv/" + id + "/aggregate_credits?language=en-GB"),
+    request("/tv/" + id + "/videos?language=en-GB"),
+  ]);
+  return mapSeriesMetadata(details, credits, videos);
 }
 
 async function getSeasonEpisodes(tmdbId, seasonNumber) {
@@ -188,6 +195,8 @@ module.exports = {
   getMovieMetadata,
   getSeriesMetadata,
   getSeasonEpisodes,
+  mapMovieMetadata,
+  mapSeriesMetadata,
   validTmdbId,
   tmdbConfigured,
 };
