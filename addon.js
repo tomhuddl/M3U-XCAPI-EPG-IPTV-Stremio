@@ -571,7 +571,7 @@ class M3UEPGAddon {
             if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
             if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
             if (tmdbEpisode?.rating) {
-                video.tmdbRating = tmdbEpisode.rating;
+                video.ratings = [{ value: tmdbEpisode.rating, system: 'TMDb' }];
                 video.links = [{
                     name: 'TMDb rating: ' + tmdbEpisode.rating,
                     category: 'Rating',
@@ -581,7 +581,7 @@ class M3UEPGAddon {
                 }];
             }
             if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
-            if (tmdbEpisode?.crew?.length) video.crew = tmdbEpisode.crew;
+            if (tmdbEpisode?.crew?.length) video.directors = tmdbEpisode.crew;
             if (tmdbEpisode?.released) {
                 const d = new Date(tmdbEpisode.released);
                 if (!isNaN(d.getTime())) released = d.toISOString();
