@@ -559,14 +559,14 @@ class M3UEPGAddon {
         }
         const videos = (info?.videos || []).map(v => {
             const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
-            // Episode display metadata must come from TMDb, never Xtream.
-            let released = undefined;
+            // Prefer TMDb episode details, retaining the provider listing if a season/episode has no match.
+            let released = tmdbEpisode ? undefined : (v.released || undefined);
             const video = {
                 id: v.id,
-                title: tmdbEpisode?.title || `Episode ${v.episode || ''}`.trim(),
+                title: tmdbEpisode?.title || v.title || `Episode ${v.episode || ''}`.trim(),
                 season: v.season,
                 episode: v.episode,
-                thumbnail: tmdbEpisode?.thumbnail || (tmdb ? undefined : v.thumbnail)
+                thumbnail: tmdbEpisode?.thumbnail || v.thumbnail || seriesItem.poster || undefined
             };
             if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
             if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
