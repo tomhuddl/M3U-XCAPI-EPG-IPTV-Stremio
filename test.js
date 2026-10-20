@@ -103,7 +103,7 @@ function testMovieMetadataMapping() {
     assert.strictEqual(meta.rating, "7.9");
     assert.deepStrictEqual(meta.genres, ["Action", "Adventure"]);
     assert.deepStrictEqual(meta.director, ["Sample Director", "Co-Director"]);
-    assert.deepStrictEqual(meta.cast, ["Actor 1", "Actor 2", "Actor 3", "Actor 4"]);
+    assert.deepStrictEqual(meta.cast, ["Actor 1", "Actor 2", "Actor 3", "Actor 4", "Actor 5", "Actor 6", "Actor 7", "Actor 8"]);
     assert.deepStrictEqual(meta.links, [
         { name: "Action", category: "Genre", url: "https://www.themoviedb.org/genre/28" },
         { name: "Adventure", category: "Genre", url: "https://www.themoviedb.org/genre/12" },
@@ -111,6 +111,10 @@ function testMovieMetadataMapping() {
         { name: "Actor 2", category: "Actor", url: "https://www.themoviedb.org/person/102" },
         { name: "Actor 3", category: "Actor", url: "https://www.themoviedb.org/person/103" },
         { name: "Actor 4", category: "Actor", url: "https://www.themoviedb.org/person/104" },
+        { name: "Actor 5", category: "Actor", url: "https://www.themoviedb.org/person/105" },
+        { name: "Actor 6", category: "Actor", url: "https://www.themoviedb.org/person/106" },
+        { name: "Actor 7", category: "Actor", url: "https://www.themoviedb.org/person/107" },
+        { name: "Actor 8", category: "Actor", url: "https://www.themoviedb.org/person/108" },
         { name: "Sample Director", category: "Directors", url: "https://www.themoviedb.org/person/55" },
         { name: "Co-Director", category: "Directors", url: "https://www.themoviedb.org/person/56" }
     ]);
