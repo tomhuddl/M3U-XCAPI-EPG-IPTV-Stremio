@@ -174,7 +174,7 @@ function mapSeriesMetadata(details, credits, videos) {
   const year = dateYear(details.first_air_date);
   const endYear = dateYear(details.last_air_date);
   const stillRunning = details.status === "Returning Series" || details.status === "In Production";
-  const releaseInfo = year ? String(year) + (endYear ? "-" + endYear : stillRunning ? "-" : "") : undefined;
+  const releaseInfo = year ? String(year) + (stillRunning ? "-" : endYear ? "-" + endYear : "") : undefined;
   const episodeRuntime = Array.isArray(details.episode_run_time)
     ? details.episode_run_time.find(n => Number.isFinite(n) && n > 0)
     : undefined;
