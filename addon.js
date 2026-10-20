@@ -879,7 +879,26 @@ async function createAddon(config) {
                     if (i.type === 'movie' || i.type === 'series') {
                         try {
                             const detailed = await addonInstance.getDetailedMetaAsync(i.id, i.type);
-                            if (detailed) return { ...meta, ...detailed, id: i.id, type: i.type };
+                            if (detailed) {
+                                // Preserve useful provider catalogue categories when
+                                // TMDb has no genre data, and keep cast/genres in the
+                                // lightweight catalogue preview response.
+                                const providerGenre = i.category || i.attributes?.['group-title'];
+                                const genres = Array.isArray(detailed.genres) && detailed.genres.length
+                                    ? detailed.genres
+                                    : (meta.genres?.length ? meta.genres : (providerGenre ? [providerGenre] : []));
+                                const cast = Array.isArray(detailed.cast) && detailed.cast.length
+                                    ? detailed.cast
+                                    : (Array.isArray(meta.cast) ? meta.cast : undefined);
+                                return {
+                                    ...meta,
+                                    ...detailed,
+                                    genres,
+                                    ...(cast?.length ? { cast } : {}),
+                                    id: i.id,
+                                    type: i.type
+                                };
+                            }
                         } catch (error) {
                             addonInstance.log.warn('Catalog metadata enrichment failed for', i.id, error?.message || error);
                         }
