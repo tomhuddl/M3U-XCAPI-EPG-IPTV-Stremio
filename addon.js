@@ -71,17 +71,22 @@ function normalizeSearchText(value) {
  */
 // Search normalization is repeated for every catalogue item and every query.
 // Keep a bounded cache so large libraries avoid re-normalizing the same titles.
-const normalizedSearchCache = new LRUCache({
-    max: parsePositiveInteger(process.env.SEARCH_TEXT_CACHE_MAX, 20000, 1000, 100000),
-    ttl: 30 * 60 * 1000
-});
+const NORMALIZED_SEARCH_CACHE_MAX = parsePositiveInteger(
+    process.env.SEARCH_TEXT_CACHE_MAX, 20000, 1000, 100000
+);
+// Use a bounded FIFO Map here rather than the shared LRU implementation: that
+// cache prunes expired entries on every write, which is undesirable when a
+// large catalogue introduces thousands of new titles in one search pass.
+const normalizedSearchCache = new Map();
 
 function getNormalizedSearchText(value) {
     const original = String(value ?? '');
-    const cached = normalizedSearchCache.get(original);
-    if (cached !== undefined) return cached;
+    if (normalizedSearchCache.has(original)) return normalizedSearchCache.get(original);
     const normalized = normalizeSearchText(original);
     normalizedSearchCache.set(original, normalized);
+    if (normalizedSearchCache.size > NORMALIZED_SEARCH_CACHE_MAX) {
+        normalizedSearchCache.delete(normalizedSearchCache.keys().next().value);
+    }
     return normalized;
 }
 
