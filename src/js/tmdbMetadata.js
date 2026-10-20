@@ -91,7 +91,7 @@ function metadataLinks(details, credits, mediaType) {
     if (nonEmpty(genre?.name) && Number.isSafeInteger(genre.id) && genre.id > 0) {
       links.push({
         name: genre.name,
-        category: "Genre",
+        category: "Genres",
         url: "https://www.themoviedb.org/genre/" + genre.id,
       });
     }
@@ -101,7 +101,7 @@ function metadataLinks(details, credits, mediaType) {
     if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0) {
       links.push({
         name: person.name,
-        category: "Actor",
+        category: "Cast",
         url: "https://www.themoviedb.org/person/" + person.id,
       });
     }
