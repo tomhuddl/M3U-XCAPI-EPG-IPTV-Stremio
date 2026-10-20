@@ -55,11 +55,75 @@ function matchesGenre(category, selectedGenre) {
  */
 function normalizeSearchText(value) {
     return String(value ?? '')
-        .normalize('NFKC')
+        .normalize('NFKD')
+        .replace(/\p{M}+/gu, '')
         .toLowerCase()
         .replace(/[\p{P}\p{S}]+/gu, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+/**
+ * Return true when every query word can be matched to a distinct title word.
+ * Exact phrase matching remains the fast path; token matching also supports
+ * reordered words, partial words while typing, and a single-character typo
+ * in words of at least five characters.
+ */
+function matchesSearchText(query, title) {
+    const q = normalizeSearchText(query);
+    const text = normalizeSearchText(title);
+    if (!q || !text) return false;
+    if (text.includes(q)) return true;
+
+    const queryWords = q.split(' ').filter(Boolean);
+    const titleWords = text.split(' ').filter(Boolean);
+    if (!queryWords.length || queryWords.length > titleWords.length) return false;
+
+    const words = [...queryWords].sort((a, b) => b.length - a.length);
+    const used = new Set();
+
+    function matchesWord(queryWord, titleWord) {
+        if (titleWord.startsWith(queryWord)) return true;
+        if (queryWord.length < 5 || titleWord.length < 5) return false;
+        return editDistanceAtMostOne(queryWord, titleWord);
+    }
+
+    function assign(index) {
+        if (index >= words.length) return true;
+        const word = words[index];
+        for (let i = 0; i < titleWords.length; i++) {
+            if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
+            used.add(i);
+            if (assign(index + 1)) return true;
+            used.delete(i);
+        }
+        return false;
+    }
+
+    return assign(0);
+}
+
+function editDistanceAtMostOne(a, b) {
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0;
+    let j = 0;
+    let edits = 0;
+    while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) {
+            i++;
+            j++;
+            continue;
+        }
+        if (++edits > 1) return false;
+        if (a.length > b.length) i++;
+        else if (b.length > a.length) j++;
+        else {
+            i++;
+            j++;
+        }
+    }
+    if (i < a.length || j < b.length) edits++;
+    return edits <= 1;
 }
 
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
@@ -888,10 +952,7 @@ async function createAddon(config) {
                 // Normalise both sides so punctuation and spacing differences
                 // (e.g. "Spider-Man" vs "spider   man") do not hide matches.
                 if (extra.search) {
-                    const q = normalizeSearchText(extra.search);
-                    filtered = q
-                        ? filtered.filter(i => normalizeSearchText(i.name).includes(q))
-                        : [];
+                    filtered = filtered.filter(i => matchesSearchText(extra.search, i.name));
                 }
                 
                 // Pagination / Skip
@@ -1097,3 +1158,4 @@ module.exports = createAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
 module.exports.normalizeSearchText = normalizeSearchText;
+module.exports.matchesSearchText = matchesSearchText;
