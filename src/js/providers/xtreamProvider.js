@@ -145,7 +145,8 @@ async function fetchData(addonInstance) {
         url: `${xtreamUrl}/movie/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.${s.container_extension}`,
         poster: s.stream_icon,
         plot: s.plot,
-        year: s.releasedate ? new Date(s.releasedate).getFullYear() : null,
+        // TMDb ID is an identifier only; display metadata is fetched from TMDb.
+        tmdbId: s.tmdb_id || s.tmdb || null,
         category: cat,
         attributes: {
           "tvg-logo": s.stream_icon,
@@ -186,6 +187,7 @@ async function fetchData(addonInstance) {
               return {
                 id: `iptv_series_${s.series_id}`,
                 series_id: s.series_id,
+                tmdbId: s.tmdb || s.tmdb_id || null,
                 name: s.name,
                 type: "series",
                 poster: s.cover,
@@ -245,6 +247,22 @@ async function fetchData(addonInstance) {
         .sort((a, b) => String(a.start).localeCompare(String(b.start)));
     }
     addonInstance.epgData = merged;
+  }
+}
+
+async function fetchMovieInfo(addonInstance, streamId) {
+  const { config } = addonInstance;
+  if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  try {
+    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, { timeout: 20000 });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
+    const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;
+    return { tmdbId: /^\\d{1,12}$/.test(String(tmdbId || "")) && Number(tmdbId) > 0 ? String(tmdbId) : null };
+  } catch {
+    return null;
   }
 }
 
@@ -333,5 +351,6 @@ function cryptoHash(text) {
 
 module.exports = {
   fetchData,
+  fetchMovieInfo,
   fetchSeriesInfo,
 };
