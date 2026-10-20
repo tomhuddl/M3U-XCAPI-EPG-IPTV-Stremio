@@ -92,36 +92,44 @@ function matchesSearchText(query, title) {
     );
 }
 
-function matchesNormalizedSearchText(q, text) {
-    if (!q || !text) return false;
-    if (text.includes(q)) return true;
+function createNormalizedSearchMatcher(q) {
+    if (!q) return () => false;
 
-    const queryWords = q.split(' ').filter(Boolean);
-    const titleWords = text.split(' ').filter(Boolean);
-    if (!queryWords.length || queryWords.length > titleWords.length) return false;
+    // Query tokenization and ordering are independent of the title, so compile
+    // them once per search request rather than once per catalogue item.
+    const words = q.split(' ').filter(Boolean).sort((a, b) => b.length - a.length);
+    return function matchNormalizedTitle(text) {
+        if (!text) return false;
+        if (text.includes(q)) return true;
 
-    const words = [...queryWords].sort((a, b) => b.length - a.length);
-    const used = new Set();
+        const titleWords = text.split(' ').filter(Boolean);
+        if (!words.length || words.length > titleWords.length) return false;
+        const used = new Set();
 
-    function matchesWord(queryWord, titleWord) {
-        if (titleWord.startsWith(queryWord)) return true;
-        if (queryWord.length < 5 || titleWord.length < 5) return false;
-        return editDistanceAtMostOne(queryWord, titleWord);
-    }
-
-    function assign(index) {
-        if (index >= words.length) return true;
-        const word = words[index];
-        for (let i = 0; i < titleWords.length; i++) {
-            if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
-            used.add(i);
-            if (assign(index + 1)) return true;
-            used.delete(i);
+        function matchesWord(queryWord, titleWord) {
+            if (titleWord.startsWith(queryWord)) return true;
+            if (queryWord.length < 5 || titleWord.length < 5) return false;
+            return editDistanceAtMostOne(queryWord, titleWord);
         }
-        return false;
-    }
 
-    return assign(0);
+        function assign(index) {
+            if (index >= words.length) return true;
+            const word = words[index];
+            for (let i = 0; i < titleWords.length; i++) {
+                if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
+                used.add(i);
+                if (assign(index + 1)) return true;
+                used.delete(i);
+            }
+            return false;
+        }
+
+        return assign(0);
+    };
+}
+
+function matchesNormalizedSearchText(q, text) {
+    return createNormalizedSearchMatcher(q)(text);
 }
 
 function editDistanceAtMostOne(a, b) {
@@ -974,10 +982,8 @@ async function createAddon(config) {
                 // (e.g. "Spider-Man" vs "spider   man") do not hide matches.
                 if (extra.search) {
                     // Normalize the query once per catalogue request, not once per title.
-                    const normalizedQuery = getNormalizedSearchText(extra.search);
-                    filtered = filtered.filter(i =>
-                        matchesNormalizedSearchText(normalizedQuery, getNormalizedSearchText(i.name))
-                    );
+                    const matcher = createNormalizedSearchMatcher(getNormalizedSearchText(extra.search));
+                    filtered = filtered.filter(i => matcher(getNormalizedSearchText(i.name)));
                 }
                 
                 // Pagination / Skip
@@ -1185,3 +1191,4 @@ module.exports.matchesGenre = matchesGenre;
 module.exports.normalizeSearchText = normalizeSearchText;
 module.exports.matchesSearchText = matchesSearchText;
 module.exports.matchesNormalizedSearchText = matchesNormalizedSearchText;
+module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
