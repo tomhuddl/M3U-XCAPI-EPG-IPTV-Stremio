@@ -920,7 +920,7 @@ async function createAddon(config) {
                     }
                     return { meta: meta || null };
                 }
-                const meta = addonInstance.getDetailedMeta(id);
+                const meta = await addonInstance.getDetailedMetaAsync(id, type);
                 if (meta && type === 'tv' && meta.type === 'tv') {
                     const channel = addonInstance.channels.find(item => item.id === id);
                     if (channel) {
