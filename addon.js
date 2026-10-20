@@ -560,7 +560,7 @@ class M3UEPGAddon {
         const videos = (info?.videos || []).map(v => {
             const tmdbEpisode = (tmdbSeasons.get(Number(v.season)) || []).find(ep => ep.episode === Number(v.episode));
             // Prefer TMDb episode details, retaining the provider listing if a season/episode has no match.
-            let released = tmdbEpisode ? undefined : (v.released || undefined);
+            let released = v.released || undefined;
             const video = {
                 id: v.id,
                 title: tmdbEpisode?.title || v.title || `Episode ${v.episode || ''}`.trim(),
