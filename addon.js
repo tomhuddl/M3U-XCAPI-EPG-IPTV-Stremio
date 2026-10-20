@@ -283,6 +283,9 @@ class M3UEPGAddon {
 
         // Direct provider may populate this (seriesId -> episodes array)
         this.directSeriesEpisodeIndex = new Map();
+        // Direct-provider episode IDs are stable for a loaded playlist; index them
+        // so stream resolution does not scan every series and episode.
+        this.directSeriesEpisodeById = new Map();
 
         if (typeof this.config.epgOffsetHours === 'string') {
             const n = parseFloat(this.config.epgOffsetHours);
@@ -689,12 +692,8 @@ class M3UEPGAddon {
                 if (found) return found;
             }
         }
-        // Direct provider inline index
-        for (const arr of this.directSeriesEpisodeIndex.values()) {
-            const found = arr.find(v => v.id === epId);
-            if (found) return found;
-        }
-        return null;
+        // Direct-provider episodes are indexed when the playlist is loaded.
+        return this.directSeriesEpisodeById.get(epId) || null;
     }
 
     async buildSeriesMeta(seriesItem) {
