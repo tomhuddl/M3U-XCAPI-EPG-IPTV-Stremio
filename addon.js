@@ -865,47 +865,17 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                const metas = await Promise.all(page.map(async i => {
+                // Keep catalogue responses fast: do not make per-item TMDb/Xtream
+                // detail requests while Stremio is waiting for a page of cards.
+                // Full metadata remains available when an individual item is opened.
+                const metas = page.map(i => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
                         meta.behaviorHints = { isLive: true };
                         meta.posterShape = 'square';
-                        return meta;
-                    }
-
-                    // Enrich movie and series catalogue previews with their
-                    // detailed metadata so home/search cards have richer text
-                    // and artwork. Keep the rating out of this preview response.
-                    if (i.type === 'movie' || i.type === 'series') {
-                        try {
-                            const detailed = await addonInstance.getDetailedMetaAsync(i.id, i.type);
-                            if (detailed) {
-                                const providerGenre = i.category || i.attributes?.['group-title'];
-                                const genres = Array.isArray(detailed.genres) && detailed.genres.length
-                                    ? detailed.genres
-                                    : (meta.genres?.length ? meta.genres : (providerGenre ? [providerGenre] : []));
-                                const cast = Array.isArray(detailed.cast) && detailed.cast.length
-                                    ? detailed.cast
-                                    : (Array.isArray(meta.cast) ? meta.cast : undefined);
-                                const { tmdbRating, ...preview } = detailed;
-                                preview.links = Array.isArray(preview.links)
-                                    ? preview.links.filter(link => link?.category !== 'Rating')
-                                    : preview.links;
-                                return {
-                                    ...meta,
-                                    ...preview,
-                                    genres,
-                                    ...(cast?.length ? { cast } : {}),
-                                    id: i.id,
-                                    type: i.type
-                                };
-                            }
-                        } catch (error) {
-                            addonInstance.log.warn('Catalog metadata enrichment failed for', i.id, error?.message || error);
-                        }
                     }
                     return meta;
-                }));
+                });
                 
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
