@@ -549,11 +549,12 @@ class M3UEPGAddon {
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
         const info = await this.ensureSeriesInfo(seriesIdRaw);
-        const tmdb = await tmdbMetadata.getSeriesMetadata(seriesItem.tmdbId);
+        const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
+        const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
         const tmdbSeasons = new Map();
-        if (tmdb && tmdbMetadata.validTmdbId(seriesItem.tmdbId)) {
+        if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
             const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
-            const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(seriesItem.tmdbId, season)]));
+            const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(tmdbId, season)]));
             for (const [season, episodes] of seasonResults) if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
         }
         const videos = (info?.videos || []).map(v => {
@@ -610,7 +611,7 @@ class M3UEPGAddon {
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             links: [
-                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(seriesItem.tmdbId)) }] : []),
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.trailer ? [{ name: tmdb.trailer.title, category: 'Trailer', url: 'https://www.youtube.com/watch?v=' + encodeURIComponent(tmdb.trailer.id) }] : [])
             ],
             videos
