@@ -581,7 +581,7 @@ app.get("/:token/manifest.json", (req, res) => {
 // outside the shared metadata builder and fail conservatively when the client
 // cannot be identified.
 app.use("/:token", (req, res, next) => {
-  const pathIsMeta = /^\\/meta\\/(movie|series)\\//.test(req.path);
+  const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
   const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
   const isIosStremioClient =
     userAgent.includes("stremio") &&
