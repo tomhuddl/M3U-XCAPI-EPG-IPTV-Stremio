@@ -1415,7 +1415,7 @@ async function createAddon(config) {
                 // Allow more independent item lookups to overlap. Keep this configurable
                 // because some Xtream providers impose stricter request limits.
                 const genreMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_GENRE_META_CONCURRENCY, 12, 1, 12
+                    process.env.CATALOG_GENRE_META_CONCURRENCY, 16, 1, 16
                 );
                 const enrichmentStartedAt = Date.now();
                 if (page.length && (args.type === 'movie' || args.type === 'series')) {
