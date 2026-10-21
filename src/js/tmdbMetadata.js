@@ -90,11 +90,13 @@ async function request(path) {
     try {
       const separator = path.includes("?") ? "&" : "?";
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
+      const diagnostics = {};
       const response = await safeFetch(url, {
         timeout: 12000,
         // Opt in only for TMDb requests. safeFetch still resolves and validates
         // DNS for every request before selecting an agent pinned to those addresses.
         reuseConnection: true,
+        diagnostics,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
       status = response.status;
@@ -103,13 +105,21 @@ async function request(path) {
         logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
       }
+      const jsonStartedAt = Date.now();
       const data = await response.json();
+      const jsonMs = Date.now() - jsonStartedAt;
       if (!data || typeof data !== "object" || Array.isArray(data)) {
         logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
         return null;
       }
       cache.set(cacheKey, data);
-      logRequestDebug("fetched", { path, status, ms: Date.now() - startedAt });
+      logRequestDebug("fetched", {
+        path, status, ms: Date.now() - startedAt,
+        dnsMs: diagnostics.dnsMs ?? null,
+        headersMs: diagnostics.headersMs ?? null,
+        jsonMs,
+        freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
+      });
       return data;
     } catch (error) {
       logRequestDebug("request-error", {
