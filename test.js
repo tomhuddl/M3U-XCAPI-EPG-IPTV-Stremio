@@ -340,16 +340,18 @@ function testValidatedConnectionReuseIsScopedToValidatedAddresses() {
     const firstAgent = getPinnedAgent(url, firstAddresses, true);
     const reusedAgent = getPinnedAgent(url, firstAddresses, true);
     const changedAgent = getPinnedAgent(url, changedAddresses, true);
+    const oneShotAgent = getPinnedAgent(url, firstAddresses, false);
 
     try {
         assert.strictEqual(firstAgent, reusedAgent, "same origin and validated DNS answers should reuse an agent");
         assert.notStrictEqual(firstAgent, changedAgent, "changed validated DNS answers must not reuse the old pinned agent");
         assert.strictEqual(firstAgent.options.keepAlive, true, "opt-in agents should enable keep-alive");
-        assert.strictEqual(getPinnedAgent(url, firstAddresses, false).options.keepAlive, false,
+        assert.strictEqual(oneShotAgent.options.keepAlive, false,
             "requests without opt-in should retain one-shot agent behavior");
     } finally {
         firstAgent.destroy();
         changedAgent.destroy();
+        oneShotAgent.destroy();
     }
 }
 
