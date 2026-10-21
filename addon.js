@@ -796,6 +796,42 @@ class M3UEPGAddon {
         };
     }
 
+    async enrichCatalogMetaItems(items, concurrency = 3) {
+        const candidates = items.filter(item =>
+            item && (item.type === 'movie' || item.type === 'series') &&
+            !this.catalogMetaCache.has(item.id)
+        );
+        let nextIndex = 0;
+        const worker = async () => {
+            while (nextIndex < candidates.length) {
+                const item = candidates[nextIndex++];
+                try {
+                    const detailed = await this.getCatalogMetaAsync(item.id, item.type);
+                    if (!detailed) continue;
+                    const preview = { ...detailed };
+                    delete preview.tmdbRating;
+                    if (Array.isArray(preview.links)) {
+                        preview.links = preview.links.filter(link => link?.category !== 'Rating');
+                    }
+                    const providerGenre = item.category || item.attributes?.['group-title'];
+                    if (!Array.isArray(preview.genres) || !preview.genres.length) {
+                        const base = this.generateMetaPreview(item);
+                        preview.genres = base.genres?.length ? base.genres : (providerGenre ? [providerGenre] : []);
+                    }
+                    if (!Array.isArray(preview.cast) || !preview.cast.length) {
+                        const base = this.generateMetaPreview(item);
+                        if (Array.isArray(base.cast) && base.cast.length) preview.cast = base.cast;
+                    }
+                    this.catalogMetaCache.set(item.id, preview);
+                } catch (error) {
+                    this.log.warn('Foreground catalogue metadata enrichment failed for', item.id, error?.message || error);
+                }
+            }
+        };
+        const workerCount = Math.min(Math.max(1, concurrency), candidates.length);
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    }
+
     queueCatalogMetaEnrichment(item) {
         if (!item || this.catalogMetaCache.has(item.id) || this.catalogMetaPending.has(item.id)) return;
         this.catalogMetaPending.set(item.id, true);
@@ -1141,18 +1177,18 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                // Return cached enriched cards immediately. Missing metadata is
-                // fetched in a small background queue, so cold catalogue loads stay
-                // fast and subsequent requests can use the richer cached previews.
-                // Enrich only the first visible portion of a catalogue page. Enqueuing
-                // all 100 returned cards can saturate the workers with items the user
-                // may never scroll to, delaying metadata for the cards they actually see.
+                // Stremio does not push catalogue updates into an already-rendered
+                // Discover page. For a selected genre, enrich the returned page before
+                // replying so its metadata is visible without leaving and re-entering.
+                // Keep unfiltered cold starts fast by enriching only the first visible rows
+                // in the background.
                 const catalogMetaPrefetchItems = parsePositiveInteger(
                     process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
                 );
-                // When a genre is selected, warm the whole returned genre catalogue
-                // immediately; otherwise keep cold-start work focused on the first rows.
                 const enrichWholeGenre = Boolean(extra.genre);
+                if (enrichWholeGenre) {
+                    await addonInstance.enrichCatalogMetaItems(page, 3);
+                }
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
@@ -1169,7 +1205,7 @@ async function createAddon(config) {
                     // authoritative TMDb data is ready, avoid showing provider
                     // genres/cast/plot as if they were the final metadata; otherwise
                     // Stremio can appear to switch from one set of details to another.
-                    if (enrichWholeGenre || pageIndex < catalogMetaPrefetchItems) {
+                    if (!enrichWholeGenre && pageIndex < catalogMetaPrefetchItems) {
                         addonInstance.queueCatalogMetaEnrichment(i);
                     }
                     const firstPass = { ...meta, id: i.id, type: i.type };
