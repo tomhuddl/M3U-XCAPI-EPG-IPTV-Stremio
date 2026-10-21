@@ -1215,12 +1215,11 @@ async function createAddon(config) {
                     filtered = filtered.filter(i => matcher(getNormalizedSearchText(i.name)));
                 }
                 
-                // Keep movie/series Discover pages small enough to enrich completely
-                // before returning them. Stremio requests subsequent pages as the user
-                // scrolls, so each new batch can arrive fully enriched without relying on
-                // the client to refresh cards already on screen. Search and live-TV/EPG
-                // retain the existing 100-item page size.
-                const catalogPageSize = (args.type === 'movie' || args.type === 'series') && !extra.search
+                // Keep every movie/series Discover batch small enough to enrich fully
+                // before returning it, including search results. Stremio requests the next
+                // page as the user scrolls, so no visible movie/series card depends on a
+                // later background update. Live-TV/EPG retain the existing 100-item size.
+                const catalogPageSize = (args.type === 'movie' || args.type === 'series')
                     ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100)
                     : 100;
 
@@ -1264,49 +1263,15 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                // Stremio does not push catalogue updates into an already-rendered
-                // Discover page. Enrich selected genres and search results before replying,
-                // so their metadata is visible immediately without leaving/re-entering.
-                // Keep the initial unfiltered catalogue fast by enriching its first visible
-                // rows in the background.
-                const catalogMetaPrefetchItems = parsePositiveInteger(
-                    process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
-                );
-                // Do not block a search on metadata requests for the entire page.
-                // Enrich a bounded first batch before replying, then queue remaining
-                // results in the background so large searches cannot stall Stremio.
-                const searchMetaItems = parsePositiveInteger(
-                    process.env.CATALOG_SEARCH_META_ITEMS, 12, 1, 30
-                );
-                const searchMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_SEARCH_META_CONCURRENCY, 3, 1, 6
-                );
-                // Non-search movie/series pages deliberately enrich the entire page
-                // before replying. Smaller pages let Discover append complete metadata
-                // as the user scrolls, without relying on an unsupported live card refresh.
-                // Search keeps a bounded foreground batch to remain responsive.
+                // Stremio does not reliably refresh cards already rendered in Discover.
+                // Enrich every movie/series item in the current page before replying,
+                // including search results. Later pages are loaded when the user scrolls.
                 const genreMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_GENRE_META_CONCURRENCY, 8, 1, 8
                 );
-                const hasSearch = Boolean(extra.search);
-                const hasGenre = Boolean(extra.genre);
-                const foregroundItems = hasSearch
-                    ? page.slice(0, searchMetaItems)
-                    : page;
-                if (foregroundItems.length) {
-                    const concurrency = hasSearch
-                        ? searchMetaConcurrency
-                        : genreMetaConcurrency;
-                    await addonInstance.enrichCatalogMetaItems(foregroundItems, concurrency);
+                if (page.length && (args.type === 'movie' || args.type === 'series')) {
+                    await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
                 }
-                // Background work keeps the cache warm without holding up the
-                // catalogue response. This does not alter the selected-genre path.
-                if (hasSearch) {
-                    for (const item of page.slice(searchMetaItems)) {
-                        addonInstance.queueCatalogMetaEnrichment(item);
-                    }
-                }
-                const enrichWholeSelection = hasGenre || hasSearch;
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
