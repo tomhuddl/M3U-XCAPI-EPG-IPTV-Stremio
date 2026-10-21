@@ -7,6 +7,9 @@ const net = require("net");
 const ipaddr = require("ipaddr.js");
 const fetch = require("node-fetch");
 
+const REUSABLE_AGENT_MAX_ENTRIES = 8;
+const reusableAgents = new Map();
+
 const PROVIDER_MAX_BYTES_RAW = Number.parseInt(
   process.env.PROVIDER_MAX_BYTES || "50000000",
   10,
@@ -53,7 +56,7 @@ async function resolvePublicAddresses(url) {
   return records;
 }
 
-function createPinnedAgent(url, addresses) {
+function createPinnedAgent(url, addresses, keepAlive = false) {
   const lookup = (hostname, options, callback) => {
     if (typeof options === "function") {
       callback = options;
@@ -75,8 +78,36 @@ function createPinnedAgent(url, addresses) {
   };
 
   return url.protocol === "https:"
-    ? new https.Agent({ keepAlive: false, lookup })
-    : new http.Agent({ keepAlive: false, lookup });
+    ? new https.Agent({ keepAlive, maxSockets: 16, maxFreeSockets: 4, lookup })
+    : new http.Agent({ keepAlive, maxSockets: 16, maxFreeSockets: 4, lookup });
+}
+
+function getPinnedAgent(url, addresses, reuseConnection) {
+  if (!reuseConnection) return createPinnedAgent(url, addresses);
+  // DNS is still resolved and validated on every request. Including the exact
+  // validated address set in the key prevents reusing an agent pinned to an
+  // address that is no longer returned by DNS.
+  const addressKey = addresses
+    .map(({ address, family }) => family + ":" + address)
+    .sort()
+    .join(",");
+  const key = url.protocol + "//" + url.hostname.toLowerCase() + ":" +
+    (url.port || (url.protocol === "https:" ? "443" : "80")) + "|" + addressKey;
+  let agent = reusableAgents.get(key);
+  if (agent && !agent.destroyed) {
+    reusableAgents.delete(key);
+    reusableAgents.set(key, agent);
+    return agent;
+  }
+  agent = createPinnedAgent(url, addresses, true);
+  reusableAgents.set(key, agent);
+  while (reusableAgents.size > REUSABLE_AGENT_MAX_ENTRIES) {
+    const oldestKey = reusableAgents.keys().next().value;
+    const oldestAgent = reusableAgents.get(oldestKey);
+    reusableAgents.delete(oldestKey);
+    oldestAgent?.destroy();
+  }
+  return agent;
 }
 
 /**
@@ -96,6 +127,8 @@ async function safeFetch(input, options = {}) {
     ? Math.max(0, Math.min(options.maxRedirects, 5))
     : 3;
   const fetchOptions = { ...options };
+  const reuseConnection = fetchOptions.reuseConnection === true;
+  delete fetchOptions.reuseConnection;
   delete fetchOptions.maxRedirects;
 
   // Keep a total deadline active through response-body consumption. node-fetch's
@@ -115,7 +148,7 @@ async function safeFetch(input, options = {}) {
   const cleanup = (agent) => {
     clearTimeout(timeout);
     if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
-    if (agent) agent.destroy();
+    if (agent && !reuseConnection) agent.destroy();
   };
 
   // node-fetch v2 otherwise permits unbounded response bodies. Clamp caller
@@ -158,7 +191,7 @@ async function safeFetch(input, options = {}) {
         throw error;
       }
 
-      const agent = createPinnedAgent(currentUrl, records);
+      const agent = getPinnedAgent(currentUrl, records, reuseConnection);
       let response;
       try {
         response = await fetch(currentUrl.toString(), {
@@ -167,7 +200,7 @@ async function safeFetch(input, options = {}) {
           redirect: "manual",
         });
       } catch (error) {
-        agent.destroy();
+        if (!reuseConnection) agent.destroy();
         throw error;
       }
 
@@ -199,7 +232,7 @@ async function safeFetch(input, options = {}) {
       }
 
       if (response.body) response.body.destroy();
-      agent.destroy();
+      if (!reuseConnection) agent.destroy();
       if (redirects >= maxRedirects) {
         throw new Error("Too many redirects");
       }
@@ -219,5 +252,6 @@ module.exports = {
   isPublicAddress,
   resolvePublicAddresses,
   createPinnedAgent,
+  getPinnedAgent,
   safeFetch,
 };
