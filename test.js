@@ -6,7 +6,7 @@ const LRUCache = require("./lruCache");
 const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = require("./urlSafety");
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
-const { parseEPGStream } = require("./src/js/epgStreamParser");
+const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS } = require("./src/js/epgStreamParser");
 const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
@@ -522,6 +522,18 @@ async function testStreamingEpgParser() {
     assert.strictEqual(parsed['channel.one'][0].desc, 'First and second part.');
 }
 
+async function testStreamingEpgParserBoundsRetainedText() {
+    const longTitle = "T".repeat(MAX_TITLE_CHARS + 500);
+    const longDescription = "D".repeat(MAX_DESCRIPTION_CHARS + 5000);
+    const xml = '<tv><programme start="20261018120000 +0000" stop="20261018130000 +0000" channel="channel.one">' +
+        '<title>' + longTitle + '</title><desc>' + longDescription + '</desc></programme></tv>';
+    const parsed = await parseEPGStream(Readable.from([xml]), new Set(["channel.one"]));
+    assert.strictEqual(parsed["channel.one"][0].title.length, MAX_TITLE_CHARS);
+    assert.strictEqual(parsed["channel.one"][0].desc.length, MAX_DESCRIPTION_CHARS);
+    assert.strictEqual(parsed["channel.one"][0].title, "T".repeat(MAX_TITLE_CHARS));
+    assert.strictEqual(parsed["channel.one"][0].desc, "D".repeat(MAX_DESCRIPTION_CHARS));
+}
+
 async function main() {
     const tests = [
         testEncryptedConfigRoundTrip,
@@ -546,6 +558,7 @@ async function main() {
         testEpisodeMetadataMapping,
         testTmdbIdValidationAndMissingKeyGracefulHandling,
         testStreamingEpgParser,
+        testStreamingEpgParserBoundsRetainedText,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
         testValidatedConnectionReuseIsScopedToValidatedAddresses,
