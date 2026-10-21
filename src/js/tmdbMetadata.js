@@ -105,9 +105,14 @@ async function request(path) {
         logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
       }
-      const jsonStartedAt = Date.now();
-      const data = await response.json();
-      const jsonMs = Date.now() - jsonStartedAt;
+      // Separate response-body consumption from JSON parsing so large or slow
+      // responses can be distinguished from CPU time spent decoding metadata.
+      const bodyStartedAt = Date.now();
+      const responseText = await response.text();
+      const bodyMs = Date.now() - bodyStartedAt;
+      const parseStartedAt = Date.now();
+      const data = JSON.parse(responseText);
+      const parseMs = Date.now() - parseStartedAt;
       if (!data || typeof data !== "object" || Array.isArray(data)) {
         logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
         return null;
@@ -117,7 +122,8 @@ async function request(path) {
         path, status, ms: Date.now() - startedAt,
         dnsMs: diagnostics.dnsMs ?? null,
         headersMs: diagnostics.headersMs ?? null,
-        jsonMs,
+        bodyMs,
+        parseMs,
         freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
       });
       return data;
