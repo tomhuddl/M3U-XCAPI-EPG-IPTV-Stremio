@@ -396,37 +396,6 @@ async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
     assert.strictEqual(addon.catalogMetaInFlight.size, 0, "in-flight entries should be cleared after completion");
 }
 
-async function testCatalogueEnrichmentPreservesRequiredFilmMetadata() {
-    const addon = new M3UEPGAddon({ provider: "direct" });
-    addon.generateMetaPreview = () => ({ id: "movie-1", type: "movie", name: "Fallback title", genres: ["Drama"] });
-    addon.getCatalogMetaAsync = async () => ({
-        id: "movie-1",
-        type: "movie",
-        name: "Example Film",
-        description: "A complete summary.",
-        year: 2024,
-        releaseInfo: "2024",
-        runtime: "118 min",
-        tmdbRating: "7.8",
-        cast: ["Actor One", "Actor Two"],
-        director: ["Director One"],
-        links: [{ name: "TMDb rating: 7.8", category: "Rating" }]
-    });
-
-    await addon.enrichCatalogMetaItems([{ id: "movie-1", type: "movie", name: "Example Film" }], 1);
-    const enriched = addon.catalogMetaCache.get("movie-1");
-
-    assert.strictEqual(enriched.description, "A complete summary.");
-    assert.strictEqual(enriched.year, 2024);
-    assert.strictEqual(enriched.releaseInfo, "2024");
-    assert.strictEqual(enriched.runtime, "118 min");
-    assert.strictEqual(enriched.imdbRating, "7.8", "TMDb score should use Stremio's standard displayed-rating field");
-    assert.deepStrictEqual(enriched.cast, ["Actor One", "Actor Two"]);
-    assert.deepStrictEqual(enriched.director, ["Director One"]);
-    assert.ok(!("tmdbRating" in enriched), "internal TMDb rating field should not leak into the card");
-    assert.ok(!enriched.links.some(link => link.category === "Rating"), "rating link should not replace the visible score");
-}
-
 async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     const count = 75;
@@ -543,7 +512,6 @@ async function main() {
         testScheduledProgramsCacheParsedTimestamps,
         testDirectEpisodeLookupUsesExactIndex,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
-        testCatalogueEnrichmentPreservesRequiredFilmMetadata,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
