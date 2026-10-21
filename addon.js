@@ -271,6 +271,10 @@ class M3UEPGAddon {
             ttl: parsePositiveInteger(process.env.CATALOG_META_CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
         });
         this.catalogMetaPending = new Map();
+        // Share concurrent foreground/background metadata work for the same item.
+        // Without this, a category request and a queued warm-up can race and issue
+        // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
+        this.catalogMetaInFlight = new Map();
         this.catalogMetaQueue = [];
         this.catalogMetaQueueHead = 0;
         this.catalogMetaWorkers = 0;
@@ -879,6 +883,23 @@ class M3UEPGAddon {
     }
 
     async getCatalogMetaAsync(id, type) {
+        const key = String(id || '');
+        if (!key) return null;
+        if (this.catalogMetaCache.has(key)) return this.catalogMetaCache.get(key);
+        if (this.catalogMetaInFlight.has(key)) return this.catalogMetaInFlight.get(key);
+
+        const task = this._getCatalogMetaAsync(id, type);
+        this.catalogMetaInFlight.set(key, task);
+        try {
+            return await task;
+        } finally {
+            if (this.catalogMetaInFlight.get(key) === task) {
+                this.catalogMetaInFlight.delete(key);
+            }
+        }
+    }
+
+    async _getCatalogMetaAsync(id, type) {
         // Discover cards do not need episode lists, trailers, or logo-image lookups.
         // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
         if (type === 'series' || id.startsWith('iptv_series_')) {
