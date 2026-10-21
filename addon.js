@@ -823,10 +823,11 @@ class M3UEPGAddon {
 
     async enrichCatalogMetaItems(items, concurrency = 3) {
         const startedAt = Date.now();
-        const candidates = items.filter(item =>
-            item && (item.type === 'movie' || item.type === 'series') &&
-            !this.catalogMetaCache.has(item.id)
-        );
+        const candidates = items.filter(item => {
+            if (!item || (item.type !== 'movie' && item.type !== 'series')) return false;
+            // LRUCache.has() delegates to get(), so use one lookup to test for a hit.
+            return this.catalogMetaCache.get(item.id) === undefined;
+        });
         let nextIndex = 0;
         const worker = async () => {
             while (nextIndex < candidates.length) {
