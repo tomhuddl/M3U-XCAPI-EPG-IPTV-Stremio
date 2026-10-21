@@ -271,6 +271,26 @@ async function fetchMovieInfo(addonInstance, streamId) {
   }
 }
 
+async function fetchSeriesTmdbId(addonInstance, seriesId) {
+  const { config } = addonInstance;
+  if (!seriesId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  try {
+    // Discover only needs the series TMDb ID. Avoid constructing and sorting every
+    // episode object when a catalogue listing omitted that ID.
+    const response = await fetch(
+      `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+      { timeout: 25000 },
+    );
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const info = payload?.info && typeof payload.info === "object" ? payload.info : {};
+    return normalizeTmdbId(info.tmdb || info.tmdb_id || payload?.tmdb || payload?.tmdb_id);
+  } catch {
+    return null;
+  }
+}
+
 async function fetchSeriesInfo(addonInstance, seriesId) {
   // For xtream JSON API only
   const { config } = addonInstance;
@@ -361,5 +381,6 @@ module.exports = {
   fetchData,
   fetchMovieInfo,
   fetchSeriesInfo,
+  fetchSeriesTmdbId,
   normalizeTmdbId,
 };
