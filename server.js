@@ -81,24 +81,21 @@ function preflightRateLimit(req, res, next) {
   const key = req.ip || req.socket?.remoteAddress || "unknown";
   let bucket = preflightRateBuckets.get(key);
   if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+    if (!bucket && preflightRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+      for (const [client, entry] of preflightRateBuckets) {
+        if (now - entry.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+          preflightRateBuckets.delete(client);
+        }
+        if (preflightRateBuckets.size < PREFLIGHT_RATE_MAX_CLIENTS) break;
+      }
+      if (preflightRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+        return res.status(503).json({ error: "Preflight rate-limit capacity reached; retry shortly" });
+      }
+    }
     bucket = { startedAt: now, count: 0 };
     preflightRateBuckets.set(key, bucket);
   }
   bucket.count += 1;
-
-  // Opportunistically prune expired entries and cap map growth under scans
-  // from many source addresses.
-  if (preflightRateBuckets.size > PREFLIGHT_RATE_MAX_CLIENTS) {
-    for (const [client, entry] of preflightRateBuckets) {
-      if (now - entry.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
-        preflightRateBuckets.delete(client);
-      }
-      if (preflightRateBuckets.size <= PREFLIGHT_RATE_MAX_CLIENTS) break;
-    }
-    if (preflightRateBuckets.size > PREFLIGHT_RATE_MAX_CLIENTS) {
-      return res.status(503).json({ error: "Preflight rate-limit capacity reached; retry shortly" });
-    }
-  }
 
   if (bucket.count > PREFLIGHT_RATE_MAX) {
     const retryAfter = Math.max(1, Math.ceil(
@@ -111,6 +108,9 @@ function preflightRateLimit(req, res, next) {
 }
 
 const app = express();
+// Render terminates TLS at its proxy; trust exactly that hop so per-client
+// preflight limits use the originating client address rather than one shared proxy IP.
+if (process.env.RENDER) app.set("trust proxy", 1);
 const staticDir = path.join(__dirname, "src");
 app.use((req, res, next) => {
   res.setHeader("X-App", "IPTV-Stremio-Addon");
