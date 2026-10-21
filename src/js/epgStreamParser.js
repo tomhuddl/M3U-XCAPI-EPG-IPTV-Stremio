@@ -4,6 +4,10 @@ const sax = require('sax');
 
 const MAX_PROGRAMMES_PER_SOURCE = 150000;
 const MAX_EPG_BYTES = 800 * 1024 * 1024;
+// Bound retained free text: one malformed programme must not consume the
+// process heap even when the overall XML feed is within its byte limit.
+const MAX_TITLE_CHARS = 512;
+const MAX_DESCRIPTION_CHARS = 8192;
 
 /**
  * Parse XMLTV from a Node readable stream. XML bytes are consumed incrementally;
@@ -17,7 +21,6 @@ function parseEPGStream(readable, allowedChannelIds) {
         let field = null;
         let programmeCount = 0;
         let bytesRead = 0;
-        let titleText = '';
         let settled = false;
         const xml = sax.createStream(true, { trim: false, normalize: false });
 
@@ -52,14 +55,13 @@ function parseEPGStream(readable, allowedChannelIds) {
                 if (name === 'title') current.hasTitle = true;
                 else current.hasDesc = true;
                 field = name;
-                if (name === 'title') titleText = '';
             }
         });
 
         xml.on('text', (value) => {
             if (current && current.keep && field) {
-                if (field === 'title') { titleText += value; current.title = titleText; }
-                else current.desc += value;
+                if (field === 'title') current.title = (current.title + value).slice(0, MAX_TITLE_CHARS);
+                else if (current.desc.length < MAX_DESCRIPTION_CHARS) current.desc = (current.desc + value).slice(0, MAX_DESCRIPTION_CHARS);
             }
         });
         xml.on('cdata', (value) => {
@@ -110,4 +112,4 @@ function parseEPGStream(readable, allowedChannelIds) {
     });
 }
 
-module.exports = { parseEPGStream, MAX_PROGRAMMES_PER_SOURCE, MAX_EPG_BYTES };
+module.exports = { parseEPGStream, MAX_PROGRAMMES_PER_SOURCE, MAX_EPG_BYTES, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS };
