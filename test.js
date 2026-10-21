@@ -431,18 +431,12 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
 async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     let calls = 0;
-    const originalRequire = module.require;
-    module.require = function (id) {
-        if (id === "./src/js/providers/directProvider.js") {
-            return {
-                fetchSeriesInfo: async (_addon, seriesId) => {
-                    calls++;
-                    await new Promise(resolve => setImmediate(resolve));
-                    return { tmdbId: "65251", videos: [{ id: "ep-1" }], seriesId };
-                }
-            };
-        }
-        return originalRequire.call(this, id);
+    const originalFetchSeriesInfo = require("./src/js/providers/directProvider").fetchSeriesInfo;
+    const providerModule = require("./src/js/providers/directProvider");
+    providerModule.fetchSeriesInfo = async (_addon, seriesId) => {
+        calls++;
+        await new Promise(resolve => setImmediate(resolve));
+        return { tmdbId: "65251", videos: [{ id: "ep-1" }], seriesId };
     };
 
     try {
@@ -456,7 +450,7 @@ async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
         assert.deepStrictEqual(results[1], results[2]);
         assert.strictEqual(addon.providerInfoInFlight.size, 0);
     } finally {
-        module.require = originalRequire;
+        providerModule.fetchSeriesInfo = originalFetchSeriesInfo;
     }
 }
 
