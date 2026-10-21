@@ -61,15 +61,32 @@ function tmdbConfigured() {
   return TMDB_API_KEY.length > 0;
 }
 
+const TMDB_DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
+
+function logRequestDebug(event, details) {
+  if (TMDB_DEBUG) console.log("[DEBUG] TMDb request", { event, ...details });
+}
+
 async function request(path) {
   if (!tmdbConfigured()) return null;
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
-  if (cached !== undefined) return cached;
-  if (negativeCache.has(cacheKey)) return null;
-  if (pending.has(cacheKey)) return pending.get(cacheKey);
+  if (cached !== undefined) {
+    logRequestDebug("cache-hit", { path, ms: 0 });
+    return cached;
+  }
+  if (negativeCache.has(cacheKey)) {
+    logRequestDebug("negative-cache-hit", { path, ms: 0 });
+    return null;
+  }
+  if (pending.has(cacheKey)) {
+    logRequestDebug("in-flight-join", { path });
+    return pending.get(cacheKey);
+  }
 
   const task = (async () => {
+    const startedAt = Date.now();
+    let status = null;
     try {
       const separator = path.includes("?") ? "&" : "?";
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
@@ -77,15 +94,27 @@ async function request(path) {
         timeout: 12000,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
+      status = response.status;
       if (!response.ok) {
         if (response.status === 404) negativeCache.set(cacheKey, true);
+        logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
       }
       const data = await response.json();
-      if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
+        return null;
+      }
       cache.set(cacheKey, data);
+      logRequestDebug("fetched", { path, status, ms: Date.now() - startedAt });
       return data;
-    } catch {
+    } catch (error) {
+      logRequestDebug("request-error", {
+        path,
+        status,
+        ms: Date.now() - startedAt,
+        error: error && error.name ? error.name : "Error",
+      });
       return null;
     } finally {
       pending.delete(cacheKey);
