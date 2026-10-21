@@ -833,12 +833,6 @@ class M3UEPGAddon {
                     const detailed = await this.getCatalogMetaAsync(item.id, item.type);
                     if (!detailed) continue;
                     const preview = { ...detailed };
-                    // Stremio's standard metadata field for the displayed score is
-                    // imdbRating. Keep the TMDb score under that field on catalogue
-                    // cards; tmdbRating is an internal transport field only.
-                    if (detailed.tmdbRating != null && detailed.tmdbRating !== '') {
-                        preview.imdbRating = String(detailed.tmdbRating);
-                    }
                     delete preview.tmdbRating;
                     if (Array.isArray(preview.links)) {
                         preview.links = preview.links.filter(link => link?.category !== 'Rating');
@@ -884,9 +878,6 @@ class M3UEPGAddon {
                         const detailed = await this.getCatalogMetaAsync(next.id, next.type);
                         if (detailed) {
                             const preview = { ...detailed };
-                            if (detailed.tmdbRating != null && detailed.tmdbRating !== '') {
-                                preview.imdbRating = String(detailed.tmdbRating);
-                            }
                             delete preview.tmdbRating;
                             if (Array.isArray(preview.links)) {
                                 preview.links = preview.links.filter(link => link?.category !== 'Rating');
