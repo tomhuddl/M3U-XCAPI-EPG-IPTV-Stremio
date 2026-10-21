@@ -1178,16 +1178,19 @@ async function createAddon(config) {
                 }
 
                 // Stremio does not push catalogue updates into an already-rendered
-                // Discover page. For a selected genre, enrich the returned page before
-                // replying so its metadata is visible without leaving and re-entering.
-                // Keep unfiltered cold starts fast by enriching only the first visible rows
-                // in the background.
+                // Discover page. Enrich selected genres and search results before replying,
+                // so their metadata is visible immediately without leaving/re-entering.
+                // Keep the initial unfiltered catalogue fast by enriching its first visible
+                // rows in the background.
                 const catalogMetaPrefetchItems = parsePositiveInteger(
                     process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
                 );
-                const enrichWholeGenre = Boolean(extra.genre);
-                if (enrichWholeGenre) {
-                    await addonInstance.enrichCatalogMetaItems(page, 3);
+                const catalogMetaConcurrency = parsePositiveInteger(
+                    process.env.CATALOG_META_CONCURRENCY, 6, 1, 12
+                );
+                const enrichWholeSelection = Boolean(extra.genre || extra.search);
+                if (enrichWholeSelection) {
+                    await addonInstance.enrichCatalogMetaItems(page, catalogMetaConcurrency);
                 }
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
@@ -1205,7 +1208,7 @@ async function createAddon(config) {
                     // authoritative TMDb data is ready, avoid showing provider
                     // genres/cast/plot as if they were the final metadata; otherwise
                     // Stremio can appear to switch from one set of details to another.
-                    if (!enrichWholeGenre && pageIndex < catalogMetaPrefetchItems) {
+                    if (!enrichWholeSelection && pageIndex < catalogMetaPrefetchItems) {
                         addonInstance.queueCatalogMetaEnrichment(i);
                     }
                     const firstPass = { ...meta, id: i.id, type: i.type };
