@@ -1266,8 +1266,10 @@ async function createAddon(config) {
                 // Stremio does not reliably refresh cards already rendered in Discover.
                 // Enrich every movie/series item in the current page before replying,
                 // including search results. Later pages are loaded when the user scrolls.
+                // Allow more independent item lookups to overlap. Keep this configurable
+                // because some Xtream providers impose stricter request limits.
                 const genreMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_GENRE_META_CONCURRENCY, 8, 1, 8
+                    process.env.CATALOG_GENRE_META_CONCURRENCY, 12, 1, 12
                 );
                 if (page.length && (args.type === 'movie' || args.type === 'series')) {
                     await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
@@ -1284,13 +1286,9 @@ async function createAddon(config) {
                     const cached = addonInstance.catalogMetaCache.get(i.id);
                     if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
 
-                    // Warm the cache without blocking catalogue delivery. Until
-                    // authoritative TMDb data is ready, avoid showing provider
-                    // genres/cast/plot as if they were the final metadata; otherwise
-                    // Stremio can appear to switch from one set of details to another.
-                    if (!enrichWholeSelection && pageIndex < catalogMetaPrefetchItems) {
-                        addonInstance.queueCatalogMetaEnrichment(i);
-                    }
+                    // The current page has already completed foreground enrichment.
+                    // If no authoritative result was available, return the best base
+                    // metadata without scheduling a background mutation of this card.
                     const firstPass = { ...meta, id: i.id, type: i.type };
                     delete firstPass.genres;
                     delete firstPass.cast;
