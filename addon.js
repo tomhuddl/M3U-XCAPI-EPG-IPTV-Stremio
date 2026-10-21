@@ -47,6 +47,25 @@ function normalizeGenre(value) {
 // replaces an array, its new identity naturally gets a fresh index.
 const catalogueIdIndexes = new WeakMap();
 
+// Genre labels are stable for a loaded catalogue. Cache their normalised values
+// per catalogue array so browsing different genres doesn't repeatedly run Unicode
+// normalisation over every item in large movie/series libraries.
+const catalogueGenreIndexes = new WeakMap();
+
+function getCatalogueGenreIndex(items) {
+    let index = catalogueGenreIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (!item || index.has(item)) continue;
+        const category = item.category || item.attributes?.['group-title'];
+        index.set(item, normalizeGenre(category));
+    }
+    catalogueGenreIndexes.set(items, index);
+    return { index, built: true };
+}
+
 function findCatalogueItemById(items, id) {
     if (!Array.isArray(items) || !id) return undefined;
     let index = catalogueIdIndexes.get(items);
@@ -1294,16 +1313,27 @@ async function createAddon(config) {
                 const extra = args.extra || {}; // Stremio passes filter/genre here
                 let filtered = items;
                 let genreFilterMs = 0;
+                let genreIndexMs = 0;
+                let genreIndexBuilt = false;
                 let searchIndexMs = 0;
                 let searchFilterMs = 0;
                 let searchIndexBuilt = false;
 
-                // If specific genre selected
+                // If specific genre selected, reuse normalised item categories across
+                // requests. Matching remains exact and preserves catalogue order.
                 const genreFilterStartedAt = Date.now();
                 if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
+                    const genreIndexStartedAt = Date.now();
+                    const genreIndexResult = getCatalogueGenreIndex(items);
+                    const genreIndex = genreIndexResult.index;
+                    genreIndexBuilt = genreIndexResult.built;
+                    genreIndexMs = Date.now() - genreIndexStartedAt;
+                    const selectedGenre = normalizeGenre(extra.genre);
                     filtered = filtered.filter(i => {
+                        const indexedGenre = genreIndex.get(i);
+                        if (indexedGenre !== undefined) return indexedGenre === selectedGenre;
                         const cat = i.category || i.attributes?.['group-title'];
-                        return matchesGenre(cat, extra.genre);
+                        return matchesGenre(cat, selectedGenre);
                     });
                 }
                 genreFilterMs = Date.now() - genreFilterStartedAt;
@@ -1430,6 +1460,8 @@ async function createAddon(config) {
                         returned: metas.length,
                         skip,
                         genreFilterMs,
+                        genreIndexMs,
+                        genreIndexBuilt,
                         searchIndexMs,
                         searchIndexBuilt,
                         searchFilterMs,
