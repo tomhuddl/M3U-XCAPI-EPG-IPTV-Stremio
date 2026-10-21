@@ -35,6 +35,23 @@ function extractSeasonEpisode(title) {
     return null;
 }
 
+function rebuildDirectEpisodeIndexes(addonInstance, episodesMap) {
+    const bySeries = new Map();
+    const byId = new Map();
+
+    for (const [seriesId, episodes] of episodesMap.entries()) {
+        bySeries.set(seriesId.replace(/^iptv_series_/, ''), episodes);
+        for (const episode of episodes) {
+            if (episode?.id && !byId.has(episode.id)) {
+                byId.set(episode.id, episode);
+            }
+        }
+    }
+
+    addonInstance.directSeriesEpisodeIndex = bySeries;
+    addonInstance.directSeriesEpisodeById = byId;
+}
+
 async function fetchData(addonInstance) {
     const { config } = addonInstance;
     const { m3uUrl } = config;
@@ -45,6 +62,7 @@ async function fetchData(addonInstance) {
     addonInstance.movies = [];
     addonInstance.series = [];
     addonInstance.directSeriesEpisodeIndex = new Map(); // reset
+    addonInstance.directSeriesEpisodeById = new Map(); // reset exact episode lookup index
     addonInstance.epgData = {};
 
     // Fetch playlist
@@ -117,11 +135,11 @@ async function fetchData(addonInstance) {
             });
         }
 
-        // Sort episodes in each series
-        for (const [sid, eps] of episodesMap.entries()) {
+        // Sort episodes before building the series and exact-ID indexes.
+        for (const eps of episodesMap.values()) {
             eps.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
-            addonInstance.directSeriesEpisodeIndex.set(sid.replace(/^iptv_series_/, ''), eps);
         }
+        rebuildDirectEpisodeIndexes(addonInstance, episodesMap);
 
         addonInstance.series = Array.from(seriesMap.values());
     }
@@ -188,5 +206,6 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
 
 module.exports = {
     fetchData,
-    fetchSeriesInfo
+    fetchSeriesInfo,
+    rebuildDirectEpisodeIndexes
 };

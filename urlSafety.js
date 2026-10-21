@@ -7,6 +7,20 @@ const net = require("net");
 const ipaddr = require("ipaddr.js");
 const fetch = require("node-fetch");
 
+const REUSABLE_AGENT_MAX_ENTRIES = 8;
+const reusableAgents = new Map();
+// Coalesce simultaneous DNS lookups for the same hostname without caching
+// answers across requests. Each request still validates the returned addresses.
+const pendingDnsLookups = new Map();
+
+function lookupAllAddresses(hostname) {
+  if (pendingDnsLookups.has(hostname)) return pendingDnsLookups.get(hostname);
+  const lookup = dns.lookup(hostname, { all: true, verbatim: true })
+    .finally(() => pendingDnsLookups.delete(hostname));
+  pendingDnsLookups.set(hostname, lookup);
+  return lookup;
+}
+
 const PROVIDER_MAX_BYTES_RAW = Number.parseInt(
   process.env.PROVIDER_MAX_BYTES || "50000000",
   10,
@@ -45,7 +59,7 @@ async function resolvePublicAddresses(url) {
   const family = net.isIP(hostname);
   const records = family
     ? [{ address: hostname, family }]
-    : await dns.lookup(hostname, { all: true, verbatim: true });
+    : await lookupAllAddresses(hostname);
 
   if (!records.length || records.some((record) => !isPublicAddress(record.address))) {
     throw new Error("Blocked host");
@@ -53,7 +67,7 @@ async function resolvePublicAddresses(url) {
   return records;
 }
 
-function createPinnedAgent(url, addresses) {
+function createPinnedAgent(url, addresses, keepAlive = false) {
   const lookup = (hostname, options, callback) => {
     if (typeof options === "function") {
       callback = options;
@@ -75,8 +89,36 @@ function createPinnedAgent(url, addresses) {
   };
 
   return url.protocol === "https:"
-    ? new https.Agent({ keepAlive: false, lookup })
-    : new http.Agent({ keepAlive: false, lookup });
+    ? new https.Agent({ keepAlive, maxSockets: 16, maxFreeSockets: 4, lookup })
+    : new http.Agent({ keepAlive, maxSockets: 16, maxFreeSockets: 4, lookup });
+}
+
+function getPinnedAgent(url, addresses, reuseConnection) {
+  if (!reuseConnection) return createPinnedAgent(url, addresses);
+  // DNS is still resolved and validated on every request. Including the exact
+  // validated address set in the key prevents reusing an agent pinned to an
+  // address that is no longer returned by DNS.
+  const addressKey = addresses
+    .map(({ address, family }) => family + ":" + address)
+    .sort()
+    .join(",");
+  const key = url.protocol + "//" + url.hostname.toLowerCase() + ":" +
+    (url.port || (url.protocol === "https:" ? "443" : "80")) + "|" + addressKey;
+  let agent = reusableAgents.get(key);
+  if (agent && !agent.destroyed) {
+    reusableAgents.delete(key);
+    reusableAgents.set(key, agent);
+    return agent;
+  }
+  agent = createPinnedAgent(url, addresses, true);
+  reusableAgents.set(key, agent);
+  while (reusableAgents.size > REUSABLE_AGENT_MAX_ENTRIES) {
+    const oldestKey = reusableAgents.keys().next().value;
+    const oldestAgent = reusableAgents.get(oldestKey);
+    reusableAgents.delete(oldestKey);
+    oldestAgent?.destroy();
+  }
+  return agent;
 }
 
 /**
@@ -96,6 +138,13 @@ async function safeFetch(input, options = {}) {
     ? Math.max(0, Math.min(options.maxRedirects, 5))
     : 3;
   const fetchOptions = { ...options };
+  const reuseConnection = fetchOptions.reuseConnection === true;
+  const diagnostics = fetchOptions.diagnostics && typeof fetchOptions.diagnostics === "object"
+    ? fetchOptions.diagnostics
+    : ((process.env.DEBUG_MODE || "").toLowerCase() === "true" &&
+       currentUrl.hostname.toLowerCase() === "api.themoviedb.org" ? {} : null);
+  delete fetchOptions.diagnostics;
+  delete fetchOptions.reuseConnection;
   delete fetchOptions.maxRedirects;
 
   // Keep a total deadline active through response-body consumption. node-fetch's
@@ -115,7 +164,7 @@ async function safeFetch(input, options = {}) {
   const cleanup = (agent) => {
     clearTimeout(timeout);
     if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
-    if (agent) agent.destroy();
+    if (agent && !reuseConnection) agent.destroy();
   };
 
   // node-fetch v2 otherwise permits unbounded response bodies. Clamp caller
@@ -138,6 +187,7 @@ async function safeFetch(input, options = {}) {
 
       let dnsTimer;
       let records;
+      const dnsStartedAt = Date.now();
       try {
         records = await Promise.race([
           resolvePublicAddresses(currentUrl),
@@ -150,6 +200,9 @@ async function safeFetch(input, options = {}) {
         ]);
       } finally {
         clearTimeout(dnsTimer);
+        if (diagnostics) {
+          diagnostics.dnsMs = (diagnostics.dnsMs || 0) + Date.now() - dnsStartedAt;
+        }
       }
 
       if (controller.signal.aborted) {
@@ -158,8 +211,14 @@ async function safeFetch(input, options = {}) {
         throw error;
       }
 
-      const agent = createPinnedAgent(currentUrl, records);
+      const agent = getPinnedAgent(currentUrl, records, reuseConnection);
+      if (diagnostics) {
+        // Reports idle socket availability, not guaranteed socket selection.
+        diagnostics.freeSocketsBeforeRequest = Object.values(agent.freeSockets || {})
+          .reduce((total, sockets) => total + sockets.length, 0);
+      }
       let response;
+      const headersStartedAt = Date.now();
       try {
         response = await fetch(currentUrl.toString(), {
           ...fetchOptions,
@@ -167,8 +226,22 @@ async function safeFetch(input, options = {}) {
           redirect: "manual",
         });
       } catch (error) {
-        agent.destroy();
+        if (!reuseConnection) agent.destroy();
         throw error;
+      }
+
+      if (diagnostics) {
+        diagnostics.headersMs = Date.now() - headersStartedAt;
+        if ((process.env.DEBUG_MODE || "").toLowerCase() === "true" &&
+            currentUrl.hostname.toLowerCase() === "api.themoviedb.org") {
+          console.log("[DEBUG] TMDb transport timing", {
+            path: currentUrl.pathname,
+            status: response.status,
+            dnsMs: diagnostics.dnsMs ?? null,
+            headersMs: diagnostics.headersMs,
+            freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
+          });
+        }
       }
 
       if (![301, 302, 303, 307, 308].includes(response.status)) {
@@ -199,7 +272,7 @@ async function safeFetch(input, options = {}) {
       }
 
       if (response.body) response.body.destroy();
-      agent.destroy();
+      if (!reuseConnection) agent.destroy();
       if (redirects >= maxRedirects) {
         throw new Error("Too many redirects");
       }
@@ -219,5 +292,6 @@ module.exports = {
   isPublicAddress,
   resolvePublicAddresses,
   createPinnedAgent,
+  getPinnedAgent,
   safeFetch,
 };

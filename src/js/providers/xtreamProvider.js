@@ -145,7 +145,8 @@ async function fetchData(addonInstance) {
         url: `${xtreamUrl}/movie/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.${s.container_extension}`,
         poster: s.stream_icon,
         plot: s.plot,
-        year: s.releasedate ? new Date(s.releasedate).getFullYear() : null,
+        // TMDb ID is an identifier only; display metadata is fetched from TMDb.
+        tmdbId: normalizeTmdbId(s.tmdb_id || s.tmdb),
         category: cat,
         attributes: {
           "tvg-logo": s.stream_icon,
@@ -186,6 +187,7 @@ async function fetchData(addonInstance) {
               return {
                 id: `iptv_series_${s.series_id}`,
                 series_id: s.series_id,
+                tmdbId: normalizeTmdbId(s.tmdb || s.tmdb_id),
                 name: s.name,
                 type: "series",
                 poster: s.cover,
@@ -248,6 +250,52 @@ async function fetchData(addonInstance) {
   }
 }
 
+function normalizeTmdbId(value) {
+  const id = String(value ?? "").trim();
+  return /^\d{1,12}$/.test(id) && Number(id) > 0 ? id : null;
+}
+
+async function fetchMovieInfo(addonInstance, streamId) {
+  const { config } = addonInstance;
+  if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  try {
+    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
+      timeout: 20000,
+      // Reuse a connection for this provider fallback when its validated DNS
+      // addresses are unchanged; safeFetch still validates DNS on every request.
+      reuseConnection: true,
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
+    const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;
+    return { tmdbId: normalizeTmdbId(tmdbId) };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchSeriesTmdbId(addonInstance, seriesId) {
+  const { config } = addonInstance;
+  if (!seriesId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  try {
+    // Discover only needs the series TMDb ID. Avoid constructing and sorting every
+    // episode object when a catalogue listing omitted that ID.
+    const response = await fetch(
+      `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+      { timeout: 25000 },
+    );
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const info = payload?.info && typeof payload.info === "object" ? payload.info : {};
+    return normalizeTmdbId(info.tmdb || info.tmdb_id || payload?.tmdb || payload?.tmdb_id);
+  } catch {
+    return null;
+  }
+}
+
 async function fetchSeriesInfo(addonInstance, seriesId) {
   // For xtream JSON API only
   const { config } = addonInstance;
@@ -269,6 +317,9 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     if (!infoResp.ok) return { videos: [] };
     const infoJson = await infoResp.json();
     const videos = [];
+    const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
+    const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
+    const tmdbId = normalizeTmdbId(rawTmdbId);
     // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
     const episodesObj = infoJson.episodes || {};
     Object.keys(episodesObj).forEach((seasonKey) => {
@@ -317,7 +368,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     });
     // Sort by season then episode
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
-    return { videos, fetchedAt: Date.now() };
+    return { videos, tmdbId, fetchedAt: Date.now() };
   } catch {
     return { videos: [] };
   }
@@ -333,5 +384,8 @@ function cryptoHash(text) {
 
 module.exports = {
   fetchData,
+  fetchMovieInfo,
   fetchSeriesInfo,
+  fetchSeriesTmdbId,
+  normalizeTmdbId,
 };

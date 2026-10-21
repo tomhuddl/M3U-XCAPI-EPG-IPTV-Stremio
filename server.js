@@ -576,6 +576,51 @@ app.get("/:token/manifest.json", (req, res) => {
   res.end(JSON.stringify(manifest));
 });
 
+// Apply platform-specific metadata presentation at the HTTP boundary. The SDK's
+// metadata handler arguments do not expose request headers, so keep this logic
+// outside the shared metadata builder. The SDK router writes serialized JSON via
+// res.end(), so intercept that boundary rather than res.json().
+app.use("/:token", (req, res, next) => {
+  const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
+  const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
+  const isIosStremioClient =
+    userAgent.includes("stremio") &&
+    /iphone|ipad|ipod|ios/.test(userAgent);
+
+  if (pathIsMeta) {
+    const originalEnd = res.end.bind(res);
+    res.end = function (chunk, encoding, callback) {
+      const contentType = String(res.getHeader("content-type") || "").toLowerCase();
+      if (chunk != null && contentType.includes("application/json")) {
+        try {
+          const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+          const body = JSON.parse(jsonText);
+          if (body && body.meta && typeof body.meta === "object") {
+            const meta = body.meta;
+            const links = Array.isArray(meta.links) ? meta.links : [];
+            if (isIosStremioClient) {
+              meta.links = links.filter(link => link?.category !== "Rating");
+              delete meta.tmdbRating;
+            } else {
+              meta.links = links.filter(link => link?.category !== "Writers");
+            }
+            const output = JSON.stringify(body);
+            if (Buffer.isBuffer(chunk)) {
+              chunk = Buffer.from(output, "utf8");
+            } else {
+              chunk = output;
+            }
+          }
+        } catch {
+          // Leave non-JSON or unexpected SDK responses untouched.
+        }
+      }
+      return originalEnd(chunk, encoding, callback);
+    };
+  }
+  next();
+});
+
 // Stremio router (handles catalog, stream, meta)
 app.use("/:token", (req, res) => {
   const iface = req.addonInterface;

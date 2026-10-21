@@ -5,6 +5,7 @@ require('dotenv').config();
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
+const tmdbMetadata = require("./src/js/tmdbMetadata");
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
@@ -42,9 +43,180 @@ function normalizeGenre(value) {
         .toLowerCase();
 }
 
+// Cache exact ID lookups for immutable provider catalogue arrays. When a refresh
+// replaces an array, its new identity naturally gets a fresh index.
+const catalogueIdIndexes = new WeakMap();
+
+// Genre labels are stable for a loaded catalogue. Cache their normalised values
+// per catalogue array so browsing different genres doesn't repeatedly run Unicode
+// normalisation over every item in large movie/series libraries.
+const catalogueGenreIndexes = new WeakMap();
+
+function getCatalogueGenreIndex(items) {
+    let index = catalogueGenreIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (!item || index.has(item)) continue;
+        const category = item.category || item.attributes?.['group-title'];
+        index.set(item, normalizeGenre(category));
+    }
+    catalogueGenreIndexes.set(items, index);
+    return { index, built: true };
+}
+
+function findCatalogueItemById(items, id) {
+    if (!Array.isArray(items) || !id) return undefined;
+    let index = catalogueIdIndexes.get(items);
+    if (!index) {
+        index = new Map();
+        for (const item of items) {
+            if (item && item.id != null && !index.has(item.id)) index.set(item.id, item);
+        }
+        catalogueIdIndexes.set(items, index);
+    }
+    return index.get(id);
+}
+
 function matchesGenre(category, selectedGenre) {
     const selected = normalizeGenre(selectedGenre);
     return selected.length > 0 && normalizeGenre(category) === selected;
+}
+
+/**
+ * Normalise catalogue search text without changing the displayed title.
+ * Unicode punctuation/symbols become spaces, and repeated whitespace collapses,
+ * making hyphenated and unhyphenated title variants equivalent.
+ */
+function normalizeSearchText(value) {
+    return String(value ?? '')
+        .normalize('NFKD')
+        .replace(/\p{M}+/gu, '')
+        .toLowerCase()
+        .replace(/[\p{P}\p{S}]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Return true when every query word can be matched to a distinct title word.
+ * Exact phrase matching remains the fast path; token matching also supports
+ * reordered words, partial words while typing, and a single-character typo
+ * in words of at least five characters.
+ */
+// Search normalization is repeated for every catalogue item and every query.
+// Keep a bounded cache so large libraries avoid re-normalizing the same titles.
+const NORMALIZED_SEARCH_CACHE_MAX = parsePositiveInteger(
+    process.env.SEARCH_TEXT_CACHE_MAX, 20000, 1000, 100000
+);
+// Use a bounded FIFO Map here rather than the shared LRU implementation: that
+// cache prunes expired entries on every write, which is undesirable when a
+// large catalogue introduces thousands of new titles in one search pass.
+const normalizedSearchCache = new Map();
+
+function getNormalizedSearchText(value) {
+    const original = String(value ?? '');
+    const cached = normalizedSearchCache.get(original);
+    if (cached !== undefined) return cached;
+    const normalized = normalizeSearchText(original);
+    normalizedSearchCache.set(original, normalized);
+    if (normalizedSearchCache.size > NORMALIZED_SEARCH_CACHE_MAX) {
+        normalizedSearchCache.delete(normalizedSearchCache.keys().next().value);
+    }
+    return normalized;
+}
+
+// Cache normalized titles against each immutable catalogue array. The general
+// bounded text cache can churn when movie and series catalogues are both searched;
+// this per-catalogue index keeps normalized titles reusable across successive queries.
+const catalogueSearchIndexes = new WeakMap();
+
+function getCatalogueSearchIndex(items) {
+    let index = catalogueSearchIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (item && !index.has(item)) {
+            const text = getNormalizedSearchText(item.name);
+            // Tokenisation is title-dependent too, so prepare it once per
+            // catalogue item rather than splitting every title on every query.
+            index.set(item, { text, words: text.split(' ').filter(Boolean) });
+        }
+    }
+    catalogueSearchIndexes.set(items, index);
+    return { index, built: true };
+}
+
+function matchesSearchText(query, title) {
+    return matchesNormalizedSearchText(
+        getNormalizedSearchText(query),
+        getNormalizedSearchText(title)
+    );
+}
+
+function createNormalizedSearchMatcher(q) {
+    if (!q) return () => false;
+
+    // Query tokenization and ordering are independent of the title, so compile
+    // them once per search request rather than once per catalogue item.
+    const words = q.split(' ').filter(Boolean).sort((a, b) => b.length - a.length);
+    return function matchNormalizedTitle(text, preparedTitleWords) {
+        if (!text) return false;
+        if (text.includes(q)) return true;
+
+        const titleWords = preparedTitleWords || text.split(' ').filter(Boolean);
+        if (!words.length || words.length > titleWords.length) return false;
+        const used = new Set();
+
+        function matchesWord(queryWord, titleWord) {
+            if (titleWord.startsWith(queryWord)) return true;
+            if (queryWord.length < 5 || titleWord.length < 5) return false;
+            return editDistanceAtMostOne(queryWord, titleWord);
+        }
+
+        function assign(index) {
+            if (index >= words.length) return true;
+            const word = words[index];
+            for (let i = 0; i < titleWords.length; i++) {
+                if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
+                used.add(i);
+                if (assign(index + 1)) return true;
+                used.delete(i);
+            }
+            return false;
+        }
+
+        return assign(0);
+    };
+}
+
+function matchesNormalizedSearchText(q, text) {
+    return createNormalizedSearchMatcher(q)(text);
+}
+
+function editDistanceAtMostOne(a, b) {
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0;
+    let j = 0;
+    let edits = 0;
+    while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) {
+            i++;
+            j++;
+            continue;
+        }
+        if (++edits > 1) return false;
+        if (a.length > b.length) i++;
+        else if (b.length > a.length) j++;
+        else {
+            i++;
+            j++;
+        }
+    }
+    if (i < a.length || j < b.length) edits++;
+    return edits <= 1;
 }
 
 const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
@@ -134,12 +306,35 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Coalesce overlapping Xtream ID and series-info lookups started by parallel
+        // Discover workers, avoiding duplicate provider API round-trips.
+        this.providerInfoInFlight = new Map();
+        // Cached catalogue enrichment lets later home/search requests return
+        // rich cards without waiting on TMDb/Xtream for every item.
+        this.catalogMetaCache = new LRUCache({
+            max: parsePositiveInteger(process.env.CATALOG_META_CACHE_MAX, 1000, 50, 5000),
+            ttl: parsePositiveInteger(process.env.CATALOG_META_CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
+        });
+        this.catalogMetaPending = new Map();
+        // Share concurrent foreground/background metadata work for the same item.
+        // Without this, a category request and a queued warm-up can race and issue
+        // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
+        this.catalogMetaInFlight = new Map();
+        this.catalogMetaQueue = [];
+        this.catalogMetaQueueHead = 0;
+        this.catalogMetaWorkers = 0;
         this.epgData = {};
+        // XMLTV programme timestamps are immutable after parsing; cache their parsed
+        // Date values per addon instance to avoid reparsing large guides on each request.
+        this.epgTimeCache = new WeakMap();
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
 
         // Direct provider may populate this (seriesId -> episodes array)
         this.directSeriesEpisodeIndex = new Map();
+        // Direct-provider episode IDs are stable for a loaded playlist; index them
+        // so stream resolution does not scan every series and episode.
+        this.directSeriesEpisodeById = new Map();
 
         if (typeof this.config.epgOffsetHours === 'string') {
             const n = parseFloat(this.config.epgOffsetHours);
@@ -394,10 +589,19 @@ class M3UEPGAddon {
         for (const program of sourcePrograms) {
             if (!program || !program.start || !program.stop) continue;
 
-            const start = this.parseEPGTime(program.start);
-            const end = this.parseEPGTime(program.stop);
-            const startMs = start instanceof Date ? start.getTime() : NaN;
-            const endMs = end instanceof Date ? end.getTime() : NaN;
+            let times = this.epgTimeCache.get(program);
+            if (!times) {
+                const start = this.parseEPGTime(program.start);
+                const end = this.parseEPGTime(program.stop);
+                times = {
+                    start,
+                    end,
+                    startMs: start instanceof Date ? start.getTime() : NaN,
+                    endMs: end instanceof Date ? end.getTime() : NaN
+                };
+                this.epgTimeCache.set(program, times);
+            }
+            const { start, end, startMs, endMs } = times;
             if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
             if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
 
@@ -413,27 +617,81 @@ class M3UEPGAddon {
             if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
             videos.push(video);
         }
-        return videos.sort((a, b) => Date.parse(a.startTime) - Date.parse(b.startTime));
+        // startTime values are normalized ISO-8601 UTC strings, so lexical order is chronological.
+        return videos.sort((a, b) => a.startTime.localeCompare(b.startTime));
+    }
+
+    async ensureSeriesTmdbId(seriesId) {
+        if (!seriesId) return null;
+        const cacheKey = 'series-tmdb-id:' + String(seriesId);
+        const cached = this.seriesInfoCache.get(cacheKey);
+        if (cached !== undefined) return cached;
+
+        const pendingKey = 'series-tmdb-id:' + String(seriesId);
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
+
+        const task = (async () => {
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                if (typeof providerModule.fetchSeriesTmdbId === 'function') {
+                    const tmdbId = await providerModule.fetchSeriesTmdbId(this, seriesId);
+                    this.seriesInfoCache.set(cacheKey, tmdbId || null);
+                    return tmdbId || null;
+                }
+                const info = await this.ensureSeriesInfo(seriesId);
+                return info?.tmdbId || null;
+            } catch (e) {
+                this.log.warn('Series TMDb ID lookup failed', seriesId, e && e.name ? e.name : 'Error');
+                this.seriesInfoCache.set(cacheKey, null);
+                return null;
+            }
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
     }
 
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) return null;
-        if (this.seriesInfoCache.has(seriesId)) return this.seriesInfoCache.get(seriesId);
+        const cached = this.seriesInfoCache.get(seriesId);
+        if (cached !== undefined) return cached;
 
-        try {
-            const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
-            if (typeof providerModule.fetchSeriesInfo === 'function') {
-                const info = await providerModule.fetchSeriesInfo(this, seriesId);
-                this.seriesInfoCache.set(seriesId, info);
-                return info;
+        const pendingKey = 'series-info:' + String(seriesId);
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
+
+        const task = (async () => {
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                if (typeof providerModule.fetchSeriesInfo === 'function') {
+                    const info = await providerModule.fetchSeriesInfo(this, seriesId);
+                    this.seriesInfoCache.set(seriesId, info);
+                    return info;
+                }
+            } catch (e) {
+                this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
             }
-        } catch (e) {
-            this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
+            // Fallback empty structure
+            const empty = { videos: [] };
+            this.seriesInfoCache.set(seriesId, empty);
+            return empty;
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
         }
-        // Fallback empty structure
-        const empty = { videos: [] };
-        this.seriesInfoCache.set(seriesId, empty);
-        return empty;
     }
 
     async updateData(force = false) {
@@ -519,8 +777,7 @@ class M3UEPGAddon {
                 behaviorHints: { notWebReady: true }
             };
         }
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
+        const item = findCatalogueItemById(this.channels, id) || findCatalogueItemById(this.movies, id);
         if (!item) return null;
         return {
             url: item.url,
@@ -537,73 +794,401 @@ class M3UEPGAddon {
                 if (found) return found;
             }
         }
-        // Direct provider inline index
-        for (const arr of this.directSeriesEpisodeIndex.values()) {
-            const found = arr.find(v => v.id === epId);
-            if (found) return found;
-        }
-        return null;
+        // Direct-provider episodes are indexed when the playlist is loaded.
+        return this.directSeriesEpisodeById.get(epId) || null;
     }
 
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
         const info = await this.ensureSeriesInfo(seriesIdRaw);
-        const videos = (info?.videos || []).map(v => {
-            // Ensure released is a valid ISO date or omit it
-            let released = v.released || undefined;
-            if (released && typeof released === 'string') {
-                // If it's a unix timestamp string, convert
-                if (/^\d{9,13}$/.test(released)) {
-                    const ts = released.length <= 10
-                        ? parseInt(released, 10) * 1000
-                        : parseInt(released, 10);
-                    const d = new Date(ts);
-                    released = !isNaN(d.getTime()) ? d.toISOString() : undefined;
-                } else if (!released.includes('T') && !released.includes('Z')) {
-                    // Try parsing non-ISO date strings
-                    const d = new Date(released);
-                    released = !isNaN(d.getTime()) ? d.toISOString() : undefined;
-                }
+        const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
+        const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
+        const tmdbSeasons = new Map();
+        if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
+            const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
+            const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(tmdbId, season)]));
+            for (const [season, episodes] of seasonResults) if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
+        }
+        // Index each season's episodes once. A repeated Array.find for every
+        // provider episode scales poorly for long-running series with many episodes.
+        const tmdbEpisodesByKey = new Map();
+        for (const [season, episodes] of tmdbSeasons) {
+            for (const episode of episodes) {
+                tmdbEpisodesByKey.set(`${season}:${Number(episode.episode)}`, episode);
             }
+        }
+        const videos = (info?.videos || []).map(v => {
+            const tmdbEpisode = tmdbEpisodesByKey.get(`${Number(v.season)}:${Number(v.episode)}`);
+            // Prefer TMDb episode details, retaining the provider listing if a season/episode has no match.
+            let released = v.released || undefined;
             const video = {
                 id: v.id,
-                title: v.title,
+                title: tmdbEpisode?.title || v.title || `Episode ${v.episode || ''}`.trim(),
                 season: v.season,
                 episode: v.episode,
-                thumbnail: v.thumbnail || seriesItem.poster || seriesItem.attributes?.['tvg-logo']
+                thumbnail: tmdbEpisode?.thumbnail || v.thumbnail || seriesItem.poster || undefined
             };
+            if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
+            if (tmdbEpisode?.runtime) video.runtime = tmdbEpisode.runtime;
+            if (tmdbEpisode?.rating) {
+                // Episode ratings are scores, not maturity/content ratings.
+                // Expose the score as a clearly labelled TMDb link, matching
+                // the series/movie metadata convention rather than misusing
+                // Stremio's ContentRating field.
+                video.links = [{
+                    name: 'TMDb rating: ' + tmdbEpisode.rating,
+                    category: 'Rating',
+                    url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) +
+                        '/season/' + encodeURIComponent(String(v.season)) +
+                        '/episode/' + encodeURIComponent(String(v.episode))
+                }];
+            }
+            if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
+            if (tmdbEpisode?.directors?.length) video.directors = tmdbEpisode.directors;
+            if (tmdbEpisode?.released) {
+                const d = new Date(tmdbEpisode.released);
+                if (!isNaN(d.getTime())) released = d.toISOString();
+            }
             if (released) video.released = released;
             return video;
         });
 
+        if (!tmdb) {
+            // Keep Xtream's playable episode catalogue when a TMDb ID is absent or unmatched.
+            return {
+                id: seriesItem.id,
+                type: 'series',
+                name: seriesItem.name,
+                poster: seriesItem.poster || seriesItem.attributes?.['tvg-logo'] ||
+                    `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
+                description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
+                genres: seriesItem.category
+                    ? [seriesItem.category]
+                    : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+                videos: (info?.videos || []).map(v => ({
+                    id: v.id,
+                    title: v.title || `Episode ${v.episode || ''}`.trim(),
+                    season: v.season,
+                    episode: v.episode,
+                    thumbnail: v.thumbnail || seriesItem.poster || undefined,
+                    ...(v.released ? { released: v.released } : {})
+                }))
+            };
+        }
         return {
             id: seriesItem.id,
             type: 'series',
-            name: seriesItem.name,
-            poster: seriesItem.poster ||
-                seriesItem.attributes?.['tvg-logo'] ||
-                `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-            description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-            genres: seriesItem.category
-                ? [seriesItem.category]
-                : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+            name: tmdb.name,
+            poster: tmdb.poster,
+            background: tmdb.background,
+            logo: tmdb.logo,
+            description: tmdb.description,
+            genres: tmdb.genres,
+            releaseInfo: tmdb.releaseInfo,
+            year: tmdb.year,
+            runtime: tmdb.runtime,
+            cast: tmdb.cast,
+            tmdbRating: tmdb.rating,
+            trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
+            links: [
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
+                ...(tmdb.links || [])
+            ],
             videos
+        };
+    }
+
+    async enrichCatalogMetaItems(items, concurrency = 3) {
+        const startedAt = Date.now();
+        const candidates = items.filter(item => {
+            if (!item || (item.type !== 'movie' && item.type !== 'series')) return false;
+            // LRUCache.has() delegates to get(), so use one lookup to test for a hit.
+            return this.catalogMetaCache.get(item.id) === undefined;
+        });
+        let nextIndex = 0;
+        const worker = async () => {
+            while (nextIndex < candidates.length) {
+                const item = candidates[nextIndex++];
+                try {
+                    const detailed = await this.getCatalogMetaAsync(item.id, item.type);
+                    if (!detailed) continue;
+                    const preview = { ...detailed };
+                    delete preview.tmdbRating;
+                    if (Array.isArray(preview.links)) {
+                        preview.links = preview.links.filter(link => link?.category !== 'Rating');
+                    }
+                    const providerGenre = item.category || item.attributes?.['group-title'];
+                    let fallbackPreview;
+                    if (!Array.isArray(preview.genres) || !preview.genres.length) {
+                        fallbackPreview = this.generateMetaPreview(item);
+                        preview.genres = fallbackPreview.genres?.length
+                            ? fallbackPreview.genres
+                            : (providerGenre ? [providerGenre] : []);
+                    }
+                    if (!Array.isArray(preview.cast) || !preview.cast.length) {
+                        fallbackPreview = fallbackPreview || this.generateMetaPreview(item);
+                        if (Array.isArray(fallbackPreview.cast) && fallbackPreview.cast.length) {
+                            preview.cast = fallbackPreview.cast;
+                        }
+                    }
+                    this.catalogMetaCache.set(item.id, preview);
+                } catch (error) {
+                    this.log.warn('Foreground catalogue metadata enrichment failed for', item.id, error?.message || error);
+                }
+            }
+        };
+        const workerCount = Math.min(Math.max(1, concurrency), candidates.length);
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        if (this.config.debug) {
+            this.log.debug('Catalogue metadata enrichment complete', {
+                requestedItems: items.length,
+                uncachedItems: candidates.length,
+                workers: workerCount,
+                ms: Date.now() - startedAt
+            });
+        }
+    }
+
+    queueCatalogMetaEnrichment(item) {
+        if (!item || this.catalogMetaCache.has(item.id) || this.catalogMetaPending.has(item.id)) return;
+        this.catalogMetaPending.set(item.id, true);
+        this.catalogMetaQueue.push(item);
+
+        const runNext = () => {
+            while (this.catalogMetaWorkers < 3 && this.catalogMetaQueueHead < this.catalogMetaQueue.length) {
+                const next = this.catalogMetaQueue[this.catalogMetaQueueHead++];
+                this.catalogMetaWorkers++;
+                (async () => {
+                    try {
+                        const detailed = await this.getCatalogMetaAsync(next.id, next.type);
+                        if (detailed) {
+                            const preview = { ...detailed };
+                            delete preview.tmdbRating;
+                            if (Array.isArray(preview.links)) {
+                                preview.links = preview.links.filter(link => link?.category !== 'Rating');
+                            }
+                            const providerGenre = next.category || next.attributes?.['group-title'];
+                            let fallbackPreview;
+                            if (!Array.isArray(preview.genres) || !preview.genres.length) {
+                                fallbackPreview = this.generateMetaPreview(next);
+                                preview.genres = fallbackPreview.genres?.length
+                                    ? fallbackPreview.genres
+                                    : (providerGenre ? [providerGenre] : []);
+                            }
+                            if (!Array.isArray(preview.cast) || !preview.cast.length) {
+                                fallbackPreview = fallbackPreview || this.generateMetaPreview(next);
+                                if (Array.isArray(fallbackPreview.cast) && fallbackPreview.cast.length) {
+                                    preview.cast = fallbackPreview.cast;
+                                }
+                            }
+                            this.catalogMetaCache.set(next.id, preview);
+                        }
+                    } catch (error) {
+                        this.log.warn('Background catalogue metadata enrichment failed for', next.id, error?.message || error);
+                    } finally {
+                        this.catalogMetaPending.delete(next.id);
+                        this.catalogMetaWorkers--;
+                        if (this.catalogMetaQueueHead >= this.catalogMetaQueue.length) {
+                            this.catalogMetaQueue = [];
+                            this.catalogMetaQueueHead = 0;
+                        }
+                        runNext();
+                    }
+                })();
+            }
+        };
+        runNext();
+    }
+
+    async resolveMovieTmdbId(id, item, providerModule) {
+        const idCacheKey = 'movie-tmdb:' + id;
+        const cached = this.seriesInfoCache.get(idCacheKey);
+        if (cached) return cached;
+
+        // Missing IDs are cached for the cache TTL too, so every Discover revisit
+        // does not repeat the same potentially slow get_vod_info call.
+        const negativeKey = 'movie-tmdb-miss:' + id;
+        if (this.seriesInfoCache.has(negativeKey)) return null;
+
+        const pendingKey = 'movie-tmdb:' + id;
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
+
+        const task = (async () => {
+            const streamId = id.replace(/^iptv_vod_/, '');
+            const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
+            const tmdbId = providerInfo?.tmdbId || null;
+            if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
+            else this.seriesInfoCache.set(negativeKey, true);
+            return tmdbId;
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
+    }
+
+    async getCatalogMetaAsync(id, type) {
+        const key = String(id || '');
+        if (!key) return null;
+        const cached = this.catalogMetaCache.get(key);
+        if (cached !== undefined) return cached;
+        const pending = this.catalogMetaInFlight.get(key);
+        if (pending) return pending;
+
+        const task = this._getCatalogMetaAsync(id, type);
+        this.catalogMetaInFlight.set(key, task);
+        try {
+            return await task;
+        } finally {
+            if (this.catalogMetaInFlight.get(key) === task) {
+                this.catalogMetaInFlight.delete(key);
+            }
+        }
+    }
+
+    async _getCatalogMetaAsync(id, type) {
+        // Discover cards do not need episode lists, trailers, or logo-image lookups.
+        // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
+        if (type === 'series' || id.startsWith('iptv_series_')) {
+            const seriesItem = findCatalogueItemById(this.series, id);
+            if (!seriesItem) return null;
+            const seriesId = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
+            let info = null;
+            let tmdbId = seriesItem.tmdbId || null;
+            const providerLookupStartedAt = Date.now();
+            if (!tmdbId) {
+                tmdbId = await this.ensureSeriesTmdbId(seriesId);
+            }
+            const providerLookupMs = Date.now() - providerLookupStartedAt;
+            const tmdbLookupStartedAt = Date.now();
+            const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
+            this.log.debug('Catalogue metadata stages', {
+                type: 'series',
+                id: seriesItem.id,
+                hasListingTmdbId: !!seriesItem.tmdbId,
+                hasResolvedTmdbId: !!tmdbId,
+                providerLookupMs,
+                tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
+                totalMs: Date.now() - providerLookupStartedAt
+            });
+            if (!tmdb) return this.getDetailedMeta(id);
+            return {
+                id: seriesItem.id,
+                type: 'series',
+                name: tmdb.name,
+                poster: tmdb.poster || seriesItem.poster,
+                background: tmdb.background,
+                logo: tmdb.logo,
+                description: tmdb.description,
+                genres: tmdb.genres,
+                releaseInfo: tmdb.releaseInfo,
+                year: tmdb.year,
+                runtime: tmdb.runtime,
+                cast: tmdb.cast,
+                tmdbRating: tmdb.rating,
+                trailers: [],
+                links: [
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
+                    ...(tmdb.links || [])
+                ]
+            };
+        }
+
+        const item = findCatalogueItemById(this.movies, id);
+        if (!item) return this.getDetailedMeta(id);
+        const providerModule = require('./src/js/providers/xtreamProvider.js');
+        const idCacheKey = 'movie-tmdb:' + id;
+        let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
+        const providerLookupStartedAt = Date.now();
+        if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+            tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
+        }
+        const providerLookupMs = Date.now() - providerLookupStartedAt;
+        const tmdbLookupStartedAt = Date.now();
+        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
+        this.log.debug('Catalogue metadata stages', {
+            type: 'movie',
+            id: item.id,
+            hasListingTmdbId: !!item.tmdbId,
+            hasResolvedTmdbId: !!tmdbId,
+            providerLookupMs,
+            tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
+            totalMs: Date.now() - providerLookupStartedAt
+        });
+        if (!tmdb) return this.getDetailedMeta(id);
+        return {
+            id: item.id,
+            type: 'movie',
+            name: tmdb.name,
+            poster: tmdb.poster || item.poster,
+            background: tmdb.background,
+            logo: tmdb.logo,
+            description: tmdb.description,
+            genres: tmdb.genres,
+            releaseInfo: tmdb.releaseInfo,
+            year: tmdb.year,
+            runtime: tmdb.runtime,
+            director: tmdb.director,
+            cast: tmdb.cast,
+            tmdbRating: tmdb.rating,
+            trailers: [],
+            links: [
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
+                ...(tmdb.links || [])
+            ]
         };
     }
 
     async getDetailedMetaAsync(id, type) {
         if (type === 'series' || id.startsWith('iptv_series_')) {
-            const seriesItem = this.series.find(s => s.id === id);
+            const seriesItem = findCatalogueItemById(this.series, id);
             if (!seriesItem) return null;
             return await this.buildSeriesMeta(seriesItem);
         }
-        // fallback sync path
+        const item = findCatalogueItemById(this.movies, id);
+        if (item) {
+            const providerModule = require('./src/js/providers/xtreamProvider.js');
+            const idCacheKey = 'movie-tmdb:' + id;
+            let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
+            if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+                tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
+            }
+            const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
+            if (!tmdb) return this.getDetailedMeta(id);
+            return {
+                id: item.id,
+                type: 'movie',
+                name: tmdb.name,
+                poster: tmdb.poster,
+                background: tmdb.background,
+                logo: tmdb.logo,
+                description: tmdb.description,
+                genres: tmdb.genres,
+                releaseInfo: tmdb.releaseInfo,
+                year: tmdb.year,
+                runtime: tmdb.runtime,
+                director: tmdb.director,
+                cast: tmdb.cast,
+                tmdbRating: tmdb.rating,
+                trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
+                links: [
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
+                    ...(tmdb.links || [])
+                ]
+            };
+        }
+        // Live-channel metadata remains unchanged; it is not film/series metadata.
         return this.getDetailedMeta(id);
     }
 
     getDetailedMeta(id) {
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
+        const item = findCatalogueItemById(this.channels, id) || findCatalogueItemById(this.movies, id);
         if (!item) return null;
         if (item.type === 'tv') {
             // Native EPG programmes are attached separately as scheduled videos.
@@ -729,24 +1314,67 @@ async function createAddon(config) {
 
                 const extra = args.extra || {}; // Stremio passes filter/genre here
                 let filtered = items;
-                
-                // If specific genre selected
+                let genreFilterMs = 0;
+                let genreIndexMs = 0;
+                let genreIndexBuilt = false;
+                let searchIndexMs = 0;
+                let searchFilterMs = 0;
+                let searchIndexBuilt = false;
+
+                // If specific genre selected, reuse normalised item categories across
+                // requests. Matching remains exact and preserves catalogue order.
+                const genreFilterStartedAt = Date.now();
                 if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
+                    const genreIndexStartedAt = Date.now();
+                    const genreIndexResult = getCatalogueGenreIndex(items);
+                    const genreIndex = genreIndexResult.index;
+                    genreIndexBuilt = genreIndexResult.built;
+                    genreIndexMs = Date.now() - genreIndexStartedAt;
+                    const selectedGenre = normalizeGenre(extra.genre);
                     filtered = filtered.filter(i => {
+                        const indexedGenre = genreIndex.get(i);
+                        if (indexedGenre !== undefined) return indexedGenre === selectedGenre;
                         const cat = i.category || i.attributes?.['group-title'];
-                        return matchesGenre(cat, extra.genre);
+                        return matchesGenre(cat, selectedGenre);
                     });
                 }
-                
-                // If searching
+                genreFilterMs = Date.now() - genreFilterStartedAt;
+
+                // Keep normalized titles indexed per immutable catalogue array. This
+                // avoids repeatedly normalizing thousands of titles on every search,
+                // without changing matching rules, result order, or displayed titles.
                 if (extra.search) {
-                    const q = extra.search.toLowerCase();
-                    filtered = filtered.filter(i => i.name.toLowerCase().includes(q));
+                    const indexStartedAt = Date.now();
+                    const searchIndexResult = getCatalogueSearchIndex(items);
+                    const searchIndex = searchIndexResult.index;
+                    searchIndexBuilt = searchIndexResult.built;
+                    const matcher = createNormalizedSearchMatcher(getNormalizedSearchText(extra.search));
+                    searchIndexMs = Date.now() - indexStartedAt;
+
+                    const searchFilterStartedAt = Date.now();
+                    filtered = filtered.filter(i => {
+                        const indexedTitle = searchIndex.get(i);
+                        return indexedTitle
+                            ? matcher(indexedTitle.text, indexedTitle.words)
+                            : matcher(getNormalizedSearchText(i.name));
+                    });
+                    searchFilterMs = Date.now() - searchFilterStartedAt;
                 }
                 
-                // Pagination / Skip
+                // Keep every movie/series Discover batch small enough to enrich fully
+                // before returning it, including search results. Stremio requests the next
+                // page as the user scrolls, so no visible movie/series card depends on a
+                // later background update. Live-TV/EPG retain the existing 100-item size.
+                const catalogPageSize = (args.type === 'movie' || args.type === 'series')
+                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100)
+                    : 100;
+
+                // Pagination / Skip. Stremio's next-page skip is based on the number
+                // of items already returned, so smaller non-search pages remain pageable.
+                const paginationStartedAt = Date.now();
                 const skip = extra.skip ? parseInt(extra.skip) : 0;
-                const page = filtered.slice(skip, skip + 100);
+                const page = filtered.slice(skip, skip + catalogPageSize);
+                const paginationMs = Date.now() - paginationStartedAt;
 
                 // Native EPG requests specify a UTC date and expect metasDetailed.
                 if (args.type === 'tv' && args.id === 'iptv_channels' && extra.date) {
@@ -783,15 +1411,47 @@ async function createAddon(config) {
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
                 }
 
-                const metas = page.map(i => {
+                // Stremio does not reliably refresh cards already rendered in Discover.
+                // Enrich every movie/series item in the current page before replying,
+                // including search results. Later pages are loaded when the user scrolls.
+                // Allow more independent item lookups to overlap. Keep this configurable
+                // because some Xtream providers impose stricter request limits.
+                const genreMetaConcurrency = parsePositiveInteger(
+                    process.env.CATALOG_GENRE_META_CONCURRENCY, 16, 1, 16
+                );
+                const enrichmentStartedAt = Date.now();
+                if (page.length && (args.type === 'movie' || args.type === 'series')) {
+                    await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
+                }
+                const enrichmentMs = Date.now() - enrichmentStartedAt;
+                const responseBuildStartedAt = Date.now();
+                const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
                         meta.behaviorHints = { isLive: true };
                         meta.posterShape = 'square';
+                        return meta;
                     }
-                    return meta;
+                    if (i.type !== 'movie' && i.type !== 'series') return meta;
+
+                    const cached = addonInstance.catalogMetaCache.get(i.id);
+                    if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
+
+                    // The current page has already completed foreground enrichment.
+                    // If no authoritative result was available, return the best base
+                    // metadata without scheduling a background mutation of this card.
+                    const firstPass = { ...meta, id: i.id, type: i.type };
+                    delete firstPass.genres;
+                    delete firstPass.cast;
+                    delete firstPass.description;
+                    delete firstPass.runtime;
+                    delete firstPass.releaseInfo;
+                    delete firstPass.year;
+                    delete firstPass.links;
+                    return firstPass;
                 });
                 
+                const responseBuildMs = Date.now() - responseBuildStartedAt;
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
                         type: args.type,
@@ -801,6 +1461,15 @@ async function createAddon(config) {
                         filtered: filtered.length,
                         returned: metas.length,
                         skip,
+                        genreFilterMs,
+                        genreIndexMs,
+                        genreIndexBuilt,
+                        searchIndexMs,
+                        searchIndexBuilt,
+                        searchFilterMs,
+                        paginationMs,
+                        enrichmentMs,
+                        responseBuildMs,
                         ms: Date.now() - start
                     });
                 }
@@ -850,13 +1519,7 @@ async function createAddon(config) {
                             const fallbackMeta = {
                                 id: seriesItem.id,
                                 type: 'series',
-                                name: seriesItem.name,
-                                poster: seriesItem.poster || seriesItem.attributes?.['tvg-logo'] ||
-                                    `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-                                description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
-                                genres: seriesItem.category
-                                    ? [seriesItem.category]
-                                    : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
+                                name: 'Metadata unavailable',
                                 videos: []
                             };
                             if (addonInstance.config.debug) {
@@ -867,7 +1530,7 @@ async function createAddon(config) {
                     }
                     return { meta: meta || null };
                 }
-                const meta = addonInstance.getDetailedMeta(id);
+                const meta = await addonInstance.getDetailedMetaAsync(id, type);
                 if (meta && type === 'tv' && meta.type === 'tv') {
                     const channel = addonInstance.channels.find(item => item.id === id);
                     if (channel) {
@@ -928,5 +1591,10 @@ async function createAddon(config) {
 }
 
 module.exports = createAddon;
+module.exports.M3UEPGAddon = M3UEPGAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
+module.exports.normalizeSearchText = normalizeSearchText;
+module.exports.matchesSearchText = matchesSearchText;
+module.exports.matchesNormalizedSearchText = matchesNormalizedSearchText;
+module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;

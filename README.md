@@ -179,6 +179,9 @@ curl -X POST http://localhost:7000/api/prefetch \
 |----------|---------|---------|
 | `PORT` | `7000` | HTTP server port |
 | `REDIS_URL` | unset | Optional shared cache for provider data only |
+| `TMDB_API_KEY` | unset | Server-side TMDb API key used for movie, series and episode metadata; without it, TMDb metadata is unavailable |
+| `TMDB_CACHE_TTL_MS` | `86400000` (24h) | Cache lifetime for TMDb API responses |
+| `TMDB_CACHE_MAX_ENTRIES` | `1000` | Maximum number of cached TMDb responses (bounded by the server) |
 | `CACHE_ENABLED` | `true` | Master toggle for LRU + Redis |
 | `CACHE_TTL_MS` | `21600000` (6h) | TTL for cached data |
 | `MAX_CACHE_ENTRIES` | `100` | Maximum entries in each in-memory cache; values are bounded by the server | LRU entry cap; values are bounded by the server |
@@ -239,8 +242,10 @@ curl -X POST http://localhost:7000/api/prefetch \
 
 ### Xtream JSON Mode
 - Fetches `get_series`
-- Per-series metadata lazily enriched via `get_series_info`
-- Each episode becomes a `video` in the series meta, streamable by ID
+- Per-series episode stream IDs and URLs are retained from `get_series_info`
+- TMDb IDs identify movie and series records; all displayed movie, series and episode metadata is fetched from TMDb
+- TMDb responses are cached server-side; set `TMDB_API_KEY` on the host
+- Each episode remains streamable by its original Xtream ID
 
 ### Direct / m3u_plus / Heuristic
 - Detects patterns:

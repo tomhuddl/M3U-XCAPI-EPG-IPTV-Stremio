@@ -29,6 +29,7 @@ jobs:
           node --check urlSafety.js
           node --check src/js/providers/directProvider.js
           node --check src/js/providers/xtreamProvider.js
+          node --check src/js/tmdbMetadata.js
           node --check src/js/configure-common.js
           node --check src/js/direct-config.js
           node --check src/js/xtream-config.js
