@@ -264,6 +264,9 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Coalesce overlapping Xtream ID and series-info lookups started by parallel
+        // Discover workers, avoiding duplicate provider API round-trips.
+        this.providerInfoInFlight = new Map();
         // Cached catalogue enrichment lets later home/search requests return
         // rich cards without waiting on TMDb/Xtream for every item.
         this.catalogMetaCache = new LRUCache({
@@ -580,20 +583,36 @@ class M3UEPGAddon {
         if (!seriesId) return null;
         if (this.seriesInfoCache.has(seriesId)) return this.seriesInfoCache.get(seriesId);
 
-        try {
-            const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
-            if (typeof providerModule.fetchSeriesInfo === 'function') {
-                const info = await providerModule.fetchSeriesInfo(this, seriesId);
-                this.seriesInfoCache.set(seriesId, info);
-                return info;
-            }
-        } catch (e) {
-            this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
+        const pendingKey = 'series-info:' + String(seriesId);
+        if (this.providerInfoInFlight.has(pendingKey)) {
+            return this.providerInfoInFlight.get(pendingKey);
         }
-        // Fallback empty structure
-        const empty = { videos: [] };
-        this.seriesInfoCache.set(seriesId, empty);
-        return empty;
+
+        const task = (async () => {
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                if (typeof providerModule.fetchSeriesInfo === 'function') {
+                    const info = await providerModule.fetchSeriesInfo(this, seriesId);
+                    this.seriesInfoCache.set(seriesId, info);
+                    return info;
+                }
+            } catch (e) {
+                this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
+            }
+            // Fallback empty structure
+            const empty = { videos: [] };
+            this.seriesInfoCache.set(seriesId, empty);
+            return empty;
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
     }
 
     async updateData(force = false) {
@@ -882,6 +901,40 @@ class M3UEPGAddon {
         runNext();
     }
 
+    async resolveMovieTmdbId(id, item, providerModule) {
+        const idCacheKey = 'movie-tmdb:' + id;
+        const cached = this.seriesInfoCache.get(idCacheKey);
+        if (cached) return cached;
+
+        // Missing IDs are cached for the cache TTL too, so every Discover revisit
+        // does not repeat the same potentially slow get_vod_info call.
+        const negativeKey = 'movie-tmdb-miss:' + id;
+        if (this.seriesInfoCache.has(negativeKey)) return null;
+
+        const pendingKey = 'movie-tmdb:' + id;
+        if (this.providerInfoInFlight.has(pendingKey)) {
+            return this.providerInfoInFlight.get(pendingKey);
+        }
+
+        const task = (async () => {
+            const streamId = id.replace(/^iptv_vod_/, '');
+            const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
+            const tmdbId = providerInfo?.tmdbId || null;
+            if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
+            else this.seriesInfoCache.set(negativeKey, true);
+            return tmdbId;
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
+    }
+
     async getCatalogMetaAsync(id, type) {
         const key = String(id || '');
         if (!key) return null;
@@ -941,10 +994,7 @@ class M3UEPGAddon {
         const idCacheKey = 'movie-tmdb:' + id;
         let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
         if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
-            const streamId = id.replace(/^iptv_vod_/, '');
-            const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
-            tmdbId = providerInfo?.tmdbId || null;
-            if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
+            tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
         }
         const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
         if (!tmdb) return this.getDetailedMeta(id);
@@ -982,10 +1032,7 @@ class M3UEPGAddon {
             const idCacheKey = 'movie-tmdb:' + id;
             let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
             if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
-                const streamId = id.replace(/^iptv_vod_/, '');
-                const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
-                tmdbId = providerInfo?.tmdbId || null;
-                if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
+                tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
             }
             const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
             if (!tmdb) return this.getDetailedMeta(id);
