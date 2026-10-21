@@ -375,6 +375,27 @@ function testScheduledProgramsCacheParsedTimestamps() {
     assert.strictEqual(parseCalls, 2, "start and stop timestamps should only be parsed once per programme");
 }
 
+async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    let calls = 0;
+    addon._getCatalogMetaAsync = async (id, type) => {
+        calls++;
+        await new Promise(resolve => setImmediate(resolve));
+        return { id, type, name: "Shared metadata" };
+    };
+
+    const results = await Promise.all([
+        addon.getCatalogMetaAsync("movie-shared", "movie"),
+        addon.getCatalogMetaAsync("movie-shared", "movie"),
+        addon.getCatalogMetaAsync("movie-shared", "movie")
+    ]);
+
+    assert.strictEqual(calls, 1, "concurrent requests for one item should share a single metadata lookup");
+    assert.deepStrictEqual(results[0], results[1]);
+    assert.deepStrictEqual(results[1], results[2]);
+    assert.strictEqual(addon.catalogMetaInFlight.size, 0, "in-flight entries should be cleared after completion");
+}
+
 async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     const count = 75;
@@ -440,6 +461,7 @@ async function main() {
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
         testDirectEpisodeLookupUsesExactIndex,
+        testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testMovieMetadataMapping,
         testSeriesMetadataMapping,
