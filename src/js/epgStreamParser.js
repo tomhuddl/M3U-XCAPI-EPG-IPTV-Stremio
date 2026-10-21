@@ -66,8 +66,8 @@ function parseEPGStream(readable, allowedChannelIds) {
         });
         xml.on('cdata', (value) => {
             if (current && current.keep && field) {
-                if (field === 'title') { titleText += value; current.title = titleText; }
-                else current.desc += value;
+                if (field === 'title') current.title = (current.title + value).slice(0, MAX_TITLE_CHARS);
+                else if (current.desc.length < MAX_DESCRIPTION_CHARS) current.desc = (current.desc + value).slice(0, MAX_DESCRIPTION_CHARS);
             }
         });
         xml.on('closetag', (tagName) => {
