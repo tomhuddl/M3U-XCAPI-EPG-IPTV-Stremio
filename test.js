@@ -428,6 +428,62 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     assert.strictEqual(addon.catalogMetaQueueHead, 0);
 }
 
+async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    let calls = 0;
+    const originalRequire = module.require;
+    module.require = function (id) {
+        if (id === "./src/js/providers/directProvider.js") {
+            return {
+                fetchSeriesInfo: async (_addon, seriesId) => {
+                    calls++;
+                    await new Promise(resolve => setImmediate(resolve));
+                    return { tmdbId: "65251", videos: [{ id: "ep-1" }], seriesId };
+                }
+            };
+        }
+        return originalRequire.call(this, id);
+    };
+
+    try {
+        const results = await Promise.all([
+            addon.ensureSeriesInfo("series-1"),
+            addon.ensureSeriesInfo("series-1"),
+            addon.ensureSeriesInfo("series-1")
+        ]);
+        assert.strictEqual(calls, 1, "concurrent requests for one series should share provider lookup");
+        assert.deepStrictEqual(results[0], results[1]);
+        assert.deepStrictEqual(results[1], results[2]);
+        assert.strictEqual(addon.providerInfoInFlight.size, 0);
+    } finally {
+        module.require = originalRequire;
+    }
+}
+
+async function testMovieTmdbMissIsCached() {
+    const addon = new M3UEPGAddon({ provider: "xtream" });
+    addon.seriesInfoCache = new LRUCache({ max: 100, ttl: 60000 });
+    let calls = 0;
+    const providerModule = {
+        fetchMovieInfo: async () => {
+            calls++;
+            await new Promise(resolve => setImmediate(resolve));
+            return { tmdbId: null };
+        }
+    };
+    const item = { id: "iptv_vod_123", name: "Test movie", type: "movie" };
+    const results = await Promise.all([
+        addon.resolveMovieTmdbId(item.id, item, providerModule),
+        addon.resolveMovieTmdbId(item.id, item, providerModule),
+        addon.resolveMovieTmdbId(item.id, item, providerModule)
+    ]);
+    assert.deepStrictEqual(results, [null, null, null]);
+    assert.strictEqual(calls, 1, "concurrent lookups should share one Xtream request");
+    await addon.resolveMovieTmdbId(item.id, item, providerModule);
+    assert.strictEqual(calls, 1, "negative cache should prevent repeated requests on subsequent visits");
+    assert.strictEqual(addon.providerInfoInFlight.size, 0);
+}
+
 async function testStreamingEpgParser() {
     const xml = [
         '<?xml version="1.0"?>',
@@ -463,6 +519,8 @@ async function main() {
         testDirectEpisodeLookupUsesExactIndex,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
+        testConcurrentSeriesInfoLookupsAreDeduplicated,
+        testMovieTmdbMissIsCached,
         testMovieMetadataMapping,
         testSeriesMetadataMapping,
         testEpisodeMetadataMapping,
