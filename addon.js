@@ -98,7 +98,8 @@ const normalizedSearchCache = new Map();
 
 function getNormalizedSearchText(value) {
     const original = String(value ?? '');
-    if (normalizedSearchCache.has(original)) return normalizedSearchCache.get(original);
+    const cached = normalizedSearchCache.get(original);
+    if (cached !== undefined) return cached;
     const normalized = normalizeSearchText(original);
     normalizedSearchCache.set(original, normalized);
     if (normalizedSearchCache.size > NORMALIZED_SEARCH_CACHE_MAX) {
