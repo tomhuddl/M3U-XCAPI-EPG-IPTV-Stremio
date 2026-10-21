@@ -130,7 +130,8 @@ async function safeFetch(input, options = {}) {
   const reuseConnection = fetchOptions.reuseConnection === true;
   const diagnostics = fetchOptions.diagnostics && typeof fetchOptions.diagnostics === "object"
     ? fetchOptions.diagnostics
-    : null;
+    : ((process.env.DEBUG_MODE || "").toLowerCase() === "true" &&
+       currentUrl.hostname.toLowerCase() === "api.themoviedb.org" ? {} : null);
   delete fetchOptions.diagnostics;
   delete fetchOptions.reuseConnection;
   delete fetchOptions.maxRedirects;
@@ -218,7 +219,19 @@ async function safeFetch(input, options = {}) {
         throw error;
       }
 
-      if (diagnostics) diagnostics.headersMs = Date.now() - headersStartedAt;
+      if (diagnostics) {
+        diagnostics.headersMs = Date.now() - headersStartedAt;
+        if ((process.env.DEBUG_MODE || "").toLowerCase() === "true" &&
+            currentUrl.hostname.toLowerCase() === "api.themoviedb.org") {
+          console.log("[DEBUG] TMDb transport timing", {
+            path: currentUrl.pathname,
+            status: response.status,
+            dnsMs: diagnostics.dnsMs ?? null,
+            headersMs: diagnostics.headersMs,
+            freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
+          });
+        }
+      }
 
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         finalAgent = agent;
