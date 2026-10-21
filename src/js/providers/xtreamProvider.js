@@ -260,7 +260,12 @@ async function fetchMovieInfo(addonInstance, streamId) {
   if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   try {
-    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, { timeout: 20000 });
+    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
+      timeout: 20000,
+      // Reuse a connection for this provider fallback when its validated DNS
+      // addresses are unchanged; safeFetch still validates DNS on every request.
+      reuseConnection: true,
+    });
     if (!response.ok) return null;
     const payload = await response.json();
     const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
