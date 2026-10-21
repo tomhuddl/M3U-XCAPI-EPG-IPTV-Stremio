@@ -149,9 +149,14 @@ function metadataLinks(details, credits, mediaType) {
   // credited directors are grouped under the correct label in Stremio.
   if (mediaType === "movie") {
     const crew = Array.isArray(credits?.crew) ? credits.crew : [];
-    const directors = crew.filter(person => person?.job === "Director");
     const seen = new Set();
-    for (const person of directors.slice(0, 10)) {
+    let directorCount = 0;
+    for (const person of crew) {
+      if (person?.job !== "Director") continue;
+      // Preserve the previous first-ten-credits limit without allocating a
+      // filtered directors array and a second sliced array for every catalogue item.
+      if (directorCount >= 10) break;
+      directorCount++;
       if (nonEmpty(person?.name) && Number.isSafeInteger(person.id) && person.id > 0 && !seen.has(person.id)) {
         seen.add(person.id);
         links.push({
