@@ -1191,8 +1191,15 @@ async function createAddon(config) {
                 const searchMetaItems = parsePositiveInteger(
                     process.env.CATALOG_SEARCH_META_ITEMS, 12, 1, 30
                 );
-                const catalogMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_META_CONCURRENCY, 3, 1, 6
+                const searchMetaConcurrency = parsePositiveInteger(
+                    process.env.CATALOG_SEARCH_META_CONCURRENCY, 3, 1, 6
+                );
+                // Category selections deliberately enrich the entire visible page before
+                // replying, so users can browse the category without re-entering it.
+                // Give that path more parallelism than search, whose foreground batch is
+                // already bounded to avoid making search feel unresponsive.
+                const genreMetaConcurrency = parsePositiveInteger(
+                    process.env.CATALOG_GENRE_META_CONCURRENCY, 6, 1, 8
                 );
                 const hasSearch = Boolean(extra.search);
                 const hasGenre = Boolean(extra.genre);
@@ -1200,7 +1207,10 @@ async function createAddon(config) {
                     ? page.slice(0, searchMetaItems)
                     : (hasGenre ? page : []);
                 if (foregroundItems.length) {
-                    await addonInstance.enrichCatalogMetaItems(foregroundItems, catalogMetaConcurrency);
+                    const concurrency = hasGenre && !hasSearch
+                        ? genreMetaConcurrency
+                        : searchMetaConcurrency;
+                    await addonInstance.enrichCatalogMetaItems(foregroundItems, concurrency);
                 }
                 // Background work keeps the cache warm without holding up the
                 // catalogue response. This does not alter the selected-genre path.
