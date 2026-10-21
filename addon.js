@@ -108,6 +108,23 @@ function getNormalizedSearchText(value) {
     return normalized;
 }
 
+// Cache normalized titles against each immutable catalogue array. The general
+// bounded text cache can churn when movie and series catalogues are both searched;
+// this per-catalogue index keeps normalized titles reusable across successive queries.
+const catalogueSearchIndexes = new WeakMap();
+
+function getCatalogueSearchIndex(items) {
+    let index = catalogueSearchIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (item && !index.has(item)) index.set(item, getNormalizedSearchText(item.name));
+    }
+    catalogueSearchIndexes.set(items, index);
+    return { index, built: true };
+}
+
 function matchesSearchText(query, title) {
     return matchesNormalizedSearchText(
         getNormalizedSearchText(query),
@@ -1271,21 +1288,35 @@ async function createAddon(config) {
 
                 const extra = args.extra || {}; // Stremio passes filter/genre here
                 let filtered = items;
-                
+                let genreFilterMs = 0;
+                let searchIndexMs = 0;
+                let searchFilterMs = 0;
+                let searchIndexBuilt = false;
+
                 // If specific genre selected
+                const genreFilterStartedAt = Date.now();
                 if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
                     filtered = filtered.filter(i => {
                         const cat = i.category || i.attributes?.['group-title'];
                         return matchesGenre(cat, extra.genre);
                     });
                 }
-                
-                // Normalise both sides so punctuation and spacing differences
-                // (e.g. "Spider-Man" vs "spider   man") do not hide matches.
+                genreFilterMs = Date.now() - genreFilterStartedAt;
+
+                // Keep normalized titles indexed per immutable catalogue array. This
+                // avoids repeatedly normalizing thousands of titles on every search,
+                // without changing matching rules, result order, or displayed titles.
                 if (extra.search) {
-                    // Normalize the query once per catalogue request, not once per title.
+                    const indexStartedAt = Date.now();
+                    const searchIndexResult = getCatalogueSearchIndex(items);
+                    const searchIndex = searchIndexResult.index;
+                    searchIndexBuilt = searchIndexResult.built;
                     const matcher = createNormalizedSearchMatcher(getNormalizedSearchText(extra.search));
-                    filtered = filtered.filter(i => matcher(getNormalizedSearchText(i.name)));
+                    searchIndexMs = Date.now() - indexStartedAt;
+
+                    const searchFilterStartedAt = Date.now();
+                    filtered = filtered.filter(i => matcher(searchIndex.get(i) ?? getNormalizedSearchText(i.name)));
+                    searchFilterMs = Date.now() - searchFilterStartedAt;
                 }
                 
                 // Keep every movie/series Discover batch small enough to enrich fully
@@ -1298,8 +1329,10 @@ async function createAddon(config) {
 
                 // Pagination / Skip. Stremio's next-page skip is based on the number
                 // of items already returned, so smaller non-search pages remain pageable.
+                const paginationStartedAt = Date.now();
                 const skip = extra.skip ? parseInt(extra.skip) : 0;
                 const page = filtered.slice(skip, skip + catalogPageSize);
+                const paginationMs = Date.now() - paginationStartedAt;
 
                 // Native EPG requests specify a UTC date and expect metasDetailed.
                 if (args.type === 'tv' && args.id === 'iptv_channels' && extra.date) {
@@ -1344,9 +1377,12 @@ async function createAddon(config) {
                 const genreMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_GENRE_META_CONCURRENCY, 12, 1, 12
                 );
+                const enrichmentStartedAt = Date.now();
                 if (page.length && (args.type === 'movie' || args.type === 'series')) {
                     await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
                 }
+                const enrichmentMs = Date.now() - enrichmentStartedAt;
+                const responseBuildStartedAt = Date.now();
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
@@ -1373,6 +1409,7 @@ async function createAddon(config) {
                     return firstPass;
                 });
                 
+                const responseBuildMs = Date.now() - responseBuildStartedAt;
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
                         type: args.type,
@@ -1382,6 +1419,13 @@ async function createAddon(config) {
                         filtered: filtered.length,
                         returned: metas.length,
                         skip,
+                        genreFilterMs,
+                        searchIndexMs,
+                        searchIndexBuilt,
+                        searchFilterMs,
+                        paginationMs,
+                        enrichmentMs,
+                        responseBuildMs,
                         ms: Date.now() - start
                     });
                 }
