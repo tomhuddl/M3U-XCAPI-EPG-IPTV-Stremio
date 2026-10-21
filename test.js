@@ -166,7 +166,8 @@ function testMovieMetadataMapping() {
             crew: [{ id: 55, job: "Director", name: "Sample Director" }, { id: 56, job: "Director", name: "Co-Director" }, { job: "Writer", name: "Sample Writer" }],
             cast: Array.from({ length: 8 }, (_, index) => ({ id: 101 + index, name: "Actor " + (index + 1) }))
         },
-        { results: [{ site: "YouTube", type: "Trailer", key: "abc123", name: "Official Trailer" }] }
+        { results: [{ site: "YouTube", type: "Trailer", key: "abc123", name: "Official Trailer" }] },
+        { logos: [{ iso_639_1: "en", file_path: "/movie-logo.png" }] }
     );
     assert.strictEqual(meta.name, "Spider-Man: Brand New Day");
     assert.strictEqual(meta.year, 2026);
@@ -188,6 +189,7 @@ function testMovieMetadataMapping() {
     ]);
     assert.strictEqual(meta.poster, "https://image.tmdb.org/t/p/w500/poster.jpg");
     assert.strictEqual(meta.background, "https://image.tmdb.org/t/p/w1280/backdrop.jpg");
+    assert.strictEqual(meta.logo, "https://image.tmdb.org/t/p/w500/movie-logo.png");
     assert.strictEqual(meta.trailer.id, "abc123");
     assert.strictEqual(mapMovieMetadata({ title: "Unknown", vote_average: 9.9, vote_count: 0 }, {}, {}).rating, undefined);
 }
@@ -211,7 +213,8 @@ function testSeriesMetadataMapping() {
             crew: [{ name: "Sample Director", jobs: [{ job: "Director" }] }],
             cast: [{ id: 202, name: "Series Actor" }]
         },
-        { results: [] }
+        { results: [] },
+        { logos: [{ iso_639_1: "en", file_path: "/series-logo.png" }] }
     );
     assert.strictEqual(meta.name, "Crashing");
     assert.strictEqual(meta.year, 2016);
@@ -226,6 +229,7 @@ function testSeriesMetadataMapping() {
         { name: "Series Actor", category: "Cast", url: "https://www.themoviedb.org/person/202" }
     ]);
     assert.strictEqual(meta.trailer, undefined);
+    assert.strictEqual(meta.logo, "https://image.tmdb.org/t/p/w500/series-logo.png");
 }
 
 function testEpisodeMetadataMapping() {
