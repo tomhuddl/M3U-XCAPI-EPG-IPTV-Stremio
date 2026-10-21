@@ -807,7 +807,7 @@ class M3UEPGAddon {
                 this.catalogMetaWorkers++;
                 (async () => {
                     try {
-                        const detailed = await this.getDetailedMetaAsync(next.id, next.type);
+                        const detailed = await this.getCatalogMetaAsync(next.id, next.type);
                         if (detailed) {
                             const preview = { ...detailed };
                             delete preview.tmdbRating;
@@ -840,6 +840,77 @@ class M3UEPGAddon {
             }
         };
         runNext();
+    }
+
+    async getCatalogMetaAsync(id, type) {
+        // Discover cards do not need episode lists, trailers, or logo-image lookups.
+        // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
+        if (type === 'series' || id.startsWith('iptv_series_')) {
+            const seriesItem = findCatalogueItemById(this.series, id);
+            if (!seriesItem) return null;
+            const seriesId = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
+            let info = null;
+            let tmdbId = seriesItem.tmdbId || null;
+            if (!tmdbId) {
+                info = await this.ensureSeriesInfo(seriesId);
+                tmdbId = info?.tmdbId || null;
+            }
+            const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
+            if (!tmdb) return this.getDetailedMeta(id);
+            return {
+                id: seriesItem.id,
+                type: 'series',
+                name: tmdb.name,
+                poster: tmdb.poster || seriesItem.poster,
+                background: tmdb.background,
+                description: tmdb.description,
+                genres: tmdb.genres,
+                releaseInfo: tmdb.releaseInfo,
+                year: tmdb.year,
+                runtime: tmdb.runtime,
+                cast: tmdb.cast,
+                tmdbRating: tmdb.rating,
+                trailers: [],
+                links: [
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
+                    ...(tmdb.links || [])
+                ]
+            };
+        }
+
+        const item = findCatalogueItemById(this.movies, id);
+        if (!item) return this.getDetailedMeta(id);
+        const providerModule = require('./src/js/providers/xtreamProvider.js');
+        const idCacheKey = 'movie-tmdb:' + id;
+        let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
+        if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+            const streamId = id.replace(/^iptv_vod_/, '');
+            const providerInfo = await providerModule.fetchMovieInfo(this, streamId);
+            tmdbId = providerInfo?.tmdbId || null;
+            if (tmdbId) this.seriesInfoCache.set(idCacheKey, tmdbId);
+        }
+        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
+        if (!tmdb) return this.getDetailedMeta(id);
+        return {
+            id: item.id,
+            type: 'movie',
+            name: tmdb.name,
+            poster: tmdb.poster || item.poster,
+            background: tmdb.background,
+            description: tmdb.description,
+            genres: tmdb.genres,
+            releaseInfo: tmdb.releaseInfo,
+            year: tmdb.year,
+            runtime: tmdb.runtime,
+            director: tmdb.director,
+            cast: tmdb.cast,
+            tmdbRating: tmdb.rating,
+            trailers: [],
+            links: [
+                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
+                ...(tmdb.links || [])
+            ]
+        };
     }
 
     async getDetailedMetaAsync(id, type) {
