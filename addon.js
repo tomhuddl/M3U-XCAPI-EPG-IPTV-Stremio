@@ -970,11 +970,23 @@ class M3UEPGAddon {
             const seriesId = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
             let info = null;
             let tmdbId = seriesItem.tmdbId || null;
+            const providerLookupStartedAt = Date.now();
             if (!tmdbId) {
                 info = await this.ensureSeriesInfo(seriesId);
                 tmdbId = info?.tmdbId || null;
             }
+            const providerLookupMs = Date.now() - providerLookupStartedAt;
+            const tmdbLookupStartedAt = Date.now();
             const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
+            this.log.debug('Catalogue metadata stages', {
+                type: 'series',
+                id: seriesItem.id,
+                hasListingTmdbId: !!seriesItem.tmdbId,
+                hasResolvedTmdbId: !!tmdbId,
+                providerLookupMs,
+                tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
+                totalMs: Date.now() - providerLookupStartedAt
+            });
             if (!tmdb) return this.getDetailedMeta(id);
             return {
                 id: seriesItem.id,
@@ -1002,10 +1014,22 @@ class M3UEPGAddon {
         const providerModule = require('./src/js/providers/xtreamProvider.js');
         const idCacheKey = 'movie-tmdb:' + id;
         let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
+        const providerLookupStartedAt = Date.now();
         if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
             tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
         }
+        const providerLookupMs = Date.now() - providerLookupStartedAt;
+        const tmdbLookupStartedAt = Date.now();
         const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
+        this.log.debug('Catalogue metadata stages', {
+            type: 'movie',
+            id: item.id,
+            hasListingTmdbId: !!item.tmdbId,
+            hasResolvedTmdbId: !!tmdbId,
+            providerLookupMs,
+            tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
+            totalMs: Date.now() - providerLookupStartedAt
+        });
         if (!tmdb) return this.getDetailedMeta(id);
         return {
             id: item.id,
