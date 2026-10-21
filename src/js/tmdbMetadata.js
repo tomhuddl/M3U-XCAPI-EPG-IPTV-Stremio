@@ -252,13 +252,13 @@ async function getSeriesCatalogMetadata(tmdbId) {
 async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  const [details, credits, videos, images] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB"),
-    request("/movie/" + id + "/credits?language=en-GB"),
+  // Match the catalogue lookup so details + credits share one cached response.
+  const [details, videos, images] = await Promise.all([
+    request("/movie/" + id + "?language=en-GB&append_to_response=credits"),
     request("/movie/" + id + "/videos?language=en-GB"),
     request("/movie/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapMovieMetadata(details, credits, videos, images);
+  return mapMovieMetadata(details, details?.credits, videos, images);
 }
 
 function mapSeriesMetadata(details, credits, videos, images) {
@@ -296,13 +296,13 @@ function mapSeriesMetadata(details, credits, videos, images) {
 async function getSeriesMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  const [details, credits, videos, images] = await Promise.all([
-    request("/tv/" + id + "?language=en-GB"),
-    request("/tv/" + id + "/aggregate_credits?language=en-GB"),
+  // Match the catalogue lookup so details + aggregate credits share one cached response.
+  const [details, videos, images] = await Promise.all([
+    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits"),
     request("/tv/" + id + "/videos?language=en-GB"),
     request("/tv/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapSeriesMetadata(details, credits, videos, images);
+  return mapSeriesMetadata(details, details?.aggregate_credits, videos, images);
 }
 
 function mapSeasonEpisodes(data, season) {
