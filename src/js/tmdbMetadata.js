@@ -101,6 +101,12 @@ async function request(path) {
       });
       status = response.status;
       if (!response.ok) {
+        // Do not leave an unused upstream response body draining in the
+        // background. Explicitly close it so repeated HTTP failures release
+        // sockets and buffers promptly.
+        if (response.body && typeof response.body.destroy === "function") {
+          response.body.destroy();
+        }
         if (response.status === 404) negativeCache.set(cacheKey, true);
         logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
