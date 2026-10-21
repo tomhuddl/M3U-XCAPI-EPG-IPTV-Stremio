@@ -1150,6 +1150,9 @@ async function createAddon(config) {
                 const catalogMetaPrefetchItems = parsePositiveInteger(
                     process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
                 );
+                // When a genre is selected, warm the whole returned genre catalogue
+                // immediately; otherwise keep cold-start work focused on the first rows.
+                const enrichWholeGenre = Boolean(extra.genre);
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
@@ -1166,7 +1169,7 @@ async function createAddon(config) {
                     // authoritative TMDb data is ready, avoid showing provider
                     // genres/cast/plot as if they were the final metadata; otherwise
                     // Stremio can appear to switch from one set of details to another.
-                    if (pageIndex < catalogMetaPrefetchItems) {
+                    if (enrichWholeGenre || pageIndex < catalogMetaPrefetchItems) {
                         addonInstance.queueCatalogMetaEnrichment(i);
                     }
                     const firstPass = { ...meta, id: i.id, type: i.type };
