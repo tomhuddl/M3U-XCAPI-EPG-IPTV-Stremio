@@ -582,7 +582,8 @@ class M3UEPGAddon {
 
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) return null;
-        if (this.seriesInfoCache.has(seriesId)) return this.seriesInfoCache.get(seriesId);
+        const cached = this.seriesInfoCache.get(seriesId);
+        if (cached !== undefined) return cached;
 
         const pendingKey = 'series-info:' + String(seriesId);
         if (this.providerInfoInFlight.has(pendingKey)) {
