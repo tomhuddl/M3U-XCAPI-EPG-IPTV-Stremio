@@ -1159,9 +1159,19 @@ async function createAddon(config) {
                     filtered = filtered.filter(i => matcher(getNormalizedSearchText(i.name)));
                 }
                 
-                // Pagination / Skip
+                // Keep movie/series Discover pages small enough to enrich completely
+                // before returning them. Stremio requests subsequent pages as the user
+                // scrolls, so each new batch can arrive fully enriched without relying on
+                // the client to refresh cards already on screen. Search and live-TV/EPG
+                // retain the existing 100-item page size.
+                const catalogPageSize = (args.type === 'movie' || args.type === 'series') && !extra.search
+                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100)
+                    : 100;
+
+                // Pagination / Skip. Stremio's next-page skip is based on the number
+                // of items already returned, so smaller non-search pages remain pageable.
                 const skip = extra.skip ? parseInt(extra.skip) : 0;
-                const page = filtered.slice(skip, skip + 100);
+                const page = filtered.slice(skip, skip + catalogPageSize);
 
                 // Native EPG requests specify a UTC date and expect metasDetailed.
                 if (args.type === 'tv' && args.id === 'iptv_channels' && extra.date) {
@@ -1215,10 +1225,10 @@ async function createAddon(config) {
                 const searchMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_SEARCH_META_CONCURRENCY, 3, 1, 6
                 );
-                // Category selections deliberately enrich the entire visible page before
-                // replying, so users can browse the category without re-entering it.
-                // Give that path more parallelism than search, whose foreground batch is
-                // already bounded to avoid making search feel unresponsive.
+                // Non-search movie/series pages deliberately enrich the entire page
+                // before replying. Smaller pages let Discover append complete metadata
+                // as the user scrolls, without relying on an unsupported live card refresh.
+                // Search keeps a bounded foreground batch to remain responsive.
                 const genreMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_GENRE_META_CONCURRENCY, 6, 1, 8
                 );
@@ -1226,11 +1236,11 @@ async function createAddon(config) {
                 const hasGenre = Boolean(extra.genre);
                 const foregroundItems = hasSearch
                     ? page.slice(0, searchMetaItems)
-                    : (hasGenre ? page : []);
+                    : page;
                 if (foregroundItems.length) {
-                    const concurrency = hasGenre && !hasSearch
-                        ? genreMetaConcurrency
-                        : searchMetaConcurrency;
+                    const concurrency = hasSearch
+                        ? searchMetaConcurrency
+                        : genreMetaConcurrency;
                     await addonInstance.enrichCatalogMetaItems(foregroundItems, concurrency);
                 }
                 // Background work keeps the cache warm without holding up the
