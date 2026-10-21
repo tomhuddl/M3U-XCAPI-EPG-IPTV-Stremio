@@ -128,6 +128,10 @@ async function safeFetch(input, options = {}) {
     : 3;
   const fetchOptions = { ...options };
   const reuseConnection = fetchOptions.reuseConnection === true;
+  const diagnostics = fetchOptions.diagnostics && typeof fetchOptions.diagnostics === "object"
+    ? fetchOptions.diagnostics
+    : null;
+  delete fetchOptions.diagnostics;
   delete fetchOptions.reuseConnection;
   delete fetchOptions.maxRedirects;
 
@@ -171,6 +175,7 @@ async function safeFetch(input, options = {}) {
 
       let dnsTimer;
       let records;
+      const dnsStartedAt = Date.now();
       try {
         records = await Promise.race([
           resolvePublicAddresses(currentUrl),
@@ -183,6 +188,9 @@ async function safeFetch(input, options = {}) {
         ]);
       } finally {
         clearTimeout(dnsTimer);
+        if (diagnostics) {
+          diagnostics.dnsMs = (diagnostics.dnsMs || 0) + Date.now() - dnsStartedAt;
+        }
       }
 
       if (controller.signal.aborted) {
@@ -192,7 +200,13 @@ async function safeFetch(input, options = {}) {
       }
 
       const agent = getPinnedAgent(currentUrl, records, reuseConnection);
+      if (diagnostics) {
+        // Reports idle socket availability, not guaranteed socket selection.
+        diagnostics.freeSocketsBeforeRequest = Object.values(agent.freeSockets || {})
+          .reduce((total, sockets) => total + sockets.length, 0);
+      }
       let response;
+      const headersStartedAt = Date.now();
       try {
         response = await fetch(currentUrl.toString(), {
           ...fetchOptions,
@@ -203,6 +217,8 @@ async function safeFetch(input, options = {}) {
         if (!reuseConnection) agent.destroy();
         throw error;
       }
+
+      if (diagnostics) diagnostics.headersMs = Date.now() - headersStartedAt;
 
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         finalAgent = agent;
