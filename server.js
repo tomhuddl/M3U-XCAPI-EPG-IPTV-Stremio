@@ -63,6 +63,53 @@ const MAX_ACTIVE_PREFETCHES = parsePositiveInteger(
 );
 let activePrefetches = 0;
 
+// The preflight endpoints are public and can trigger large upstream downloads.
+// Apply a per-client rolling-window limit in addition to the existing global
+// concurrency, timeout and byte limits. Keep this in memory (no new service).
+const PREFLIGHT_RATE_WINDOW_MS = 60 * 1000;
+const PREFLIGHT_RATE_MAX = parsePositiveInteger(
+  process.env.PREFLIGHT_RATE_MAX,
+  120,
+  10,
+  600,
+);
+const PREFLIGHT_RATE_MAX_CLIENTS = 5000;
+const preflightRateBuckets = new Map();
+
+function preflightRateLimit(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.socket?.remoteAddress || "unknown";
+  let bucket = preflightRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+    bucket = { startedAt: now, count: 0 };
+    preflightRateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+
+  // Opportunistically prune expired entries and cap map growth under scans
+  // from many source addresses.
+  if (preflightRateBuckets.size > PREFLIGHT_RATE_MAX_CLIENTS) {
+    for (const [client, entry] of preflightRateBuckets) {
+      if (now - entry.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+        preflightRateBuckets.delete(client);
+      }
+      if (preflightRateBuckets.size <= PREFLIGHT_RATE_MAX_CLIENTS) break;
+    }
+    if (preflightRateBuckets.size > PREFLIGHT_RATE_MAX_CLIENTS) {
+      return res.status(503).json({ error: "Preflight rate-limit capacity reached; retry shortly" });
+    }
+  }
+
+  if (bucket.count > PREFLIGHT_RATE_MAX) {
+    const retryAfter = Math.max(1, Math.ceil(
+      (PREFLIGHT_RATE_WINDOW_MS - (now - bucket.startedAt)) / 1000,
+    ));
+    res.setHeader("Retry-After", String(retryAfter));
+    return res.status(429).json({ error: "Too many preflight requests; retry shortly" });
+  }
+  return next();
+}
+
 const app = express();
 const staticDir = path.join(__dirname, "src");
 app.use((req, res, next) => {
@@ -98,7 +145,7 @@ app.post("/encrypt", (req, res) => {
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
 
 // Stream-count XMLTV programmes without retaining the feed in memory.
-app.post("/api/epg-stats", async (req, res) => {
+app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   if (!PREFETCH_ENABLED) {
     return res.status(403).json({ error: "Prefetch disabled by server" });
   }
@@ -191,7 +238,7 @@ app.post("/api/epg-stats", async (req, res) => {
  * Server-side prefetch for playlist / EPG pre-flight.
  * Every redirect is checked separately; the timeout covers DNS and body reads.
  */
-app.post("/api/prefetch", async (req, res) => {
+app.post("/api/prefetch", preflightRateLimit, async (req, res) => {
   if (!PREFETCH_ENABLED) {
     return res.status(403).json({ error: "Prefetch disabled by server" });
   }
