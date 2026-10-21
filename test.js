@@ -381,7 +381,7 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     let active = 0;
     let maxActive = 0;
     const processed = [];
-    addon.getDetailedMetaAsync = async (id) => {
+    addon.getCatalogMetaAsync = async (id) => {
         active++;
         maxActive = Math.max(maxActive, active);
         await Promise.resolve();
