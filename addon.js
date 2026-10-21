@@ -927,13 +927,18 @@ class M3UEPGAddon {
                                 preview.links = preview.links.filter(link => link?.category !== 'Rating');
                             }
                             const providerGenre = next.category || next.attributes?.['group-title'];
+                            let fallbackPreview;
                             if (!Array.isArray(preview.genres) || !preview.genres.length) {
-                                const base = this.generateMetaPreview(next);
-                                preview.genres = base.genres?.length ? base.genres : (providerGenre ? [providerGenre] : []);
+                                fallbackPreview = this.generateMetaPreview(next);
+                                preview.genres = fallbackPreview.genres?.length
+                                    ? fallbackPreview.genres
+                                    : (providerGenre ? [providerGenre] : []);
                             }
                             if (!Array.isArray(preview.cast) || !preview.cast.length) {
-                                const base = this.generateMetaPreview(next);
-                                if (Array.isArray(base.cast) && base.cast.length) preview.cast = base.cast;
+                                fallbackPreview = fallbackPreview || this.generateMetaPreview(next);
+                                if (Array.isArray(fallbackPreview.cast) && fallbackPreview.cast.length) {
+                                    preview.cast = fallbackPreview.cast;
+                                }
                             }
                             this.catalogMetaCache.set(next.id, preview);
                         }
