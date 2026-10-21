@@ -947,7 +947,8 @@ class M3UEPGAddon {
     async getCatalogMetaAsync(id, type) {
         const key = String(id || '');
         if (!key) return null;
-        if (this.catalogMetaCache.has(key)) return this.catalogMetaCache.get(key);
+        const cached = this.catalogMetaCache.get(key);
+        if (cached !== undefined) return cached;
         if (this.catalogMetaInFlight.has(key)) return this.catalogMetaInFlight.get(key);
 
         const task = this._getCatalogMetaAsync(id, type);
