@@ -9,6 +9,17 @@ const fetch = require("node-fetch");
 
 const REUSABLE_AGENT_MAX_ENTRIES = 8;
 const reusableAgents = new Map();
+// Coalesce simultaneous DNS lookups for the same hostname without caching
+// answers across requests. Each request still validates the returned addresses.
+const pendingDnsLookups = new Map();
+
+function lookupAllAddresses(hostname) {
+  if (pendingDnsLookups.has(hostname)) return pendingDnsLookups.get(hostname);
+  const lookup = dns.lookup(hostname, { all: true, verbatim: true })
+    .finally(() => pendingDnsLookups.delete(hostname));
+  pendingDnsLookups.set(hostname, lookup);
+  return lookup;
+}
 
 const PROVIDER_MAX_BYTES_RAW = Number.parseInt(
   process.env.PROVIDER_MAX_BYTES || "50000000",
@@ -48,7 +59,7 @@ async function resolvePublicAddresses(url) {
   const family = net.isIP(hostname);
   const records = family
     ? [{ address: hostname, family }]
-    : await dns.lookup(hostname, { all: true, verbatim: true });
+    : await lookupAllAddresses(hostname);
 
   if (!records.length || records.some((record) => !isPublicAddress(record.address))) {
     throw new Error("Blocked host");
