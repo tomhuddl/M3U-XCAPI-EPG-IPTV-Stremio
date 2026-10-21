@@ -119,7 +119,12 @@ function getCatalogueSearchIndex(items) {
 
     index = new Map();
     for (const item of items) {
-        if (item && !index.has(item)) index.set(item, getNormalizedSearchText(item.name));
+        if (item && !index.has(item)) {
+            const text = getNormalizedSearchText(item.name);
+            // Tokenisation is title-dependent too, so prepare it once per
+            // catalogue item rather than splitting every title on every query.
+            index.set(item, { text, words: text.split(' ').filter(Boolean) });
+        }
     }
     catalogueSearchIndexes.set(items, index);
     return { index, built: true };
@@ -138,11 +143,11 @@ function createNormalizedSearchMatcher(q) {
     // Query tokenization and ordering are independent of the title, so compile
     // them once per search request rather than once per catalogue item.
     const words = q.split(' ').filter(Boolean).sort((a, b) => b.length - a.length);
-    return function matchNormalizedTitle(text) {
+    return function matchNormalizedTitle(text, preparedTitleWords) {
         if (!text) return false;
         if (text.includes(q)) return true;
 
-        const titleWords = text.split(' ').filter(Boolean);
+        const titleWords = preparedTitleWords || text.split(' ').filter(Boolean);
         if (!words.length || words.length > titleWords.length) return false;
         const used = new Set();
 
@@ -1315,7 +1320,12 @@ async function createAddon(config) {
                     searchIndexMs = Date.now() - indexStartedAt;
 
                     const searchFilterStartedAt = Date.now();
-                    filtered = filtered.filter(i => matcher(searchIndex.get(i) ?? getNormalizedSearchText(i.name)));
+                    filtered = filtered.filter(i => {
+                        const indexedTitle = searchIndex.get(i);
+                        return indexedTitle
+                            ? matcher(indexedTitle.text, indexedTitle.words)
+                            : matcher(getNormalizedSearchText(i.name));
+                    });
                     searchFilterMs = Date.now() - searchFilterStartedAt;
                 }
                 
