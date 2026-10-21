@@ -3,7 +3,7 @@ process.env.CONFIG_SECRET = "test-only-secret-with-more-than-32-characters";
 
 const { encryptConfig, decryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const LRUCache = require("./lruCache");
-const { isPublicAddress, resolvePublicAddresses, safeFetch } = require("./urlSafety");
+const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = require("./urlSafety");
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream } = require("./src/js/epgStreamParser");
@@ -333,6 +333,26 @@ function testPublicAndPrivateAddressClassification() {
     assert.strictEqual(isPublicAddress("2001:4860:4860::8888"), true);
 }
 
+function testValidatedConnectionReuseIsScopedToValidatedAddresses() {
+    const url = new URL("https://tmdb.example.test/");
+    const firstAddresses = [{ address: "8.8.8.8", family: 4 }];
+    const changedAddresses = [{ address: "1.1.1.1", family: 4 }];
+    const firstAgent = getPinnedAgent(url, firstAddresses, true);
+    const reusedAgent = getPinnedAgent(url, firstAddresses, true);
+    const changedAgent = getPinnedAgent(url, changedAddresses, true);
+
+    try {
+        assert.strictEqual(firstAgent, reusedAgent, "same origin and validated DNS answers should reuse an agent");
+        assert.notStrictEqual(firstAgent, changedAgent, "changed validated DNS answers must not reuse the old pinned agent");
+        assert.strictEqual(firstAgent.options.keepAlive, true, "opt-in agents should enable keep-alive");
+        assert.strictEqual(getPinnedAgent(url, firstAddresses, false).options.keepAlive, false,
+            "requests without opt-in should retain one-shot agent behavior");
+    } finally {
+        firstAgent.destroy();
+        changedAgent.destroy();
+    }
+}
+
 async function testPrivateDestinationsAreRejected() {
     await assert.rejects(
         () => resolvePublicAddresses(new URL("http://127.0.0.1/")),
@@ -522,6 +542,7 @@ async function main() {
         testStreamingEpgParser,
         testGenreMatchingIgnoresCaseAndWhitespace,
         testSafeFetchRejectsPrivateAddresses,
+        testValidatedConnectionReuseIsScopedToValidatedAddresses,
         testLruEvictionAndPromotion,
         testLruExpiry,
         testLruInvalidSettingsFallback,
