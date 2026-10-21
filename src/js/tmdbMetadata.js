@@ -253,19 +253,19 @@ function mapMovieMetadata(details, credits, videos, images) {
 async function getMovieCatalogMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // TMDb supports append_to_response for same-namespace resources. Fetch details
-  // and credits in one request for Discover cards instead of two parallel calls.
-  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits");
-  return mapMovieMetadata(details, details?.credits, null, null);
+  // Include images in the appended response so Discover can use TMDb's
+  // transparent title logo without adding a second network round-trip per movie.
+  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null");
+  return mapMovieMetadata(details, details?.credits, null, details?.images);
 }
 
 async function getSeriesCatalogMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // Aggregate credits are supported on the TV details endpoint. Combining these
-  // avoids a second network round-trip for every series shown in Discover.
-  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits");
-  return mapSeriesMetadata(details, details?.aggregate_credits, null, null);
+  // Append images alongside aggregate credits so Discover receives the
+  // transparent title logo without an extra request for each series.
+  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null");
+  return mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
 }
 
 async function getMovieMetadata(tmdbId) {
