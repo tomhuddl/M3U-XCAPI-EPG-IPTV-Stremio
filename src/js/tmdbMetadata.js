@@ -92,6 +92,9 @@ async function request(path) {
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
       const response = await safeFetch(url, {
         timeout: 12000,
+        // Opt in only for TMDb requests. safeFetch still resolves and validates
+        // DNS for every request before selecting an agent pinned to those addresses.
+        reuseConnection: true,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
       status = response.status;
