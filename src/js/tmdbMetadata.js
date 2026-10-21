@@ -188,6 +188,26 @@ function mapMovieMetadata(details, credits, videos, images) {
   });
 }
 
+async function getMovieCatalogMetadata(tmdbId) {
+  const id = validTmdbId(tmdbId);
+  if (!id) return null;
+  const [details, credits] = await Promise.all([
+    request("/movie/" + id + "?language=en-GB"),
+    request("/movie/" + id + "/credits?language=en-GB"),
+  ]);
+  return mapMovieMetadata(details, credits, null, null);
+}
+
+async function getSeriesCatalogMetadata(tmdbId) {
+  const id = validTmdbId(tmdbId);
+  if (!id) return null;
+  const [details, credits] = await Promise.all([
+    request("/tv/" + id + "?language=en-GB"),
+    request("/tv/" + id + "/aggregate_credits?language=en-GB"),
+  ]);
+  return mapSeriesMetadata(details, credits, null, null);
+}
+
 async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
@@ -279,6 +299,8 @@ function stripEmpty(value) {
 module.exports = {
   getMovieMetadata,
   getSeriesMetadata,
+  getMovieCatalogMetadata,
+  getSeriesCatalogMetadata,
   getSeasonEpisodes,
   mapMovieMetadata,
   mapSeriesMetadata,
