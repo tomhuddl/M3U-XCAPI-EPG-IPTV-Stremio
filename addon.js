@@ -1185,13 +1185,31 @@ async function createAddon(config) {
                 const catalogMetaPrefetchItems = parsePositiveInteger(
                     process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
                 );
-                const catalogMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_META_CONCURRENCY, 6, 1, 12
+                // Do not block a search on metadata requests for the entire page.
+                // Enrich a bounded first batch before replying, then queue remaining
+                // results in the background so large searches cannot stall Stremio.
+                const searchMetaItems = parsePositiveInteger(
+                    process.env.CATALOG_SEARCH_META_ITEMS, 12, 1, 30
                 );
-                const enrichWholeSelection = Boolean(extra.genre || extra.search);
-                if (enrichWholeSelection) {
-                    await addonInstance.enrichCatalogMetaItems(page, catalogMetaConcurrency);
+                const catalogMetaConcurrency = parsePositiveInteger(
+                    process.env.CATALOG_META_CONCURRENCY, 3, 1, 6
+                );
+                const hasSearch = Boolean(extra.search);
+                const hasGenre = Boolean(extra.genre);
+                const foregroundItems = hasSearch
+                    ? page.slice(0, searchMetaItems)
+                    : (hasGenre ? page : []);
+                if (foregroundItems.length) {
+                    await addonInstance.enrichCatalogMetaItems(foregroundItems, catalogMetaConcurrency);
                 }
+                // Background work keeps the cache warm without holding up the
+                // catalogue response. This does not alter the selected-genre path.
+                if (hasSearch) {
+                    for (const item of page.slice(searchMetaItems)) {
+                        addonInstance.queueCatalogMetaEnrichment(item);
+                    }
+                }
+                const enrichWholeSelection = hasGenre || hasSearch;
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
