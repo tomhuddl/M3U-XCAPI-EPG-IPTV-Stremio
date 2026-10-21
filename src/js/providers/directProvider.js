@@ -148,6 +148,7 @@ async function fetchData(addonInstance) {
     if (config.enableEpg) {
         const epgSources = [...new Set([...(config.epgUrl ? [config.epgUrl] : []), ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
         const merged = {};
+        const retentionBudget = { programmes: 0, textChars: 0 };
         for (const sourceUrl of epgSources) {
             try {
                 const controller = new AbortController();
@@ -167,7 +168,7 @@ async function fetchData(addonInstance) {
                         .map(channel => channel.attributes?.['tvg-id'] || channel.attributes?.['tvg-name'])
                         .filter(Boolean)
                         .map(String));
-                    const parsed = await parseEPGStream(epgResp.body, allowedIds);
+                    const parsed = await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
                     for (const [channelId, programmes] of Object.entries(parsed)) {
                         if (!merged[channelId]) merged[channelId] = [];
                         merged[channelId].push(...programmes);
