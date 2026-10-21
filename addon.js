@@ -820,6 +820,7 @@ class M3UEPGAddon {
     }
 
     async enrichCatalogMetaItems(items, concurrency = 3) {
+        const startedAt = Date.now();
         const candidates = items.filter(item =>
             item && (item.type === 'movie' || item.type === 'series') &&
             !this.catalogMetaCache.has(item.id)
@@ -853,6 +854,14 @@ class M3UEPGAddon {
         };
         const workerCount = Math.min(Math.max(1, concurrency), candidates.length);
         await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        if (this.config.debug) {
+            this.log.debug('Catalogue metadata enrichment complete', {
+                requestedItems: items.length,
+                uncachedItems: candidates.length,
+                workers: workerCount,
+                ms: Date.now() - startedAt
+            });
+        }
     }
 
     queueCatalogMetaEnrichment(item) {
@@ -1277,7 +1286,7 @@ async function createAddon(config) {
                 // as the user scrolls, without relying on an unsupported live card refresh.
                 // Search keeps a bounded foreground batch to remain responsive.
                 const genreMetaConcurrency = parsePositiveInteger(
-                    process.env.CATALOG_GENRE_META_CONCURRENCY, 6, 1, 8
+                    process.env.CATALOG_GENRE_META_CONCURRENCY, 8, 1, 8
                 );
                 const hasSearch = Boolean(extra.search);
                 const hasGenre = Boolean(extra.genre);
