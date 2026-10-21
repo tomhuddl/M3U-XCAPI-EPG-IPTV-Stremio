@@ -172,15 +172,14 @@ function metadataLinks(details, credits, mediaType) {
   const crew = Array.isArray(credits?.crew) ? credits.crew : [];
   // Only include explicit writing credits. Creator/developed-by and editorial
   // roles can identify people who did not write episodes or scripts themselves.
-  const writerJobs = new Set(["Writer"]);
   const seenWriters = new Set();
   for (const person of crew) {
     // Movie credits use person.job; TV aggregate credits use person.jobs[].
-    const roles = [
-      person?.job,
-      ...(Array.isArray(person?.jobs) ? person.jobs.map(job => job?.job) : []),
-    ].filter(Boolean).map(String);
-    if (roles.some(role => writerJobs.has(role)) &&
+    // Check the relevant role directly to avoid building temporary role arrays
+    // for every credited crew member on each catalogue metadata response.
+    const isWriter = person?.job != null && String(person.job) === "Writer"
+      || Array.isArray(person?.jobs) && person.jobs.some(job => job?.job != null && String(job.job) === "Writer");
+    if (isWriter &&
         nonEmpty(person?.name) &&
         Number.isSafeInteger(person.id) && person.id > 0 &&
         !seenWriters.has(person.id)) {
