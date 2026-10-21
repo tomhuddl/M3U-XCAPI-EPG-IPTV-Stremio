@@ -9,6 +9,12 @@ const cache = new LRUCache({
   max: parsePositiveInteger(process.env.TMDB_CACHE_MAX_ENTRIES, 1000, 1, 5000),
   ttl: CACHE_TTL_MS,
 });
+// Missing TMDb records are common when provider IDs are stale or incorrect.
+// Cache only confirmed 404s briefly; transient errors must remain retryable.
+const negativeCache = new LRUCache({
+  max: parsePositiveInteger(process.env.TMDB_NEGATIVE_CACHE_MAX_ENTRIES, 500, 1, 5000),
+  ttl: parsePositiveInteger(process.env.TMDB_NEGATIVE_CACHE_TTL_MS, 5 * 60 * 1000, 1000, 60 * 60 * 1000),
+});
 const pending = new Map();
 const MAX_MAIN_CAST = 4;
 
@@ -60,6 +66,7 @@ async function request(path) {
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
+  if (negativeCache.has(cacheKey)) return null;
   if (pending.has(cacheKey)) return pending.get(cacheKey);
 
   const task = (async () => {
@@ -70,7 +77,10 @@ async function request(path) {
         timeout: 12000,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        if (response.status === 404) negativeCache.set(cacheKey, true);
+        return null;
+      }
       const data = await response.json();
       if (!data || typeof data !== "object" || Array.isArray(data)) return null;
       cache.set(cacheKey, data);
