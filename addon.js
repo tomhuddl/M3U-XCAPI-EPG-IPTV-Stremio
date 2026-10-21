@@ -1144,7 +1144,13 @@ async function createAddon(config) {
                 // Return cached enriched cards immediately. Missing metadata is
                 // fetched in a small background queue, so cold catalogue loads stay
                 // fast and subsequent requests can use the richer cached previews.
-                const metas = page.map(i => {
+                // Enrich only the first visible portion of a catalogue page. Enqueuing
+                // all 100 returned cards can saturate the workers with items the user
+                // may never scroll to, delaying metadata for the cards they actually see.
+                const catalogMetaPrefetchItems = parsePositiveInteger(
+                    process.env.CATALOG_META_PREFETCH_ITEMS, 16, 4, 100
+                );
+                const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
                         meta.behaviorHints = { isLive: true };
@@ -1160,7 +1166,9 @@ async function createAddon(config) {
                     // authoritative TMDb data is ready, avoid showing provider
                     // genres/cast/plot as if they were the final metadata; otherwise
                     // Stremio can appear to switch from one set of details to another.
-                    addonInstance.queueCatalogMetaEnrichment(i);
+                    if (pageIndex < catalogMetaPrefetchItems) {
+                        addonInstance.queueCatalogMetaEnrichment(i);
+                    }
                     const firstPass = { ...meta, id: i.id, type: i.type };
                     delete firstPass.genres;
                     delete firstPass.cast;
