@@ -587,9 +587,8 @@ class M3UEPGAddon {
         if (cached !== undefined) return cached;
 
         const pendingKey = 'series-tmdb-id:' + String(seriesId);
-        if (this.providerInfoInFlight.has(pendingKey)) {
-            return this.providerInfoInFlight.get(pendingKey);
-        }
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
 
         const task = (async () => {
             try {
@@ -624,9 +623,8 @@ class M3UEPGAddon {
         if (cached !== undefined) return cached;
 
         const pendingKey = 'series-info:' + String(seriesId);
-        if (this.providerInfoInFlight.has(pendingKey)) {
-            return this.providerInfoInFlight.get(pendingKey);
-        }
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
 
         const task = (async () => {
             try {
@@ -967,9 +965,8 @@ class M3UEPGAddon {
         if (this.seriesInfoCache.has(negativeKey)) return null;
 
         const pendingKey = 'movie-tmdb:' + id;
-        if (this.providerInfoInFlight.has(pendingKey)) {
-            return this.providerInfoInFlight.get(pendingKey);
-        }
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
 
         const task = (async () => {
             const streamId = id.replace(/^iptv_vod_/, '');
@@ -995,7 +992,8 @@ class M3UEPGAddon {
         if (!key) return null;
         const cached = this.catalogMetaCache.get(key);
         if (cached !== undefined) return cached;
-        if (this.catalogMetaInFlight.has(key)) return this.catalogMetaInFlight.get(key);
+        const pending = this.catalogMetaInFlight.get(key);
+        if (pending) return pending;
 
         const task = this._getCatalogMetaAsync(id, type);
         this.catalogMetaInFlight.set(key, task);
