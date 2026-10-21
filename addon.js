@@ -580,6 +580,44 @@ class M3UEPGAddon {
         return videos.sort((a, b) => a.startTime.localeCompare(b.startTime));
     }
 
+    async ensureSeriesTmdbId(seriesId) {
+        if (!seriesId) return null;
+        const cacheKey = 'series-tmdb-id:' + String(seriesId);
+        const cached = this.seriesInfoCache.get(cacheKey);
+        if (cached !== undefined) return cached;
+
+        const pendingKey = 'series-tmdb-id:' + String(seriesId);
+        if (this.providerInfoInFlight.has(pendingKey)) {
+            return this.providerInfoInFlight.get(pendingKey);
+        }
+
+        const task = (async () => {
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                if (typeof providerModule.fetchSeriesTmdbId === 'function') {
+                    const tmdbId = await providerModule.fetchSeriesTmdbId(this, seriesId);
+                    this.seriesInfoCache.set(cacheKey, tmdbId || null);
+                    return tmdbId || null;
+                }
+                const info = await this.ensureSeriesInfo(seriesId);
+                return info?.tmdbId || null;
+            } catch (e) {
+                this.log.warn('Series TMDb ID lookup failed', seriesId, e && e.name ? e.name : 'Error');
+                this.seriesInfoCache.set(cacheKey, null);
+                return null;
+            }
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
+    }
+
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) return null;
         const cached = this.seriesInfoCache.get(seriesId);
@@ -976,8 +1014,7 @@ class M3UEPGAddon {
             let tmdbId = seriesItem.tmdbId || null;
             const providerLookupStartedAt = Date.now();
             if (!tmdbId) {
-                info = await this.ensureSeriesInfo(seriesId);
-                tmdbId = info?.tmdbId || null;
+                tmdbId = await this.ensureSeriesTmdbId(seriesId);
             }
             const providerLookupMs = Date.now() - providerLookupStartedAt;
             const tmdbLookupStartedAt = Date.now();
