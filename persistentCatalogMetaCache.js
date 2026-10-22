@@ -133,7 +133,10 @@ class PersistentCatalogMetaCache {
         this.writeTimer = setTimeout(() => {
             this.writeTimer = null;
             this.flush().catch(error => {
-                console.warn("[CATALOG-CACHE] Could not save persistent metadata cache:", error?.name || "Error");
+                console.warn("[CATALOG-CACHE] Could not save persistent metadata cache:", {
+                    name: error?.name || "Error", code: error?.code || "UNKNOWN",
+                    syscall: error?.syscall || null, message: String(error?.message || "No error message").slice(0, 300)
+                });
             });
         }, delay);
         if (typeof this.writeTimer.unref === "function") this.writeTimer.unref();
