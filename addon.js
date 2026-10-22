@@ -1424,6 +1424,44 @@ async function createAddon(config) {
                     await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
                 }
                 const enrichmentMs = Date.now() - enrichmentStartedAt;
+
+                // Prepare exactly one following movie/series page while the current
+                // page is being returned. This never changes Stremio pagination or
+                // adds items to the current response; it only warms the existing
+                // metadata cache so the next request can reuse completed results.
+                // Foreground requests and prefetch share getCatalogMetaAsync's
+                // in-flight deduplication, so scrolling quickly does not duplicate
+                // upstream lookups for the same item.
+                const nextPagePrefetchEnabled =
+                    (process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false';
+                if (nextPagePrefetchEnabled &&
+                    (args.type === 'movie' || args.type === 'series') &&
+                    filtered.length > skip + catalogPageSize) {
+                    const nextPage = filtered.slice(
+                        skip + catalogPageSize,
+                        skip + catalogPageSize * 2
+                    );
+                    if (nextPage.length) {
+                        const prefetchConcurrency = parsePositiveInteger(
+                            process.env.CATALOG_PREFETCH_CONCURRENCY, 4, 1, 8
+                        );
+                        addonInstance.enrichCatalogMetaItems(nextPage, prefetchConcurrency)
+                            .then(() => {
+                                if (addonInstance.config.debug) {
+                                    console.log('[DEBUG] Next catalogue page prefetch complete', {
+                                        type: args.type,
+                                        id: args.id,
+                                        skip: skip + catalogPageSize,
+                                        requestedItems: nextPage.length
+                                    });
+                                }
+                            })
+                            .catch(error => {
+                                console.warn('[CATALOG] Next-page prefetch failed', error?.name || 'Error');
+                            });
+                    }
+                }
+
                 const responseBuildStartedAt = Date.now();
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
