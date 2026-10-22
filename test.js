@@ -10,6 +10,10 @@ const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_T
 const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
+const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
+const fs = require("fs/promises");
+const os = require("os");
+const path = require("path");
 const { rebuildDirectEpisodeIndexes } = require("./src/js/providers/directProvider");
 
 function testDirectEpisodeLookupUsesExactIndex() {
@@ -401,6 +405,36 @@ function testScheduledProgramsCacheParsedTimestamps() {
     assert.strictEqual(parseCalls, 2, "start and stop timestamps should only be parsed once per programme");
 }
 
+
+async function testPersistentCatalogMetadataCacheRoundTripAndStaleFallback() {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-catalog-cache-"));
+    try {
+        const first = new PersistentCatalogMetaCache("test-config", {
+            directory, ttlMs: 60000, staleRetentionMs: 120000, maxEntries: 10
+        });
+        const metadata = { id: "movie-1", name: "Cached movie", cast: ["Actor"] };
+        await first.set("movie-1", metadata);
+        await first.flush();
+
+        const reopened = new PersistentCatalogMetaCache("test-config", {
+            directory, ttlMs: 60000, staleRetentionMs: 120000, maxEntries: 10
+        });
+        const loaded = await reopened.get("movie-1");
+        assert.deepStrictEqual(loaded.value, metadata);
+        assert.strictEqual(loaded.fresh, true);
+
+        await new Promise(resolve => setTimeout(resolve, 10));
+        const shortTtl = new PersistentCatalogMetaCache("test-config", {
+            directory, ttlMs: 1, staleRetentionMs: 120000, maxEntries: 10
+        });
+        const stale = await shortTtl.get("movie-1");
+        assert.deepStrictEqual(stale.value, metadata);
+        assert.strictEqual(stale.fresh, false, "expired metadata should remain available as a refresh fallback");
+    } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+    }
+}
+
 async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     let calls = 0;
@@ -560,6 +594,7 @@ async function main() {
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
         testDirectEpisodeLookupUsesExactIndex,
+        testPersistentCatalogMetadataCacheRoundTripAndStaleFallback,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
