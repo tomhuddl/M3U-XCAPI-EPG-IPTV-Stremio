@@ -1425,41 +1425,53 @@ async function createAddon(config) {
                 }
                 const enrichmentMs = Date.now() - enrichmentStartedAt;
 
-                // Prepare exactly one following movie/series page while the current
-                // page is being returned. This never changes Stremio pagination or
-                // adds items to the current response; it only warms the existing
-                // metadata cache so the next request can reuse completed results.
-                // Foreground requests and prefetch share getCatalogMetaAsync's
-                // in-flight deduplication, so scrolling quickly does not duplicate
-                // upstream lookups for the same item.
-                const nextPagePrefetchEnabled =
+                // Trial: keep preparing subsequent movie/series pages in the background,
+                // even if the user has not scrolled to them yet. Each page is enriched
+                // sequentially and stored in the existing cache; Stremio's page size,
+                // ordering and response are unchanged. Bound the look-ahead so a large
+                // provider library cannot trigger an unbounded burst of upstream requests.
+                const continuousPrefetchEnabled =
                     (process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false';
-                if (nextPagePrefetchEnabled &&
+                if (continuousPrefetchEnabled &&
                     (args.type === 'movie' || args.type === 'series') &&
                     filtered.length > skip + catalogPageSize) {
-                    const nextPage = filtered.slice(
-                        skip + catalogPageSize,
-                        skip + catalogPageSize * 2
+                    const prefetchConcurrency = parsePositiveInteger(
+                        process.env.CATALOG_PREFETCH_CONCURRENCY, 4, 1, 8
                     );
-                    if (nextPage.length) {
-                        const prefetchConcurrency = parsePositiveInteger(
-                            process.env.CATALOG_PREFETCH_CONCURRENCY, 4, 1, 8
-                        );
-                        addonInstance.enrichCatalogMetaItems(nextPage, prefetchConcurrency)
-                            .then(() => {
+                    const maxPrefetchPages = parsePositiveInteger(
+                        process.env.CATALOG_PREFETCH_MAX_PAGES, 5, 1, 20
+                    );
+                    const prefetchStart = skip + catalogPageSize;
+                    const prefetchEnd = Math.min(
+                        filtered.length,
+                        prefetchStart + catalogPageSize * maxPrefetchPages
+                    );
+
+                    (async () => {
+                        for (let pageStart = prefetchStart; pageStart < prefetchEnd; pageStart += catalogPageSize) {
+                            const nextPage = filtered.slice(
+                                pageStart,
+                                Math.min(pageStart + catalogPageSize, prefetchEnd)
+                            );
+                            if (!nextPage.length) break;
+                            try {
+                                await addonInstance.enrichCatalogMetaItems(nextPage, prefetchConcurrency);
                                 if (addonInstance.config.debug) {
-                                    console.log('[DEBUG] Next catalogue page prefetch complete', {
+                                    console.log('[DEBUG] Background catalogue page prefetch complete', {
                                         type: args.type,
                                         id: args.id,
-                                        skip: skip + catalogPageSize,
+                                        skip: pageStart,
                                         requestedItems: nextPage.length
                                     });
                                 }
-                            })
-                            .catch(error => {
-                                console.warn('[CATALOG] Next-page prefetch failed', error?.name || 'Error');
-                            });
-                    }
+                            } catch (error) {
+                                console.warn('[CATALOG] Background page prefetch failed', error?.name || 'Error');
+                                // Continue to later pages if one batch fails.
+                            }
+                        }
+                    })().catch(error => {
+                        console.warn('[CATALOG] Continuous prefetch stopped', error?.name || 'Error');
+                    });
                 }
 
                 const responseBuildStartedAt = Date.now();
