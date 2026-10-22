@@ -29,6 +29,7 @@ jobs:
           node --check cryptoConfig.js
           node --check configValidation.js
           node --check lruCache.js
+          node --check persistentCatalogMetaCache.js
           node --check urlSafety.js
           node --check src/js/providers/directProvider.js
           node --check src/js/providers/xtreamProvider.js
