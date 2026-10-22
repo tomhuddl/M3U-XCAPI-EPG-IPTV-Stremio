@@ -5,6 +5,7 @@ require('dotenv').config();
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
+const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
@@ -316,6 +317,11 @@ class M3UEPGAddon {
             ttl: parsePositiveInteger(process.env.CATALOG_META_CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
         });
         this.catalogMetaPending = new Map();
+        this.persistentCatalogMetaCache = new PersistentCatalogMetaCache(this.cacheKey);
+        // At most one full-catalogue warm-up per media type. Search requests must not
+        // spawn independent background walks over different filtered result sets.
+        this.catalogPrefetchJobs = new Map();
+        this.catalogPrefetchLastCompleted = new Map();
         // Share concurrent foreground/background metadata work for the same item.
         // Without this, a category request and a queued warm-up can race and issue
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
@@ -931,7 +937,7 @@ class M3UEPGAddon {
                             preview.cast = fallbackPreview.cast;
                         }
                     }
-                    this.catalogMetaCache.set(item.id, preview);
+                    this.cacheCatalogMetaPreview(item.id, preview);
                 } catch (error) {
                     this.log.warn('Foreground catalogue metadata enrichment failed for', item.id, error?.message || error);
                 }
@@ -981,7 +987,7 @@ class M3UEPGAddon {
                                     preview.cast = fallbackPreview.cast;
                                 }
                             }
-                            this.catalogMetaCache.set(next.id, preview);
+                            this.cacheCatalogMetaPreview(next.id, preview);
                         }
                     } catch (error) {
                         this.log.warn('Background catalogue metadata enrichment failed for', next.id, error?.message || error);
@@ -998,6 +1004,59 @@ class M3UEPGAddon {
             }
         };
         runNext();
+    }
+
+    cacheCatalogMetaPreview(id, preview) {
+        this.catalogMetaCache.set(id, preview);
+        this.persistentCatalogMetaCache.set(id, preview).catch(error => {
+            this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
+        });
+    }
+
+    startContinuousCatalogPrefetch(type, pageSize, concurrency) {
+        if (type !== 'movie' && type !== 'series') return;
+        if (this.catalogPrefetchJobs.has(type)) return;
+
+        const refreshInterval = parsePositiveInteger(
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
+            60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+        );
+        const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
+        if (Date.now() - lastCompleted < refreshInterval) return;
+
+        // Walk the unfiltered provider catalogue so a search for a small subset does
+        // not accidentally define the scope of the background warm-up.
+        const items = type === 'movie' ? this.movies : this.series;
+        if (!Array.isArray(items) || !items.length) return;
+
+        const job = (async () => {
+            const startedAt = Date.now();
+            let processed = 0;
+            for (let offset = 0; offset < items.length; offset += pageSize) {
+                const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
+                if (!batch.length) continue;
+                await this.enrichCatalogMetaItems(batch, concurrency);
+                processed += batch.length;
+                if (this.config.debug) {
+                    this.log.debug('Background catalogue prefetch progress', {
+                        type, processed, total: items.length,
+                    });
+                }
+            }
+            this.catalogPrefetchLastCompleted.set(type, Date.now());
+            this.log.debug('Background catalogue prefetch complete', {
+                type, processed, total: items.length, ms: Date.now() - startedAt,
+            });
+        })();
+
+        this.catalogPrefetchJobs.set(type, job);
+        job.catch(error => {
+            this.log.warn('Continuous catalogue prefetch failed:', error?.name || 'Error');
+        }).finally(() => {
+            if (this.catalogPrefetchJobs.get(type) === job) {
+                this.catalogPrefetchJobs.delete(type);
+            }
+        });
     }
 
     async resolveMovieTmdbId(id, item, providerModule) {
@@ -1041,7 +1100,17 @@ class M3UEPGAddon {
         const pending = this.catalogMetaInFlight.get(key);
         if (pending) return pending;
 
-        const task = this._getCatalogMetaAsync(id, type);
+        const task = (async () => {
+            const persisted = await this.persistentCatalogMetaCache.get(key);
+            if (persisted?.fresh) {
+                this.catalogMetaCache.set(key, persisted.value);
+                return persisted.value;
+            }
+            // Expired entries remain a fallback if TMDb/provider refresh fails, but
+            // are not treated as fresh; successful enrichment replaces them.
+            const refreshed = await this._getCatalogMetaAsync(id, type);
+            return refreshed || persisted?.value || null;
+        })();
         this.catalogMetaInFlight.set(key, task);
         try {
             return await task;
@@ -1425,49 +1494,20 @@ async function createAddon(config) {
                 }
                 const enrichmentMs = Date.now() - enrichmentStartedAt;
 
-                // Trial: prepare the rest of the filtered movie/series catalogue in
-                // sequential pages, regardless of whether the user scrolls. This only
-                // warms the existing metadata cache; it never changes the current response,
-                // Stremio pagination, provider order, IDs or playback. Sequential pages
-                // keep the amount of active work bounded instead of firing requests for
-                // the whole catalogue at once.
+                // One background job per media type warms the complete, unfiltered
+                // catalogue. Search requests join the same job instead of creating
+                // separate walks over every search result. Persistent metadata means the
+                // full catalogue can remain warm across restarts when a volume is configured.
                 const continuousPrefetchEnabled =
                     (process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false';
                 if (continuousPrefetchEnabled &&
-                    (args.type === 'movie' || args.type === 'series') &&
-                    filtered.length > skip + catalogPageSize) {
+                    (args.type === 'movie' || args.type === 'series')) {
                     const prefetchConcurrency = parsePositiveInteger(
-                        process.env.CATALOG_PREFETCH_CONCURRENCY, 4, 1, 8
+                        process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6
                     );
-                    const prefetchStart = skip + catalogPageSize;
-                    const prefetchEnd = filtered.length;
-
-                    (async () => {
-                        for (let pageStart = prefetchStart; pageStart < prefetchEnd; pageStart += catalogPageSize) {
-                            const nextPage = filtered.slice(
-                                pageStart,
-                                Math.min(pageStart + catalogPageSize, prefetchEnd)
-                            );
-                            if (!nextPage.length) break;
-                            try {
-                                await addonInstance.enrichCatalogMetaItems(nextPage, prefetchConcurrency);
-                                if (addonInstance.config.debug) {
-                                    console.log('[DEBUG] Background catalogue page prefetch complete', {
-                                        type: args.type,
-                                        id: args.id,
-                                        skip: pageStart,
-                                        requestedItems: nextPage.length,
-                                        remainingItems: Math.max(0, prefetchEnd - pageStart - nextPage.length)
-                                    });
-                                }
-                            } catch (error) {
-                                console.warn('[CATALOG] Background page prefetch failed', error?.name || 'Error');
-                                // Continue to later pages if one batch fails.
-                            }
-                        }
-                    })().catch(error => {
-                        console.warn('[CATALOG] Continuous prefetch stopped', error?.name || 'Error');
-                    });
+                    addonInstance.startContinuousCatalogPrefetch(
+                        args.type, catalogPageSize, prefetchConcurrency
+                    );
                 }
 
                 const responseBuildStartedAt = Date.now();
