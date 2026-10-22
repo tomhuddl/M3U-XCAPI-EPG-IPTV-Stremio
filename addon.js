@@ -793,6 +793,17 @@ class M3UEPGAddon {
         }
     }
 
+    startScheduledRefresh() {
+        if (this.refreshTimer) return;
+        this.refreshTimer = setInterval(() => {
+            if (this.scheduledRefreshInFlight) return;
+            this.scheduledRefreshInFlight = this.updateData(true)
+                .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
+                .finally(() => { this.scheduledRefreshInFlight = null; });
+        }, this.updateInterval);
+        if (typeof this.refreshTimer.unref === 'function') this.refreshTimer.unref();
+    }
+
     deriveFallbackLogoUrl(item) {
         const logoAttr = item.attributes?.['tvg-logo'];
         if (logoAttr && logoAttr.trim()) return logoAttr;
@@ -1444,6 +1455,9 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
+        // Keep the catalogue and guide refreshed daily even if Stremio is idle
+        // after startup. The timer is unref'd so it does not keep Node alive.
+        addonInstance.startScheduledRefresh();
 
         // Only advertise native EPG when this instance has parsed real programme data.
         manifest.behaviorHints.epgProvider = Object.values(addonInstance.epgData || {})
