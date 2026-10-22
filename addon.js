@@ -1425,11 +1425,12 @@ async function createAddon(config) {
                 }
                 const enrichmentMs = Date.now() - enrichmentStartedAt;
 
-                // Trial: keep preparing subsequent movie/series pages in the background,
-                // even if the user has not scrolled to them yet. Each page is enriched
-                // sequentially and stored in the existing cache; Stremio's page size,
-                // ordering and response are unchanged. Bound the look-ahead so a large
-                // provider library cannot trigger an unbounded burst of upstream requests.
+                // Trial: prepare the rest of the filtered movie/series catalogue in
+                // sequential pages, regardless of whether the user scrolls. This only
+                // warms the existing metadata cache; it never changes the current response,
+                // Stremio pagination, provider order, IDs or playback. Sequential pages
+                // keep the amount of active work bounded instead of firing requests for
+                // the whole catalogue at once.
                 const continuousPrefetchEnabled =
                     (process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false';
                 if (continuousPrefetchEnabled &&
@@ -1438,14 +1439,8 @@ async function createAddon(config) {
                     const prefetchConcurrency = parsePositiveInteger(
                         process.env.CATALOG_PREFETCH_CONCURRENCY, 4, 1, 8
                     );
-                    const maxPrefetchPages = parsePositiveInteger(
-                        process.env.CATALOG_PREFETCH_MAX_PAGES, 5, 1, 20
-                    );
                     const prefetchStart = skip + catalogPageSize;
-                    const prefetchEnd = Math.min(
-                        filtered.length,
-                        prefetchStart + catalogPageSize * maxPrefetchPages
-                    );
+                    const prefetchEnd = filtered.length;
 
                     (async () => {
                         for (let pageStart = prefetchStart; pageStart < prefetchEnd; pageStart += catalogPageSize) {
@@ -1461,7 +1456,8 @@ async function createAddon(config) {
                                         type: args.type,
                                         id: args.id,
                                         skip: pageStart,
-                                        requestedItems: nextPage.length
+                                        requestedItems: nextPage.length,
+                                        remainingItems: Math.max(0, prefetchEnd - pageStart - nextPage.length)
                                     });
                                 }
                             } catch (error) {
