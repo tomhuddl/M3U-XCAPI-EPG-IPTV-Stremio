@@ -918,6 +918,9 @@ class M3UEPGAddon {
                 try {
                     const detailed = await this.getCatalogMetaAsync(item.id, item.type);
                     if (!detailed) continue;
+                    // A fresh persistent hit is already stored on disk; don't reset its
+                    // daily refresh timestamp just because the card was viewed again.
+                    const loadedFromCache = this.catalogMetaCache.get(item.id) !== undefined;
                     const preview = { ...detailed };
                     delete preview.tmdbRating;
                     if (Array.isArray(preview.links)) {
@@ -937,7 +940,7 @@ class M3UEPGAddon {
                             preview.cast = fallbackPreview.cast;
                         }
                     }
-                    this.cacheCatalogMetaPreview(item.id, preview);
+                    this.cacheCatalogMetaPreview(item.id, preview, !loadedFromCache);
                 } catch (error) {
                     this.log.warn('Foreground catalogue metadata enrichment failed for', item.id, error?.message || error);
                 }
@@ -968,6 +971,7 @@ class M3UEPGAddon {
                     try {
                         const detailed = await this.getCatalogMetaAsync(next.id, next.type);
                         if (detailed) {
+                            const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined;
                             const preview = { ...detailed };
                             delete preview.tmdbRating;
                             if (Array.isArray(preview.links)) {
@@ -987,7 +991,7 @@ class M3UEPGAddon {
                                     preview.cast = fallbackPreview.cast;
                                 }
                             }
-                            this.cacheCatalogMetaPreview(next.id, preview);
+                            this.cacheCatalogMetaPreview(next.id, preview, !loadedFromCache);
                         }
                     } catch (error) {
                         this.log.warn('Background catalogue metadata enrichment failed for', next.id, error?.message || error);
@@ -1006,11 +1010,13 @@ class M3UEPGAddon {
         runNext();
     }
 
-    cacheCatalogMetaPreview(id, preview) {
+    cacheCatalogMetaPreview(id, preview, persist = true) {
         this.catalogMetaCache.set(id, preview);
-        this.persistentCatalogMetaCache.set(id, preview).catch(error => {
-            this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
-        });
+        if (persist) {
+            this.persistentCatalogMetaCache.set(id, preview).catch(error => {
+                this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
+            });
+        }
     }
 
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
