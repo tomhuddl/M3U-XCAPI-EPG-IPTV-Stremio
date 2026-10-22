@@ -423,9 +423,12 @@ async function testPersistentCatalogMetadataCacheRoundTripAndStaleFallback() {
         assert.deepStrictEqual(loaded.value, metadata);
         assert.strictEqual(loaded.fresh, true);
 
-        await new Promise(resolve => setTimeout(resolve, 10));
+        const cacheFile = path.join(directory, "catalog-meta-test-config.json");
+        const stored = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+        stored.entries["movie-1"].savedAt = Date.now() - 2000;
+        await fs.writeFile(cacheFile, JSON.stringify(stored), "utf8");
         const shortTtl = new PersistentCatalogMetaCache("test-config", {
-            directory, ttlMs: 1, staleRetentionMs: 120000, maxEntries: 10
+            directory, ttlMs: 1000, staleRetentionMs: 120000, maxEntries: 10
         });
         const stale = await shortTtl.get("movie-1");
         assert.deepStrictEqual(stale.value, metadata);
