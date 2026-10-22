@@ -1111,15 +1111,27 @@ class M3UEPGAddon {
 
         const task = (async () => {
             const persisted = await this.persistentCatalogMetaCache.get(key);
-            if (persisted?.fresh) {
+            const isUsablePreview = value => {
+                if (!value || typeof value !== 'object' || !String(value.name || '').trim()) return false;
+                // Older/partial previews must not suppress the normal metadata lookup.
+                // Require multiple useful detail fields, while allowing legitimate
+                // provider/TMDb records to omit any individual optional field.
+                const usefulFields = [
+                    value.description, value.releaseInfo, value.year, value.runtime,
+                    value.director, value.cast?.length ? value.cast : null,
+                    value.genres?.length ? value.genres : null
+                ].filter(field => field !== undefined && field !== null && field !== '').length;
+                return usefulFields >= 2;
+            };
+            if (persisted?.fresh && isUsablePreview(persisted.value)) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
-            // Expired entries remain a fallback if TMDb/provider refresh fails, but
-            // are not treated as fresh; successful enrichment replaces them.
+            // Always refresh partial or expired persistent entries. A stale entry is
+            // only a last-resort fallback when refresh fails and the entry is usable.
             const refreshed = await this._getCatalogMetaAsync(id, type);
             if (refreshed) return refreshed;
-            if (persisted?.value) {
+            if (persisted?.value && isUsablePreview(persisted.value)) {
                 this.catalogMetaStaleFallbacks.add(key);
                 return persisted.value;
             }
