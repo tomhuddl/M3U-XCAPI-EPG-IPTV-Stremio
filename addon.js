@@ -318,6 +318,7 @@ class M3UEPGAddon {
         });
         this.catalogMetaPending = new Map();
         this.persistentCatalogMetaCache = new PersistentCatalogMetaCache(this.cacheKey);
+        this.catalogMetaStaleFallbacks = new Set();
         // At most one full-catalogue warm-up per media type. Search requests must not
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
@@ -920,7 +921,8 @@ class M3UEPGAddon {
                     if (!detailed) continue;
                     // A fresh persistent hit is already stored on disk; don't reset its
                     // daily refresh timestamp just because the card was viewed again.
-                    const loadedFromCache = this.catalogMetaCache.get(item.id) !== undefined;
+                    const loadedFromCache = this.catalogMetaCache.get(item.id) !== undefined ||
+                        this.catalogMetaStaleFallbacks.delete(item.id);
                     const preview = { ...detailed };
                     delete preview.tmdbRating;
                     if (Array.isArray(preview.links)) {
@@ -971,7 +973,8 @@ class M3UEPGAddon {
                     try {
                         const detailed = await this.getCatalogMetaAsync(next.id, next.type);
                         if (detailed) {
-                            const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined;
+                            const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined ||
+                                this.catalogMetaStaleFallbacks.delete(next.id);
                             const preview = { ...detailed };
                             delete preview.tmdbRating;
                             if (Array.isArray(preview.links)) {
@@ -1115,7 +1118,12 @@ class M3UEPGAddon {
             // Expired entries remain a fallback if TMDb/provider refresh fails, but
             // are not treated as fresh; successful enrichment replaces them.
             const refreshed = await this._getCatalogMetaAsync(id, type);
-            return refreshed || persisted?.value || null;
+            if (refreshed) return refreshed;
+            if (persisted?.value) {
+                this.catalogMetaStaleFallbacks.add(key);
+                return persisted.value;
+            }
+            return null;
         })();
         this.catalogMetaInFlight.set(key, task);
         try {
