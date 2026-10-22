@@ -6,6 +6,7 @@ const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
+const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
@@ -300,7 +301,8 @@ class M3UEPGAddon {
         this.config = config;
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
-        this.updateInterval = 3600000;
+        this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 24 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
@@ -369,18 +371,25 @@ class M3UEPGAddon {
             cached = await redisGetJSON(cacheKey);
             if (cached) dataCache.set(cacheKey, cached);
         }
+        if (!cached) {
+            cached = await this.persistentAddonDataCache.load();
+            if (cached) {
+                dataCache.set(cacheKey, cached);
+                this.log.info('Loaded provider catalogue and EPG from persistent storage');
+            }
+        }
         if (cached) {
             this.channels = cached.channels || [];
             this.movies = cached.movies || [];
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
-            // Direct series episodes index is not persisted; rebuild on next fetch
             this.log.debug('Cache hit for data', {
                 channels: this.channels.length,
                 movies: this.movies.length,
                 series: this.series.length,
-                lastUpdate: new Date(this.lastUpdate).toISOString()
+                epgChannels: Object.keys(this.epgData).length,
+                lastUpdate: this.lastUpdate ? new Date(this.lastUpdate).toISOString() : null
             });
         }
     }
@@ -397,6 +406,14 @@ class M3UEPGAddon {
         };
         dataCache.set(cacheKey, entry);
         await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
+        try {
+            const persisted = await this.persistentAddonDataCache.save(entry);
+            if (persisted) this.log.info('Persisted provider catalogue and EPG snapshot');
+        } catch (error) {
+            // The in-memory/Redis copy remains usable; a disk write failure must not
+            // interrupt a successful provider refresh or replace the last-good file.
+            this.log.warn('Persistent provider data save failed', error?.name || 'Error');
+        }
         this.log.debug('Saved data to cache');
     }
 
@@ -713,21 +730,66 @@ class M3UEPGAddon {
                 return;
             }
         }
+        const previous = {
+            channels: this.channels,
+            movies: this.movies,
+            series: this.series,
+            epgData: this.epgData,
+            lastUpdate: this.lastUpdate
+        };
         try {
             const start = Date.now();
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
             await providerModule.fetchData(this);
+
+            // A catalogue refresh may succeed while an optional EPG source is down.
+            // Keep the last-known-good guide instead of replacing it with an empty one.
+            const hasNewEpg = Object.values(this.epgData || {}).some(
+                programmes => Array.isArray(programmes) && programmes.length > 0
+            );
+            const hadPreviousEpg = Object.values(previous.epgData || {}).some(
+                programmes => Array.isArray(programmes) && programmes.length > 0
+            );
+            if (this.config.enableEpg && !hasNewEpg && hadPreviousEpg) {
+                this.epgData = previous.epgData;
+                this.log.warn('EPG refresh returned no programmes; retaining last-known-good guide');
+            }
+
+            // Reject an obviously partial catalogue response rather than persisting
+            // an accidental empty snapshot over a previously working library.
+            const previousHadCatalogue = previous.channels.length + previous.movies.length + previous.series.length > 0;
+            const currentHasCatalogue = this.channels.length + this.movies.length + this.series.length > 0;
+            if (previousHadCatalogue && !currentHasCatalogue) {
+                throw new Error('Provider refresh returned an empty catalogue; retaining previous data');
+            }
+
             this.lastUpdate = Date.now();
             if (CACHE_ENABLED) await this.saveToCache();
+            else {
+                try {
+                    await this.persistentAddonDataCache.save({
+                        channels: this.channels, movies: this.movies, series: this.series,
+                        epgData: this.epgData, lastUpdate: this.lastUpdate
+                    });
+                } catch (error) {
+                    this.log.warn('Persistent provider data save failed', error?.name || 'Error');
+                }
+            }
             this.buildGenresInManifest();
             this.log.debug('Data update complete', {
                 channels: this.channels.length,
                 movies: this.movies.length,
                 series: this.series.length,
+                epgChannels: Object.keys(this.epgData || {}).length,
                 ms: Date.now() - start
             });
         } catch (e) {
-            this.log.error('[UPDATE] Failed:', e && e.name ? e.name : 'Error');
+            this.channels = previous.channels;
+            this.movies = previous.movies;
+            this.series = previous.series;
+            this.epgData = previous.epgData;
+            this.lastUpdate = previous.lastUpdate;
+            this.log.error('[UPDATE] Failed; retaining last-known-good data:', e && e.name ? e.name : 'Error');
         }
     }
 
