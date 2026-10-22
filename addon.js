@@ -412,7 +412,10 @@ class M3UEPGAddon {
         } catch (error) {
             // The in-memory/Redis copy remains usable; a disk write failure must not
             // interrupt a successful provider refresh or replace the last-good file.
-            this.log.warn('Persistent provider data save failed', error?.name || 'Error');
+            this.log.warn('Persistent provider data save failed', {
+                name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
+                syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
+            });
         }
         this.log.debug('Saved data to cache');
     }
@@ -772,7 +775,10 @@ class M3UEPGAddon {
                         epgData: this.epgData, lastUpdate: this.lastUpdate
                     });
                 } catch (error) {
-                    this.log.warn('Persistent provider data save failed', error?.name || 'Error');
+                    this.log.warn('Persistent provider data save failed', {
+                    name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
+                    syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
+                });
                 }
             }
             this.buildGenresInManifest();
