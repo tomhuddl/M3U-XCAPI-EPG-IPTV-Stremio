@@ -11,6 +11,7 @@ const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesS
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
+const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
@@ -406,6 +407,32 @@ function testScheduledProgramsCacheParsedTimestamps() {
 }
 
 
+async function testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot() {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-persistent-data-"));
+    const data = {
+        channels: [{ id: "channel-1", name: "Live channel", url: "https://example.com/live.m3u8" }],
+        movies: [{ id: "movie-1", name: "Film", url: "https://example.com/movie.mp4" }],
+        series: [{ id: "series-1", name: "Series" }],
+        epgData: { "channel.one": [{ start: "20261023120000 +0000", stop: "20261023130000 +0000", title: "News", desc: "Description" }] },
+        lastUpdate: Date.now()
+    };
+    try {
+        const cache = new PersistentAddonDataCache("test-provider", { directory });
+        assert.strictEqual(await cache.load(), null, "missing persistent data should be a cache miss");
+        assert.strictEqual(await cache.save(data), true);
+        const reloaded = await new PersistentAddonDataCache("test-provider", { directory }).load();
+        assert.deepStrictEqual(reloaded, data, "catalogue, series, and EPG should survive a new cache instance");
+        await assert.rejects(
+            () => cache.save({ channels: [], movies: [], series: [], epgData: {}, lastUpdate: NaN }),
+            /incomplete provider data snapshot/
+        );
+        const stillSaved = await cache.load();
+        assert.deepStrictEqual(stillSaved, data, "invalid refresh data must not overwrite the last-good snapshot");
+    } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+    }
+}
+
 async function testPersistentCatalogMetadataCacheRoundTripAndStaleFallback() {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-catalog-cache-"));
     try {
@@ -598,6 +625,7 @@ async function main() {
         testScheduledProgramsCacheParsedTimestamps,
         testDirectEpisodeLookupUsesExactIndex,
         testPersistentCatalogMetadataCacheRoundTripAndStaleFallback,
+        testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testConcurrentSeriesInfoLookupsAreDeduplicated,

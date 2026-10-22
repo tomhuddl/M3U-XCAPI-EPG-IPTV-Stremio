@@ -23,7 +23,8 @@ function parsePositiveInteger(value, fallback, min, max) {
  */
 class PersistentCatalogMetaCache {
     constructor(cacheKey, options = {}) {
-        this.directory = options.directory ?? process.env.CATALOG_META_CACHE_DIR ?? "";
+        const sharedDataDirectory = process.env.PERSISTENT_DATA_DIR || "";
+        this.directory = options.directory ?? process.env.CATALOG_META_CACHE_DIR ?? (sharedDataDirectory ? path.join(sharedDataDirectory, "catalog-meta") : "");
         this.enabled = typeof this.directory === "string" && this.directory.trim().length > 0;
         this.filePath = this.enabled
             ? path.join(this.directory, "catalog-meta-" + String(cacheKey).slice(0, 24) + ".json")
@@ -132,7 +133,10 @@ class PersistentCatalogMetaCache {
         this.writeTimer = setTimeout(() => {
             this.writeTimer = null;
             this.flush().catch(error => {
-                console.warn("[CATALOG-CACHE] Could not save persistent metadata cache:", error?.name || "Error");
+                console.warn("[CATALOG-CACHE] Could not save persistent metadata cache:", {
+                    name: error?.name || "Error", code: error?.code || "UNKNOWN",
+                    syscall: error?.syscall || null, message: String(error?.message || "No error message").slice(0, 300)
+                });
             });
         }, delay);
         if (typeof this.writeTimer.unref === "function") this.writeTimer.unref();
