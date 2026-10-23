@@ -151,6 +151,17 @@ function getCatalogueQueryResultCache(items) {
     return cache;
 }
 
+function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
+    return normalizedSearchQuery ? selectedGenre + '\\u0000' + normalizedSearchQuery : null;
+}
+
+function cacheCatalogueQueryResults(cache, key, filtered, maxEntries = CATALOGUE_QUERY_RESULT_CACHE_MAX) {
+    if (!cache || !key) return;
+    cache.delete(key);
+    cache.set(key, filtered);
+    while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+}
+
 
 function getCatalogueSearchIndex(items) {
     let index = catalogueSearchIndexes.get(items);
@@ -1700,10 +1711,7 @@ async function createAddon(config) {
                 }
 
                 if (queryResultCache && !queryCacheHit) {
-                    queryResultCache.set(queryCacheKey, filtered);
-                    while (queryResultCache.size > CATALOGUE_QUERY_RESULT_CACHE_MAX) {
-                        queryResultCache.delete(queryResultCache.keys().next().value);
-                    }
+                    cacheCatalogueQueryResults(queryResultCache, queryCacheKey, filtered);
                 }
                 
                 // Keep every movie/series Discover batch small enough to enrich fully
@@ -1954,3 +1962,6 @@ module.exports.normalizeSearchText = normalizeSearchText;
 module.exports.matchesSearchText = matchesSearchText;
 module.exports.matchesNormalizedSearchText = matchesNormalizedSearchText;
 module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
+module.exports.getCatalogueQueryResultCache = getCatalogueQueryResultCache;
+module.exports.createCatalogueQueryCacheKey = createCatalogueQueryCacheKey;
+module.exports.cacheCatalogueQueryResults = cacheCatalogueQueryResults;
