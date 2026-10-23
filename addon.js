@@ -1642,11 +1642,17 @@ async function createAddon(config) {
                     ? normalizeGenre(extra.genre)
                     : '';
                 const queryCacheKey = normalizedSearchQuery
-                    ? selectedGenre + '\\u0000' + normalizedSearchQuery
+                    ? selectedGenre + '\u0000' + normalizedSearchQuery
                     : null;
                 const queryResultCache = queryCacheKey ? getCatalogueQueryResultCache(items) : null;
                 let queryCacheHit = false;
-                if (queryResultCache && queryResultCache.has(queryCacheKey)) {
+                // Preserve existing behaviour for punctuation-only searches: they
+                // normalize to an empty query and must return no matches, not all items.
+                if (extra.search && !normalizedSearchQuery) {
+                    filtered = [];
+                    queryCacheHit = true;
+                }
+                if (!queryCacheHit && queryResultCache && queryResultCache.has(queryCacheKey)) {
                     filtered = queryResultCache.get(queryCacheKey);
                     // Refresh insertion order for bounded LRU eviction.
                     queryResultCache.delete(queryCacheKey);
