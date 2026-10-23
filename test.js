@@ -518,6 +518,43 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     assert.strictEqual(addon.catalogMetaQueueHead, 0);
 }
 
+async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    addon.persistentCatalogMetaCache = {
+        get: async () => null,
+        set: async () => {},
+        flush: async () => {},
+    };
+    const crypto = require("crypto");
+    const fingerprint = items => crypto.createHash("sha256")
+        .update(items.map(item => String(item?.id || "")).join("\n"))
+        .digest("hex");
+    addon.catalogPrefetchLastCompleted.set("movie", Date.now());
+    addon.catalogPrefetchLastFingerprint.set("movie", fingerprint(addon.movies));
+
+    let enriched = [];
+    addon.enrichCatalogMetaItems = async batch => {
+        enriched.push(...batch.map(item => item.id));
+        for (const item of batch) {
+            addon.cacheCatalogMetaPreview(item.id, { name: item.name, description: "Cached preview" });
+        }
+    };
+
+    // An unchanged catalogue should respect the daily completion shortcut.
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    assert.strictEqual(addon.catalogPrefetchJobs.has("movie"), false);
+
+    // A changed catalogue must bypass that shortcut and warm the newly added item.
+    addon.movies.push({ id: "movie-2", type: "movie", name: "Movie 2" });
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const job = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(job, "a changed catalogue should start a new warm-up");
+    await job;
+    assert.deepStrictEqual(enriched, ["movie-1", "movie-2"]);
+    assert.strictEqual(addon.catalogPrefetchLastFingerprint.get("movie"), fingerprint(addon.movies));
+}
+
 async function testCataloguePrefetchBacksOffAfterIncompleteWarmup() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
@@ -653,6 +690,7 @@ async function main() {
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
+        testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
