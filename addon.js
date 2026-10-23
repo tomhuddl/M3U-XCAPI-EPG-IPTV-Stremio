@@ -1125,12 +1125,16 @@ class M3UEPGAddon {
         const job = (async () => {
             const startedAt = Date.now();
             const statusKey = '__catalog_prefetch_status__:' + type;
-            // Persist the completion timestamp so Railway restarts do not trigger a
-            // needless full-catalogue TMDb walk when the daily refresh is not due.
+            const catalogueFingerprint = crypto.createHash('sha256')
+                .update(items.map(item => String(item?.id || '')).join('\n'))
+                .digest('hex');
+            // Persist the completion timestamp and catalogue fingerprint so Railway
+            // restarts do not repeat a fresh warm-up, but changed provider catalogues
+            // still trigger a full metadata pass even when the item count is unchanged.
             const persistedStatus = await this.persistentCatalogMetaCache.get(statusKey);
             const persistedCompletedAt = Number(persistedStatus?.value?.completedAt) || 0;
-            const sameCatalogueSize = Number(persistedStatus?.value?.catalogueCount) === items.length;
-            if (persistedStatus?.fresh && sameCatalogueSize &&
+            const sameCatalogue = persistedStatus?.value?.catalogueFingerprint === catalogueFingerprint;
+            if (persistedStatus?.fresh && sameCatalogue &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                 this.log.debug('Persistent catalogue metadata is already warm', {
@@ -1171,6 +1175,7 @@ class M3UEPGAddon {
                 await this.persistentCatalogMetaCache.set(statusKey, {
                     completedAt,
                     catalogueCount: items.length,
+                    catalogueFingerprint,
                     version: 1
                 });
                 // Ensure metadata and its completion marker reach the persistent
