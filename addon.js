@@ -1240,7 +1240,7 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim()) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.omdbPending === true) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1344,7 +1344,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || Date.now() - persisted.savedAt < refreshInterval) return cached;
+            if (!persisted || (!persisted.value?.omdbPending && Date.now() - persisted.savedAt < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
@@ -1373,7 +1373,8 @@ class M3UEPGAddon {
             );
             const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
             const persistedIsDue = persistedIsUsable &&
-                Date.now() - persisted.savedAt >= metadataRefreshInterval;
+                (persisted.value.omdbPending === true ||
+                    Date.now() - persisted.savedAt >= metadataRefreshInterval);
             if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
@@ -1437,6 +1438,7 @@ class M3UEPGAddon {
                 runtime: tmdb.runtime || omdb?.runtime,
                 imdbId: tmdb.imdbId || omdb?.imdbId,
                 imdbRating: omdb?.imdbRating,
+                omdbPending: Boolean(tmdb.imdbId && !omdb),
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: [],
@@ -1484,6 +1486,7 @@ class M3UEPGAddon {
             runtime: tmdb.runtime || omdb?.runtime,
             imdbId: tmdb.imdbId || omdb?.imdbId,
             imdbRating: omdb?.imdbRating,
+            omdbPending: Boolean(tmdb.imdbId && !omdb),
             director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
