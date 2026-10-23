@@ -4,7 +4,7 @@ const LRUCache = require("../../lruCache");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
-const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
+const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({
   max: parsePositiveInteger(process.env.TMDB_CACHE_MAX_ENTRIES, 1000, 1, 5000),
   ttl: CACHE_TTL_MS,
