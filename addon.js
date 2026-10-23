@@ -1628,10 +1628,14 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
+        // Load the complete persistent metadata index before serving requests, so
+        // saved OMDb/TMDb previews are immediately available after a Railway restart.
+        // This loads saved data only; it does not wait for network refreshes.
+        await addonInstance.persistentCatalogMetaCache.init();
         // Start the full movie/series metadata warm-up as soon as this configured
         // addon is built, rather than waiting for the first Discover request.
-        // It is intentionally non-blocking: a saved last-known-good cache remains
-        // available while missing/stale metadata is refreshed in the background.
+        // It is intentionally non-blocking: saved previews remain available while
+        // missing or 14-day-due metadata is refreshed in the background.
         const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100);
         const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
         if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
@@ -1640,7 +1644,7 @@ async function createAddon(config) {
                 addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
             }
         }
-        // Keep provider catalogue and guide refreshed every 24 hours even if Stremio is idle
+        // Keep provider catalogue and guide refreshed every 12 hours even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
 
