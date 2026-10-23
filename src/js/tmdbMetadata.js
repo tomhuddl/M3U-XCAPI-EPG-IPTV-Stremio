@@ -277,13 +277,14 @@ async function getSeriesCatalogMetadata(tmdbId) {
 async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // Match the catalogue lookup so details + credits share one cached response.
-  const [details, videos, images] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB&append_to_response=credits"),
+  // Reuse the exact details/credits/images response already fetched for Discover.
+  // Only trailers need a separate request; the shared request cache deduplicates it
+  // when another detail request for the same movie is already in progress.
+  const [details, videos] = await Promise.all([
+    request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null"),
     request("/movie/" + id + "/videos?language=en-GB"),
-    request("/movie/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapMovieMetadata(details, details?.credits, videos, images);
+  return mapMovieMetadata(details, details?.credits, videos, details?.images);
 }
 
 function mapSeriesMetadata(details, credits, videos, images) {
@@ -321,13 +322,14 @@ function mapSeriesMetadata(details, credits, videos, images) {
 async function getSeriesMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // Match the catalogue lookup so details + aggregate credits share one cached response.
-  const [details, videos, images] = await Promise.all([
-    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits"),
+  // Reuse the exact details/credits/images response already fetched for Discover.
+  // Only trailers need a separate request; the shared request cache deduplicates it
+  // when another detail request for the same series is already in progress.
+  const [details, videos] = await Promise.all([
+    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null"),
     request("/tv/" + id + "/videos?language=en-GB"),
-    request("/tv/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapSeriesMetadata(details, details?.aggregate_credits, videos, images);
+  return mapSeriesMetadata(details, details?.aggregate_credits, videos, details?.images);
 }
 
 function mapSeasonEpisodes(data, season) {

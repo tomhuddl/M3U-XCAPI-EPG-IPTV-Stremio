@@ -134,15 +134,15 @@ function getNormalizedSearchText(value) {
 // this per-catalogue index keeps normalized titles reusable across successive queries.
 const catalogueSearchIndexes = new WeakMap();
 
-// Cache the filtered item list for recently repeated identical searches. The
-// cache is keyed by catalogue-array identity, so replacing a provider catalogue
-// naturally invalidates old results without risking stale pagination.
+// Cache filtered search results per immutable catalogue array. WeakMap keys allow
+// old indexes to be collected after a provider refresh replaces the catalogue.
 const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
-    process.env.SEARCH_RESULT_CACHE_MAX, 12, 1, 50
+    process.env.CATALOGUE_QUERY_RESULT_CACHE_MAX, 100, 10, 1000
 );
 const catalogueQueryResultCaches = new WeakMap();
 
 function getCatalogueQueryResultCache(items) {
+    if (!Array.isArray(items)) return null;
     let cache = catalogueQueryResultCaches.get(items);
     if (!cache) {
         cache = new Map();
@@ -1606,7 +1606,7 @@ async function createAddon(config) {
         // addon is built, rather than waiting for the first Discover request.
         // It is intentionally non-blocking: a saved last-known-good cache remains
         // available while missing/stale metadata is refreshed in the background.
-        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100);
+        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100);
         const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
         if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
             addonInstance.startContinuousCatalogPrefetch('movie', metadataPrefetchPageSize, metadataPrefetchConcurrency);
@@ -1722,7 +1722,7 @@ async function createAddon(config) {
                 // page as the user scrolls, so no visible movie/series card depends on a
                 // later background update. Live-TV/EPG retain the existing 100-item size.
                 const catalogPageSize = (args.type === 'movie' || args.type === 'series')
-                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100)
+                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100)
                     : 100;
 
                 // Pagination / Skip. Stremio's next-page skip is based on the number
