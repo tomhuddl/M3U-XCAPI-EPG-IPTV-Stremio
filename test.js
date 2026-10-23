@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -16,6 +16,39 @@ const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
 const { rebuildDirectEpisodeIndexes } = require("./src/js/providers/directProvider");
+
+function testCatalogueQueryResultCacheIsBoundedAndPreservesPagination() {
+    const catalogue = [
+        { id: "m1", name: "Alpha Movie", category: "Drama" },
+        { id: "m2", name: "Alpha Series", category: "Comedy" },
+        { id: "m3", name: "Alpha Story", category: "Drama" },
+        { id: "m4", name: "Beta Movie", category: "Drama" }
+    ];
+    const cache = getCatalogueQueryResultCache(catalogue);
+    const key = createCatalogueQueryCacheKey("alpha", "");
+    const results = catalogue.filter(item => item.name.toLowerCase().includes("alpha"));
+    cacheCatalogueQueryResults(cache, key, results, 2);
+
+    assert.strictEqual(getCatalogueQueryResultCache(catalogue), cache,
+        "the same catalogue array should reuse its result cache");
+    assert.deepStrictEqual(cache.get(key), results);
+    assert.deepStrictEqual(cache.get(key).slice(1, 3).map(item => item.id), ["m2", "m3"],
+        "pagination over cached results must preserve provider order");
+
+    const genreKey = createCatalogueQueryCacheKey("alpha", "drama");
+    assert.notStrictEqual(genreKey, key, "the selected genre must be part of the query cache key");
+    cacheCatalogueQueryResults(cache, genreKey, results.filter(item => item.category === "Drama"), 2);
+    const thirdKey = createCatalogueQueryCacheKey("beta", "");
+    cacheCatalogueQueryResults(cache, thirdKey, [catalogue[3]], 2);
+    assert.strictEqual(cache.size, 2, "the cache must remain within its configured entry bound");
+    assert.strictEqual(cache.has(key), false, "oldest search should be evicted when the bound is exceeded");
+
+    const refreshedCatalogue = catalogue.slice();
+    assert.notStrictEqual(getCatalogueQueryResultCache(refreshedCatalogue), cache,
+        "a replacement catalogue array must not reuse potentially stale search results");
+    assert.strictEqual(createCatalogueQueryCacheKey("", "drama"), null,
+        "empty normalized searches should not be cached as ordinary queries");
+}
 
 function testDirectEpisodeLookupUsesExactIndex() {
     const addon = new M3UEPGAddon({ provider: "direct" });
@@ -719,6 +752,7 @@ async function main() {
         testSearchSupportsReorderedWordsAndPartialTyping,
         testNormalizedSearchMatcherPreservesSearchBehaviour,
         testSearchAllowsConservativeSingleCharacterTypos,
+        testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
         testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,
