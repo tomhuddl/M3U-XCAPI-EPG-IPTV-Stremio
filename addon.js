@@ -134,6 +134,24 @@ function getNormalizedSearchText(value) {
 // this per-catalogue index keeps normalized titles reusable across successive queries.
 const catalogueSearchIndexes = new WeakMap();
 
+// Cache the filtered item list for recently repeated identical searches. The
+// cache is keyed by catalogue-array identity, so replacing a provider catalogue
+// naturally invalidates old results without risking stale pagination.
+const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
+    process.env.SEARCH_RESULT_CACHE_MAX, 12, 1, 50
+);
+const catalogueQueryResultCaches = new WeakMap();
+
+function getCatalogueQueryResultCache(items) {
+    let cache = catalogueQueryResultCaches.get(items);
+    if (!cache) {
+        cache = new Map();
+        catalogueQueryResultCaches.set(items, cache);
+    }
+    return cache;
+}
+
+
 function getCatalogueSearchIndex(items) {
     let index = catalogueSearchIndexes.get(items);
     if (index) return { index, built: false };
@@ -1619,16 +1637,32 @@ async function createAddon(config) {
                 let searchFilterMs = 0;
                 let searchIndexBuilt = false;
 
+                const normalizedSearchQuery = extra.search ? getNormalizedSearchText(extra.search) : '';
+                const selectedGenre = extra.genre && normalizeGenre(extra.genre) !== 'all channels'
+                    ? normalizeGenre(extra.genre)
+                    : '';
+                const queryCacheKey = normalizedSearchQuery
+                    ? selectedGenre + '\\u0000' + normalizedSearchQuery
+                    : null;
+                const queryResultCache = queryCacheKey ? getCatalogueQueryResultCache(items) : null;
+                let queryCacheHit = false;
+                if (queryResultCache && queryResultCache.has(queryCacheKey)) {
+                    filtered = queryResultCache.get(queryCacheKey);
+                    // Refresh insertion order for bounded LRU eviction.
+                    queryResultCache.delete(queryCacheKey);
+                    queryResultCache.set(queryCacheKey, filtered);
+                    queryCacheHit = true;
+                }
+
                 // If specific genre selected, reuse normalised item categories across
                 // requests. Matching remains exact and preserves catalogue order.
                 const genreFilterStartedAt = Date.now();
-                if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
+                if (!queryCacheHit && selectedGenre) {
                     const genreIndexStartedAt = Date.now();
                     const genreIndexResult = getCatalogueGenreIndex(items);
                     const genreIndex = genreIndexResult.index;
                     genreIndexBuilt = genreIndexResult.built;
                     genreIndexMs = Date.now() - genreIndexStartedAt;
-                    const selectedGenre = normalizeGenre(extra.genre);
                     filtered = filtered.filter(i => {
                         const indexedGenre = genreIndex.get(i);
                         if (indexedGenre !== undefined) return indexedGenre === selectedGenre;
@@ -1641,12 +1675,12 @@ async function createAddon(config) {
                 // Keep normalized titles indexed per immutable catalogue array. This
                 // avoids repeatedly normalizing thousands of titles on every search,
                 // without changing matching rules, result order, or displayed titles.
-                if (extra.search) {
+                if (!queryCacheHit && normalizedSearchQuery) {
                     const indexStartedAt = Date.now();
                     const searchIndexResult = getCatalogueSearchIndex(items);
                     const searchIndex = searchIndexResult.index;
                     searchIndexBuilt = searchIndexResult.built;
-                    const matcher = createNormalizedSearchMatcher(getNormalizedSearchText(extra.search));
+                    const matcher = createNormalizedSearchMatcher(normalizedSearchQuery);
                     searchIndexMs = Date.now() - indexStartedAt;
 
                     const searchFilterStartedAt = Date.now();
@@ -1657,6 +1691,13 @@ async function createAddon(config) {
                             : matcher(getNormalizedSearchText(i.name));
                     });
                     searchFilterMs = Date.now() - searchFilterStartedAt;
+                }
+
+                if (queryResultCache && !queryCacheHit) {
+                    queryResultCache.set(queryCacheKey, filtered);
+                    while (queryResultCache.size > CATALOGUE_QUERY_RESULT_CACHE_MAX) {
+                        queryResultCache.delete(queryResultCache.keys().next().value);
+                    }
                 }
                 
                 // Keep every movie/series Discover batch small enough to enrich fully
@@ -1775,6 +1816,7 @@ async function createAddon(config) {
                         searchIndexMs,
                         searchIndexBuilt,
                         searchFilterMs,
+                        queryCacheHit,
                         paginationMs,
                         enrichmentMs,
                         responseBuildMs,
