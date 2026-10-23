@@ -332,7 +332,7 @@ class M3UEPGAddon {
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
-        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 24 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
@@ -1189,8 +1189,8 @@ class M3UEPGAddon {
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
-            process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
-            60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+            60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000
         );
         // Walk the unfiltered provider catalogue so a search for a small subset does
         // not accidentally define the scope of the background warm-up.
@@ -1354,11 +1354,17 @@ class M3UEPGAddon {
                 ].filter(field => field !== undefined && field !== null && field !== '').length;
                 return usefulFields >= 2;
             };
-            // Metadata is effectively immutable for this personal-use addon. Reuse
-            // any complete persisted preview regardless of age; only missing/partial
-            // records should trigger TMDb/OMDb calls. New provider items naturally miss
-            // this key and are enriched before their first card is returned.
-            if (persisted?.value && isUsablePreview(persisted.value)) {
+            // Reuse complete persisted metadata until its 14-day refresh interval expires.
+            // Refresh due records when the catalogue warm-up reaches them; if a lookup
+            // fails, keep the last saved preview available for the card.
+            const metadataRefreshInterval = parsePositiveInteger(
+                process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+                60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
+            );
+            const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
+            const persistedIsDue = persistedIsUsable &&
+                Date.now() - persisted.savedAt >= metadataRefreshInterval;
+            if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
