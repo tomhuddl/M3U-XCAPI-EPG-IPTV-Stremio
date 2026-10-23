@@ -534,6 +534,36 @@ async function testPersistentCatalogMetadataCacheRoundTripAndStaleFallback() {
     }
 }
 
+async function testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFailure() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-catalog-cache-write-failure-"));
+    const blockedDirectory = path.join(root, "not-a-directory");
+    await fs.writeFile(blockedDirectory, "block directory creation");
+    let cache;
+    try {
+        cache = new PersistentCatalogMetaCache("test-config", {
+            directory: blockedDirectory, ttlMs: 60000, staleRetentionMs: 120000, maxEntries: 10
+        });
+        await cache.set("movie-1", { id: "movie-1", name: "Cached movie" });
+        if (cache.writeTimer) {
+            clearTimeout(cache.writeTimer);
+            cache.writeTimer = null;
+        }
+
+        await assert.rejects(() => cache.flush(), /EEXIST|ENOTDIR/);
+        assert.strictEqual(cache.dirty, true,
+            "a failed disk write must leave the cache dirty so a later flush can retry");
+
+        // Avoid leaving the deliberately failing retry timer alive in this test.
+        if (cache.writeTimer) {
+            clearTimeout(cache.writeTimer);
+            cache.writeTimer = null;
+        }
+    } finally {
+        if (cache?.writeTimer) clearTimeout(cache.writeTimer);
+        await fs.rm(root, { recursive: true, force: true });
+    }
+}
+
 async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     let calls = 0;
@@ -786,6 +816,7 @@ async function main() {
         testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,
         testDirectEpisodeLookupUsesExactIndex,
         testPersistentCatalogMetadataCacheRoundTripAndStaleFallback,
+        testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFailure,
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
