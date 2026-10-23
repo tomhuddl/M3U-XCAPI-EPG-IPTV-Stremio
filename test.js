@@ -624,6 +624,34 @@ async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval(
     assert.strictEqual(addon.catalogPrefetchLastFingerprint.get("movie"), fingerprint(addon.movies));
 }
 
+async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    const crypto = require("crypto");
+    const fingerprint = crypto.createHash("sha256")
+        .update(addon.movies.map(item => String(item?.id || "")).join("\n"))
+        .digest("hex");
+    const completedAt = Date.now();
+    let enrichmentCalls = 0;
+    addon.persistentCatalogMetaCache = {
+        get: async key => key === "__catalog_prefetch_status__:movie"
+            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 1 }, fresh: true }
+            : null,
+        set: async () => {},
+        flush: async () => {},
+    };
+    addon.enrichCatalogMetaItems = async () => { enrichmentCalls++; };
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const job = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(job, "startup should check the persisted completion marker");
+    await job;
+    assert.strictEqual(enrichmentCalls, 0,
+        "a matching recent persistent marker should avoid repeating the full warm-up after restart");
+    assert.strictEqual(addon.catalogPrefetchLastFingerprint.get("movie"), fingerprint);
+    assert.strictEqual(addon.catalogPrefetchLastCompleted.get("movie"), completedAt);
+}
+
 async function testCataloguePrefetchBacksOffAfterIncompleteWarmup() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
@@ -762,6 +790,7 @@ async function main() {
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
         testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
+        testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
