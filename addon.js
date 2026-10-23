@@ -134,6 +134,23 @@ function getNormalizedSearchText(value) {
 // this per-catalogue index keeps normalized titles reusable across successive queries.
 const catalogueSearchIndexes = new WeakMap();
 
+// Cache filtered search results per immutable catalogue array. WeakMap keys allow
+// old indexes to be collected after a provider refresh replaces the catalogue.
+const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
+    process.env.CATALOGUE_QUERY_RESULT_CACHE_MAX, 100, 10, 1000
+);
+const catalogueQueryResultCaches = new WeakMap();
+
+function getCatalogueQueryResultCache(items) {
+    if (!Array.isArray(items)) return null;
+    let cache = catalogueQueryResultCaches.get(items);
+    if (!cache) {
+        cache = new Map();
+        catalogueQueryResultCaches.set(items, cache);
+    }
+    return cache;
+}
+
 function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
     return normalizedSearchQuery ? JSON.stringify([selectedGenre, normalizedSearchQuery]) : null;
 }
