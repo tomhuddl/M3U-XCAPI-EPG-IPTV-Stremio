@@ -7,6 +7,7 @@ const API_KEY = (process.env.OMDB_API_KEY || "").trim();
 const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MAX_ENTRIES, 2000, 50, 10000), ttl: CACHE_TTL_MS });
 const pending = new Map();
+const retryableFailures = new Map();
 const DAILY_REQUEST_LIMIT = parsePositiveInteger(process.env.OMDB_DAILY_REQUEST_LIMIT, 100000, 1, 100000);
 const DATA_DIR = process.env.PERSISTENT_DATA_DIR || path.join(process.cwd(), "data");
 const USAGE_FILE = path.join(DATA_DIR, "omdb-usage.json");
@@ -77,12 +78,17 @@ function parseRuntime(value) {
 async function getByImdbId(value) {
   const imdbId = validImdbId(value);
   if (!API_KEY || !imdbId) return null;
-  if (cache.has(imdbId)) return cache.get(imdbId);
+  if (cache.has(imdbId)) {
+    retryableFailures.delete(imdbId);
+    return cache.get(imdbId);
+  }
   if (pending.has(imdbId)) return pending.get(imdbId);
 
   const task = (async () => {
+    retryableFailures.delete(imdbId);
     try {
       if (!(await reserveDailyRequest())) {
+        retryableFailures.set(imdbId, true);
         if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb daily request budget reached");
         return null;
       }
@@ -93,9 +99,18 @@ async function getByImdbId(value) {
         reuseConnection: true,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" }
       });
-      if (!response || !response.ok) return null;
+      if (!response || !response.ok) {
+        retryableFailures.set(imdbId, true);
+        return null;
+      }
       const data = await response.json();
-      if (!data || data.Response !== "True") return null;
+      if (!data || data.Response !== "True") {
+        // A missing title or invalid key is not helped by repeatedly retrying
+        // every hour; quota and temporary service errors should be retried.
+        const errorText = String(data?.Error || "").toLowerCase();
+        retryableFailures.set(imdbId, /request limit|too many requests|temporarily unavailable|timeout|server error/.test(errorText));
+        return null;
+      }
       const ratingValue = Number(data.imdbRating);
       const result = {
         imdbId: validImdbId(data.imdbID) || imdbId,
@@ -105,8 +120,10 @@ async function getByImdbId(value) {
         runtime: parseRuntime(data.Runtime) ? parseRuntime(data.Runtime) + " min" : undefined,
       };
       cache.set(imdbId, result);
+      retryableFailures.delete(imdbId);
       return result;
     } catch (error) {
+      retryableFailures.set(imdbId, true);
       // OMDb is optional: a transient outage must never break card delivery.
       if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
         console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
@@ -122,4 +139,9 @@ async function getByImdbId(value) {
   }
 }
 
-module.exports = { getByImdbId, validImdbId };
+function shouldRetryLookup(value) {
+  const imdbId = validImdbId(value);
+  return Boolean(imdbId && retryableFailures.get(imdbId));
+}
+
+module.exports = { getByImdbId, validImdbId, shouldRetryLookup };
