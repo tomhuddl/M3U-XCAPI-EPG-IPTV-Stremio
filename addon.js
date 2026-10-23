@@ -144,7 +144,7 @@ function getCatalogueFingerprint(items) {
     const cached = catalogueFingerprints.get(items);
     if (cached) return cached;
     const fingerprint = crypto.createHash('sha256')
-        .update(items.map(item => String(item?.id || '')).join('\\n'))
+        .update(items.map(item => String(item?.id || '')).join('\n'))
         .digest('hex');
     catalogueFingerprints.set(items, fingerprint);
     return fingerprint;
