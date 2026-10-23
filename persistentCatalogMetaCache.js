@@ -73,6 +73,12 @@ class PersistentCatalogMetaCache {
                         this.entries.set(key, { savedAt: entry.savedAt, value: entry.value });
                     }
                     this.prune();
+                    console.log("[CATALOG-CACHE] Loaded persistent metadata cache", {
+                        entries: this.entries.size,
+                        bytes: stat.size,
+                        freshEntries: [...this.entries.values()].filter(entry => now - entry.savedAt < this.ttlMs).length,
+                        staleFallbackEntries: [...this.entries.values()].filter(entry => now - entry.savedAt >= this.ttlMs).length
+                    });
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
                         console.warn("[CATALOG-CACHE] Could not load persistent metadata cache:", error?.name || "Error");
@@ -160,12 +166,20 @@ class PersistentCatalogMetaCache {
             version: 1,
             entries: Object.fromEntries(this.entries),
         });
+        if (Buffer.byteLength(snapshot, "utf8") > MAX_FILE_BYTES) {
+            this.dirty = true;
+            throw new Error("persistent catalogue metadata cache exceeds the 256 MiB safety limit");
+        }
         this.writePromise = (async () => {
             await fs.mkdir(this.directory, { recursive: true });
             const tempPath = this.filePath + "." + process.pid + ".tmp";
             try {
                 await fs.writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
                 await fs.rename(tempPath, this.filePath);
+                console.log("[CATALOG-CACHE] Saved persistent metadata cache", {
+                    entries: this.entries.size,
+                    bytes: Buffer.byteLength(snapshot, "utf8")
+                });
             } finally {
                 await fs.unlink(tempPath).catch(() => {});
             }
