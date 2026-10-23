@@ -1138,7 +1138,9 @@ class M3UEPGAddon {
             const persistedStatus = await this.persistentCatalogMetaCache.get(statusKey);
             const persistedCompletedAt = Number(persistedStatus?.value?.completedAt) || 0;
             const sameCatalogue = persistedStatus?.value?.catalogueFingerprint === catalogueFingerprint;
-            if (persistedStatus?.fresh && sameCatalogue &&
+            // The completion marker has its own completedAt timestamp; do not
+            // couple daily scheduling to the metadata entries' freshness TTL.
+            if (persistedStatus && sameCatalogue &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                 this.catalogPrefetchRetryAfter.delete(type);
