@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -16,6 +16,39 @@ const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
 const { rebuildDirectEpisodeIndexes } = require("./src/js/providers/directProvider");
+
+function testCatalogueQueryResultCacheIsBoundedAndPreservesPagination() {
+    const catalogue = [
+        { id: "m1", name: "Alpha Movie", category: "Drama" },
+        { id: "m2", name: "Alpha Series", category: "Comedy" },
+        { id: "m3", name: "Alpha Story", category: "Drama" },
+        { id: "m4", name: "Beta Movie", category: "Drama" }
+    ];
+    const cache = getCatalogueQueryResultCache(catalogue);
+    const key = createCatalogueQueryCacheKey("alpha", "");
+    const results = catalogue.filter(item => item.name.toLowerCase().includes("alpha"));
+    cacheCatalogueQueryResults(cache, key, results, 2);
+
+    assert.strictEqual(getCatalogueQueryResultCache(catalogue), cache,
+        "the same catalogue array should reuse its result cache");
+    assert.deepStrictEqual(cache.get(key), results);
+    assert.deepStrictEqual(cache.get(key).slice(1, 3).map(item => item.id), ["m2", "m3"],
+        "pagination over cached results must preserve provider order");
+
+    const genreKey = createCatalogueQueryCacheKey("alpha", "drama");
+    assert.notStrictEqual(genreKey, key, "the selected genre must be part of the query cache key");
+    cacheCatalogueQueryResults(cache, genreKey, results.filter(item => item.category === "Drama"), 2);
+    const thirdKey = createCatalogueQueryCacheKey("beta", "");
+    cacheCatalogueQueryResults(cache, thirdKey, [catalogue[3]], 2);
+    assert.strictEqual(cache.size, 2, "the cache must remain within its configured entry bound");
+    assert.strictEqual(cache.has(key), false, "oldest search should be evicted when the bound is exceeded");
+
+    const refreshedCatalogue = catalogue.slice();
+    assert.notStrictEqual(getCatalogueQueryResultCache(refreshedCatalogue), cache,
+        "a replacement catalogue array must not reuse potentially stale search results");
+    assert.strictEqual(createCatalogueQueryCacheKey("", "drama"), null,
+        "empty normalized searches should not be cached as ordinary queries");
+}
 
 function testDirectEpisodeLookupUsesExactIndex() {
     const addon = new M3UEPGAddon({ provider: "direct" });
@@ -407,6 +440,42 @@ function testScheduledProgramsCacheParsedTimestamps() {
 }
 
 
+function testScheduledProgramsIndexReturnsOnlyOverlappingPrograms() {
+    const addon = new M3UEPGAddon({ provider: "direct", epgOffsetHours: 0 });
+    const channel = {
+        id: "iptv_test_channel",
+        type: "tv",
+        attributes: { "tvg-id": "test.indexed.channel" }
+    };
+    addon.epgData = {
+        "test.indexed.channel": [
+            { start: "20261018000000 +0000", stop: "20261018123000 +0000", title: "Long overnight programme" },
+            { start: "20261018100000 +0000", stop: "20261018110000 +0000", title: "Earlier programme" },
+            { start: "20261018120000 +0000", stop: "20261018130000 +0000", title: "Noon programme" },
+            { start: "20261018130000 +0000", stop: "20261018140000 +0000", title: "Afternoon programme" },
+            { start: "20261018150000 +0000", stop: "20261018160000 +0000", title: "Later programme" }
+        ]
+    };
+
+    const start = Date.parse("2026-10-18T12:00:00Z");
+    const end = Date.parse("2026-10-18T14:00:00Z");
+    const first = addon.getScheduledPrograms(channel, start, end);
+    assert.deepStrictEqual(first.map(program => program.title), [
+        "Long overnight programme", "Noon programme", "Afternoon programme"
+    ], "include long programmes overlapping the window and exclude programmes ending at its start");
+
+    const second = addon.getScheduledPrograms(channel, start, end);
+    assert.deepStrictEqual(second, first, "repeated guide requests should reuse the indexed programme window");
+
+    const nextDay = addon.getScheduledPrograms(
+        channel,
+        Date.parse("2026-10-19T00:00:00Z"),
+        Date.parse("2026-10-19T02:00:00Z")
+    );
+    assert.deepStrictEqual(nextDay, [], "a guide window with no overlapping programmes should be empty");
+}
+
+
 async function testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot() {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-persistent-data-"));
     const data = {
@@ -465,6 +534,40 @@ async function testPersistentCatalogMetadataCacheRoundTripAndStaleFallback() {
     }
 }
 
+async function testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFailure() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-catalog-cache-write-failure-"));
+    const blockedDirectory = path.join(root, "not-a-directory");
+    await fs.writeFile(blockedDirectory, "block directory creation");
+    let cache;
+    try {
+        cache = new PersistentCatalogMetaCache("test-config", {
+            directory: blockedDirectory, ttlMs: 60000, staleRetentionMs: 120000, maxEntries: 10
+        });
+        await cache.set("movie-1", { id: "movie-1", name: "Cached movie" });
+        if (cache.writeTimer) {
+            clearTimeout(cache.writeTimer);
+            cache.writeTimer = null;
+        }
+
+        await assert.rejects(() => cache.flush(), /EEXIST|ENOTDIR/);
+        assert.strictEqual(cache.dirty, true,
+            "a failed disk write must leave the cache dirty so a later flush can retry");
+        assert.strictEqual(cache.writeRetryDelayMs, 2000,
+            "the first failed write should increase the next retry delay");
+        assert.ok(cache.writeTimer,
+            "a failed write should schedule a delayed retry rather than dropping the update");
+
+        // Avoid leaving the deliberately failing retry timer alive in this test.
+        if (cache.writeTimer) {
+            clearTimeout(cache.writeTimer);
+            cache.writeTimer = null;
+        }
+    } finally {
+        if (cache?.writeTimer) clearTimeout(cache.writeTimer);
+        await fs.rm(root, { recursive: true, force: true });
+    }
+}
+
 async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     let calls = 0;
@@ -516,6 +619,96 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     assert.ok(maxActive <= 3, "metadata enrichment concurrency should remain capped at three");
     assert.deepStrictEqual(addon.catalogMetaQueue, []);
     assert.strictEqual(addon.catalogMetaQueueHead, 0);
+}
+
+async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    addon.persistentCatalogMetaCache = {
+        get: async () => null,
+        set: async () => {},
+        flush: async () => {},
+    };
+    const crypto = require("crypto");
+    const fingerprint = items => crypto.createHash("sha256")
+        .update(items.map(item => String(item?.id || "")).join("\n"))
+        .digest("hex");
+    addon.catalogPrefetchLastCompleted.set("movie", Date.now());
+    addon.catalogPrefetchLastFingerprint.set("movie", fingerprint(addon.movies));
+
+    let enriched = [];
+    addon.enrichCatalogMetaItems = async batch => {
+        enriched.push(...batch.map(item => item.id));
+        for (const item of batch) {
+            addon.cacheCatalogMetaPreview(item.id, { name: item.name, description: "Cached preview" });
+        }
+    };
+
+    // An unchanged catalogue should respect the daily completion shortcut.
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    assert.strictEqual(addon.catalogPrefetchJobs.has("movie"), false);
+
+    // A changed catalogue must bypass that shortcut and warm the newly added item.
+    addon.movies.push({ id: "movie-2", type: "movie", name: "Movie 2" });
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const job = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(job, "a changed catalogue should start a new warm-up");
+    await job;
+    assert.deepStrictEqual(enriched, ["movie-1", "movie-2"]);
+    assert.strictEqual(addon.catalogPrefetchLastFingerprint.get("movie"), fingerprint(addon.movies));
+}
+
+async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    const crypto = require("crypto");
+    const fingerprint = crypto.createHash("sha256")
+        .update(addon.movies.map(item => String(item?.id || "")).join("\n"))
+        .digest("hex");
+    const completedAt = Date.now();
+    let enrichmentCalls = 0;
+    addon.persistentCatalogMetaCache = {
+        get: async key => key === "__catalog_prefetch_status__:movie"
+            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 1 }, fresh: true }
+            : null,
+        set: async () => {},
+        flush: async () => {},
+    };
+    addon.enrichCatalogMetaItems = async () => { enrichmentCalls++; };
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const job = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(job, "startup should check the persisted completion marker");
+    await job;
+    assert.strictEqual(enrichmentCalls, 0,
+        "a matching recent persistent marker should avoid repeating the full warm-up after restart");
+    assert.strictEqual(addon.catalogPrefetchLastFingerprint.get("movie"), fingerprint);
+    assert.strictEqual(addon.catalogPrefetchLastCompleted.get("movie"), completedAt);
+}
+
+async function testCataloguePrefetchBacksOffAfterIncompleteWarmup() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    let enrichmentCalls = 0;
+    addon.enrichCatalogMetaItems = async () => {
+        enrichmentCalls++;
+        // Simulate a failed metadata lookup: no usable preview is cached.
+    };
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const firstJob = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(firstJob, "the first warm-up should start");
+    await firstJob;
+    assert.ok(
+        addon.catalogPrefetchRetryAfter.get("movie") > Date.now(),
+        "an incomplete warm-up should schedule a retry backoff"
+    );
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    assert.strictEqual(
+        enrichmentCalls, 1,
+        "repeated catalogue requests should not immediately restart a failed full-catalogue scan"
+    );
 }
 
 async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
@@ -621,13 +814,19 @@ async function main() {
         testSearchSupportsReorderedWordsAndPartialTyping,
         testNormalizedSearchMatcherPreservesSearchBehaviour,
         testSearchAllowsConservativeSingleCharacterTypos,
+        testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
+        testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,
         testDirectEpisodeLookupUsesExactIndex,
         testPersistentCatalogMetadataCacheRoundTripAndStaleFallback,
+        testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFailure,
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
+        testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
+        testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
+        testCataloguePrefetchBacksOffAfterIncompleteWarmup,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
         testMovieMetadataMapping,

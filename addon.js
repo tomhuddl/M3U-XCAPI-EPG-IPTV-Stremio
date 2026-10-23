@@ -134,6 +134,35 @@ function getNormalizedSearchText(value) {
 // this per-catalogue index keeps normalized titles reusable across successive queries.
 const catalogueSearchIndexes = new WeakMap();
 
+// Cache the filtered item list for recently repeated identical searches. The
+// cache is keyed by catalogue-array identity, so replacing a provider catalogue
+// naturally invalidates old results without risking stale pagination.
+const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
+    process.env.SEARCH_RESULT_CACHE_MAX, 12, 1, 50
+);
+const catalogueQueryResultCaches = new WeakMap();
+
+function getCatalogueQueryResultCache(items) {
+    let cache = catalogueQueryResultCaches.get(items);
+    if (!cache) {
+        cache = new Map();
+        catalogueQueryResultCaches.set(items, cache);
+    }
+    return cache;
+}
+
+function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
+    return normalizedSearchQuery ? JSON.stringify([selectedGenre, normalizedSearchQuery]) : null;
+}
+
+function cacheCatalogueQueryResults(cache, key, filtered, maxEntries = CATALOGUE_QUERY_RESULT_CACHE_MAX) {
+    if (!cache || !key) return;
+    cache.delete(key);
+    cache.set(key, filtered);
+    while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+}
+
+
 function getCatalogueSearchIndex(items) {
     let index = catalogueSearchIndexes.get(items);
     if (index) return { index, built: false };
@@ -325,10 +354,19 @@ class M3UEPGAddon {
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
         this.catalogPrefetchLastCompleted = new Map();
+        // Remember which ordered catalogue the in-memory completion applies to, so
+        // provider catalogue changes can trigger a new warm-up before the daily interval.
+        this.catalogPrefetchLastFingerprint = new Map();
+        // Avoid immediately rescanning thousands of provider items after a partial
+        // warm-up or transient metadata outage. A later request can retry after backoff.
+        this.catalogPrefetchRetryAfter = new Map();
         // Share concurrent foreground/background metadata work for the same item.
         // Without this, a category request and a queued warm-up can race and issue
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
         this.catalogMetaInFlight = new Map();
+        // Track asynchronous disk writes so a completed pre-warm can flush every
+        // metadata preview before its durable completion marker is written.
+        this.catalogMetaPersistWrites = new Set();
         this.catalogMetaQueue = [];
         this.catalogMetaQueueHead = 0;
         this.catalogMetaWorkers = 0;
@@ -336,6 +374,11 @@ class M3UEPGAddon {
         // XMLTV programme timestamps are immutable after parsing; cache their parsed
         // Date values per addon instance to avoid reparsing large guides on each request.
         this.epgTimeCache = new WeakMap();
+        // Reuse chronological programme indexes for repeated guide date requests.
+        this.epgProgramIndexes = new WeakMap();
+        // Index each immutable per-channel programme array once. Prefix maximum
+        // end-times let guide requests skip programmes that cannot overlap the
+        // requested window, including programmes that started much earlier.
         this.lastUpdate = 0;
         this.log = makeLogger(config.debug);
 
@@ -612,26 +655,54 @@ class M3UEPGAddon {
         const sourcePrograms = epgId && this.epgData[epgId];
         if (!Array.isArray(sourcePrograms)) return [];
 
-        const videos = [];
-        for (const program of sourcePrograms) {
-            if (!program || !program.start || !program.stop) continue;
-
-            let times = this.epgTimeCache.get(program);
-            if (!times) {
-                const start = this.parseEPGTime(program.start);
-                const end = this.parseEPGTime(program.stop);
-                times = {
-                    start,
-                    end,
-                    startMs: start instanceof Date ? start.getTime() : NaN,
-                    endMs: end instanceof Date ? end.getTime() : NaN
-                };
-                this.epgTimeCache.set(program, times);
+        // Build once per immutable channel programme array. Prefix maximum end
+        // times preserve long programmes that overlap the window despite starting
+        // well before its first programme.
+        let index = this.epgProgramIndexes.get(sourcePrograms);
+        if (!index) {
+            index = [];
+            for (const program of sourcePrograms) {
+                if (!program || !program.start || !program.stop) continue;
+                let times = this.epgTimeCache.get(program);
+                if (!times) {
+                    const start = this.parseEPGTime(program.start);
+                    const end = this.parseEPGTime(program.stop);
+                    times = { start, end, startMs: start instanceof Date ? start.getTime() : NaN, endMs: end instanceof Date ? end.getTime() : NaN };
+                    this.epgTimeCache.set(program, times);
+                }
+                if (!Number.isFinite(times.startMs) || !Number.isFinite(times.endMs) || times.endMs <= times.startMs) continue;
+                index.push({ program, times });
             }
-            const { start, end, startMs, endMs } = times;
-            if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
-            if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
+            index.sort((a, b) => a.times.startMs - b.times.startMs);
+            let maxEnd = -Infinity;
+            for (const entry of index) {
+                maxEnd = Math.max(maxEnd, entry.times.endMs);
+                entry.prefixMaxEndMs = maxEnd;
+            }
+            this.epgProgramIndexes.set(sourcePrograms, index);
+        }
 
+        // Binary-search the first possible overlap and the first programme
+        // starting outside the requested window.
+        let low = 0, high = index.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (index[mid].prefixMaxEndMs <= windowStartMs) low = mid + 1;
+            else high = mid;
+        }
+        const first = low;
+        low = first; high = index.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (index[mid].times.startMs < windowEndMs) low = mid + 1;
+            else high = mid;
+        }
+
+        const videos = [];
+        for (let i = first; i < low; i++) {
+            const { program, times } = index[i];
+            const { start, end, startMs, endMs } = times;
+            if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
             const video = {
                 id: `${channel.id}:epg:${start.toISOString()}`,
                 title: String(program.title || 'Untitled programme'),
@@ -644,10 +715,8 @@ class M3UEPGAddon {
             if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
             videos.push(video);
         }
-        // startTime values are normalized ISO-8601 UTC strings, so lexical order is chronological.
-        return videos.sort((a, b) => a.startTime.localeCompare(b.startTime));
+        return videos;
     }
-
     async ensureSeriesTmdbId(seriesId) {
         if (!seriesId) return null;
         const cacheKey = 'series-tmdb-id:' + String(seriesId);
@@ -1095,50 +1164,122 @@ class M3UEPGAddon {
     cacheCatalogMetaPreview(id, preview, persist = true) {
         this.catalogMetaCache.set(id, preview);
         if (persist) {
-            this.persistentCatalogMetaCache.set(id, preview).catch(error => {
+            const write = this.persistentCatalogMetaCache.set(id, preview);
+            this.catalogMetaPersistWrites.add(write);
+            write.catch(error => {
                 this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
-            });
+            }).finally(() => this.catalogMetaPersistWrites.delete(write));
         }
     }
 
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
         if (type !== 'movie' && type !== 'series') return;
         if (this.catalogPrefetchJobs.has(type)) return;
+        if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
             process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
             60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
         );
-        const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
-        if (Date.now() - lastCompleted < refreshInterval) return;
-
         // Walk the unfiltered provider catalogue so a search for a small subset does
         // not accidentally define the scope of the background warm-up.
         const items = type === 'movie' ? this.movies : this.series;
         if (!Array.isArray(items) || !items.length) return;
+        const catalogueFingerprint = crypto.createHash('sha256')
+            .update(items.map(item => String(item?.id || '')).join('\n'))
+            .digest('hex');
+        const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
+        if (Date.now() - lastCompleted < refreshInterval &&
+            this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
 
+        this.log.info('Starting catalogue metadata warm-up check', {
+            type, total: items.length, pageSize, concurrency
+        });
         const job = (async () => {
             const startedAt = Date.now();
+            const statusKey = '__catalog_prefetch_status__:' + type;
+            // Persist the completion timestamp and catalogue fingerprint so Railway
+            // restarts do not repeat a fresh warm-up, but changed provider catalogues
+            // still trigger a full metadata pass even when the item count is unchanged.
+            const persistedStatus = await this.persistentCatalogMetaCache.get(statusKey);
+            const persistedCompletedAt = Number(persistedStatus?.value?.completedAt) || 0;
+            const sameCatalogue = persistedStatus?.value?.catalogueFingerprint === catalogueFingerprint;
+            // The completion marker has its own completedAt timestamp; do not
+            // couple daily scheduling to the metadata entries' freshness TTL.
+            if (persistedStatus && sameCatalogue &&
+                Date.now() - persistedCompletedAt < refreshInterval) {
+                this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
+                this.catalogPrefetchRetryAfter.delete(type);
+                this.log.info('Persistent catalogue metadata is already warm', {
+                    type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                });
+                return;
+            }
+
             let processed = 0;
+            let missingMetadata = 0;
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
                 await this.enrichCatalogMetaItems(batch, concurrency);
                 processed += batch.length;
+                // A warm-up only counts as complete if every item has a usable card
+                // preview in the cache. Missing lookups must be retried later rather
+                // than permanently recording a false-success completion marker.
+                for (const item of batch) {
+                    const cached = this.catalogMetaCache.get(item.id);
+                    if (!cached || !String(cached.name || '').trim()) missingMetadata++;
+                }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
-                        type, processed, total: items.length,
+                        type, processed, total: items.length, missingMetadata,
                     });
                 }
             }
-            this.catalogPrefetchLastCompleted.set(type, Date.now());
-            this.log.debug('Background catalogue prefetch complete', {
-                type, processed, total: items.length, ms: Date.now() - startedAt,
-            });
+
+            if (missingMetadata === 0) {
+                const completedAt = Date.now();
+                // All set() calls are asynchronous because they initialize the
+                // persistent store on first use. Wait for them before flushing, so the
+                // completion marker can never get ahead of the actual card previews.
+                while (this.catalogMetaPersistWrites.size) {
+                    await Promise.allSettled([...this.catalogMetaPersistWrites]);
+                }
+                await this.persistentCatalogMetaCache.set(statusKey, {
+                    completedAt,
+                    catalogueCount: items.length,
+                    catalogueFingerprint,
+                    version: 1
+                });
+                // Ensure metadata and its completion marker reach the persistent
+                // volume before reporting the warm-up as durable.
+                await this.persistentCatalogMetaCache.flush();
+                this.catalogPrefetchLastCompleted.set(type, completedAt);
+                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
+                this.catalogPrefetchRetryAfter.delete(type);
+                this.log.info('Persistent catalogue metadata warm-up complete', {
+                    type, processed, total: items.length, ms: Date.now() - startedAt
+                });
+            } else {
+                const retryDelay = parsePositiveInteger(
+                    process.env.CATALOG_PREFETCH_RETRY_MS, 60 * 60 * 1000,
+                    5 * 60 * 1000, 24 * 60 * 60 * 1000
+                );
+                this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
+                this.log.warn('Catalogue metadata warm-up incomplete; will retry after backoff', {
+                    type, processed, total: items.length, missingMetadata, retryDelay
+                });
+            }
         })();
 
         this.catalogPrefetchJobs.set(type, job);
         job.catch(error => {
+            const retryDelay = parsePositiveInteger(
+                process.env.CATALOG_PREFETCH_RETRY_MS, 60 * 60 * 1000,
+                5 * 60 * 1000, 24 * 60 * 60 * 1000
+            );
+            this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
             this.log.warn('Continuous catalogue prefetch failed:', error?.name || 'Error');
         }).finally(() => {
             if (this.catalogPrefetchJobs.get(type) === job) {
@@ -1461,6 +1602,18 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
+        // Start the full movie/series metadata warm-up as soon as this configured
+        // addon is built, rather than waiting for the first Discover request.
+        // It is intentionally non-blocking: a saved last-known-good cache remains
+        // available while missing/stale metadata is refreshed in the background.
+        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100);
+        const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
+        if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
+            addonInstance.startContinuousCatalogPrefetch('movie', metadataPrefetchPageSize, metadataPrefetchConcurrency);
+            if (addonInstance.config.includeSeries !== false) {
+                addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
+            }
+        }
         // Keep the catalogue and guide refreshed daily even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
@@ -1498,16 +1651,38 @@ async function createAddon(config) {
                 let searchFilterMs = 0;
                 let searchIndexBuilt = false;
 
+                const normalizedSearchQuery = extra.search ? getNormalizedSearchText(extra.search) : '';
+                const selectedGenre = extra.genre && normalizeGenre(extra.genre) !== 'all channels'
+                    ? normalizeGenre(extra.genre)
+                    : '';
+                const queryCacheKey = normalizedSearchQuery
+                    ? selectedGenre + '\u0000' + normalizedSearchQuery
+                    : null;
+                const queryResultCache = queryCacheKey ? getCatalogueQueryResultCache(items) : null;
+                let queryCacheHit = false;
+                // Preserve existing behaviour for punctuation-only searches: they
+                // normalize to an empty query and must return no matches, not all items.
+                if (extra.search && !normalizedSearchQuery) {
+                    filtered = [];
+                    queryCacheHit = true;
+                }
+                if (!queryCacheHit && queryResultCache && queryResultCache.has(queryCacheKey)) {
+                    filtered = queryResultCache.get(queryCacheKey);
+                    // Refresh insertion order for bounded LRU eviction.
+                    queryResultCache.delete(queryCacheKey);
+                    queryResultCache.set(queryCacheKey, filtered);
+                    queryCacheHit = true;
+                }
+
                 // If specific genre selected, reuse normalised item categories across
                 // requests. Matching remains exact and preserves catalogue order.
                 const genreFilterStartedAt = Date.now();
-                if (extra.genre && normalizeGenre(extra.genre) !== 'all channels') {
+                if (!queryCacheHit && selectedGenre) {
                     const genreIndexStartedAt = Date.now();
                     const genreIndexResult = getCatalogueGenreIndex(items);
                     const genreIndex = genreIndexResult.index;
                     genreIndexBuilt = genreIndexResult.built;
                     genreIndexMs = Date.now() - genreIndexStartedAt;
-                    const selectedGenre = normalizeGenre(extra.genre);
                     filtered = filtered.filter(i => {
                         const indexedGenre = genreIndex.get(i);
                         if (indexedGenre !== undefined) return indexedGenre === selectedGenre;
@@ -1520,12 +1695,12 @@ async function createAddon(config) {
                 // Keep normalized titles indexed per immutable catalogue array. This
                 // avoids repeatedly normalizing thousands of titles on every search,
                 // without changing matching rules, result order, or displayed titles.
-                if (extra.search) {
+                if (!queryCacheHit && normalizedSearchQuery) {
                     const indexStartedAt = Date.now();
                     const searchIndexResult = getCatalogueSearchIndex(items);
                     const searchIndex = searchIndexResult.index;
                     searchIndexBuilt = searchIndexResult.built;
-                    const matcher = createNormalizedSearchMatcher(getNormalizedSearchText(extra.search));
+                    const matcher = createNormalizedSearchMatcher(normalizedSearchQuery);
                     searchIndexMs = Date.now() - indexStartedAt;
 
                     const searchFilterStartedAt = Date.now();
@@ -1536,6 +1711,10 @@ async function createAddon(config) {
                             : matcher(getNormalizedSearchText(i.name));
                     });
                     searchFilterMs = Date.now() - searchFilterStartedAt;
+                }
+
+                if (queryResultCache && !queryCacheHit) {
+                    cacheCatalogueQueryResults(queryResultCache, queryCacheKey, filtered);
                 }
                 
                 // Keep every movie/series Discover batch small enough to enrich fully
@@ -1631,18 +1810,11 @@ async function createAddon(config) {
                     const cached = addonInstance.catalogMetaCache.get(i.id);
                     if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
 
-                    // The current page has already completed foreground enrichment.
-                    // If no authoritative result was available, return the best base
-                    // metadata without scheduling a background mutation of this card.
-                    const firstPass = { ...meta, id: i.id, type: i.type };
-                    delete firstPass.genres;
-                    delete firstPass.cast;
-                    delete firstPass.description;
-                    delete firstPass.runtime;
-                    delete firstPass.releaseInfo;
-                    delete firstPass.year;
-                    delete firstPass.links;
-                    return firstPass;
+                    // Foreground enrichment has finished for this page. If TMDb or
+                    // the provider could not supply a richer preview, retain the base
+                    // provider metadata rather than stripping fields from the card.
+                    // We never mutate this already-built response in the background.
+                    return { ...meta, id: i.id, type: i.type };
                 });
                 
                 const responseBuildMs = Date.now() - responseBuildStartedAt;
@@ -1661,6 +1833,7 @@ async function createAddon(config) {
                         searchIndexMs,
                         searchIndexBuilt,
                         searchFilterMs,
+                        queryCacheHit,
                         paginationMs,
                         enrichmentMs,
                         responseBuildMs,
@@ -1792,3 +1965,6 @@ module.exports.normalizeSearchText = normalizeSearchText;
 module.exports.matchesSearchText = matchesSearchText;
 module.exports.matchesNormalizedSearchText = matchesNormalizedSearchText;
 module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
+module.exports.getCatalogueQueryResultCache = getCatalogueQueryResultCache;
+module.exports.createCatalogueQueryCacheKey = createCatalogueQueryCacheKey;
+module.exports.cacheCatalogueQueryResults = cacheCatalogueQueryResults;
