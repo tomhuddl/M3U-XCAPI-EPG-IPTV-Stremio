@@ -325,6 +325,9 @@ class M3UEPGAddon {
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
         this.catalogPrefetchLastCompleted = new Map();
+        // Avoid immediately rescanning thousands of provider items after a partial
+        // warm-up or transient metadata outage. A later request can retry after backoff.
+        this.catalogPrefetchRetryAfter = new Map();
         // Share concurrent foreground/background metadata work for the same item.
         // Without this, a category request and a queued warm-up can race and issue
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
@@ -1109,6 +1112,7 @@ class M3UEPGAddon {
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
         if (type !== 'movie' && type !== 'series') return;
         if (this.catalogPrefetchJobs.has(type)) return;
+        if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
             process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
@@ -1137,6 +1141,7 @@ class M3UEPGAddon {
             if (persistedStatus?.fresh && sameCatalogue &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                this.catalogPrefetchRetryAfter.delete(type);
                 this.log.debug('Persistent catalogue metadata is already warm', {
                     type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
                 });
@@ -1182,18 +1187,29 @@ class M3UEPGAddon {
                 // volume before reporting the warm-up as durable.
                 await this.persistentCatalogMetaCache.flush();
                 this.catalogPrefetchLastCompleted.set(type, completedAt);
+                this.catalogPrefetchRetryAfter.delete(type);
                 this.log.info('Persistent catalogue metadata warm-up complete', {
                     type, processed, total: items.length, ms: Date.now() - startedAt
                 });
             } else {
-                this.log.warn('Catalogue metadata warm-up incomplete; will retry', {
-                    type, processed, total: items.length, missingMetadata
+                const retryDelay = parsePositiveInteger(
+                    process.env.CATALOG_PREFETCH_RETRY_MS, 60 * 60 * 1000,
+                    5 * 60 * 1000, 24 * 60 * 60 * 1000
+                );
+                this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
+                this.log.warn('Catalogue metadata warm-up incomplete; will retry after backoff', {
+                    type, processed, total: items.length, missingMetadata, retryDelay
                 });
             }
         })();
 
         this.catalogPrefetchJobs.set(type, job);
         job.catch(error => {
+            const retryDelay = parsePositiveInteger(
+                process.env.CATALOG_PREFETCH_RETRY_MS, 60 * 60 * 1000,
+                5 * 60 * 1000, 24 * 60 * 60 * 1000
+            );
+            this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
             this.log.warn('Continuous catalogue prefetch failed:', error?.name || 'Error');
         }).finally(() => {
             if (this.catalogPrefetchJobs.get(type) === job) {
