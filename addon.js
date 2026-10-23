@@ -345,6 +345,8 @@ class M3UEPGAddon {
         // XMLTV programme timestamps are immutable after parsing; cache their parsed
         // Date values per addon instance to avoid reparsing large guides on each request.
         this.epgTimeCache = new WeakMap();
+        // Reuse chronological programme indexes for repeated guide date requests.
+        this.epgProgramIndexes = new WeakMap();
         // Index each immutable per-channel programme array once. Prefix maximum
         // end-times let guide requests skip programmes that cannot overlap the
         // requested window, including programmes that started much earlier.
@@ -624,42 +626,35 @@ class M3UEPGAddon {
         const sourcePrograms = epgId && this.epgData[epgId];
         if (!Array.isArray(sourcePrograms)) return [];
 
-        // Build a chronological index once per source array. The prefix maximum
-        // end time is essential: a long programme may overlap this window even
-        // when its start time is far before the first programme in the window.
+        // Build once per immutable channel programme array. Prefix maximum end
+        // times preserve long programmes that overlap the window despite starting
+        // well before its first programme.
         let index = this.epgProgramIndexes.get(sourcePrograms);
         if (!index) {
-            const ordered = [];
+            index = [];
             for (const program of sourcePrograms) {
                 if (!program || !program.start || !program.stop) continue;
                 let times = this.epgTimeCache.get(program);
                 if (!times) {
                     const start = this.parseEPGTime(program.start);
                     const end = this.parseEPGTime(program.stop);
-                    times = {
-                        start,
-                        end,
-                        startMs: start instanceof Date ? start.getTime() : NaN,
-                        endMs: end instanceof Date ? end.getTime() : NaN
-                    };
+                    times = { start, end, startMs: start instanceof Date ? start.getTime() : NaN, endMs: end instanceof Date ? end.getTime() : NaN };
                     this.epgTimeCache.set(program, times);
                 }
-                if (!Number.isFinite(times.startMs) || !Number.isFinite(times.endMs) ||
-                    times.endMs <= times.startMs) continue;
-                ordered.push({ program, times });
+                if (!Number.isFinite(times.startMs) || !Number.isFinite(times.endMs) || times.endMs <= times.startMs) continue;
+                index.push({ program, times });
             }
-            ordered.sort((a, b) => a.times.startMs - b.times.startMs);
+            index.sort((a, b) => a.times.startMs - b.times.startMs);
             let maxEnd = -Infinity;
-            for (const entry of ordered) {
+            for (const entry of index) {
                 maxEnd = Math.max(maxEnd, entry.times.endMs);
                 entry.prefixMaxEndMs = maxEnd;
             }
-            index = ordered;
             this.epgProgramIndexes.set(sourcePrograms, index);
         }
 
-        // First entry whose prefix contains any programme ending after the
-        // requested start; first entry starting at/after the requested end.
+        // Binary-search the first possible overlap and the first programme
+        // starting outside the requested window.
         let low = 0, high = index.length;
         while (low < high) {
             const mid = (low + high) >>> 1;
@@ -667,21 +662,18 @@ class M3UEPGAddon {
             else high = mid;
         }
         const first = low;
-        low = first;
-        high = index.length;
+        low = first; high = index.length;
         while (low < high) {
             const mid = (low + high) >>> 1;
             if (index[mid].times.startMs < windowEndMs) low = mid + 1;
             else high = mid;
         }
-        const last = low;
 
         const videos = [];
-        for (let i = first; i < last; i++) {
+        for (let i = first; i < low; i++) {
             const { program, times } = index[i];
             const { start, end, startMs, endMs } = times;
             if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
-
             const video = {
                 id: `${channel.id}:epg:${start.toISOString()}`,
                 title: String(program.title || 'Untitled programme'),
@@ -694,11 +686,8 @@ class M3UEPGAddon {
             if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
             videos.push(video);
         }
-        // The index is chronological already; preserve the existing stable order
-        // for equal start times and avoid sorting the filtered result again.
         return videos;
     }
-
     async ensureSeriesTmdbId(seriesId) {
         if (!seriesId) return null;
         const cacheKey = 'series-tmdb-id:' + String(seriesId);
