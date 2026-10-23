@@ -8,6 +8,7 @@ const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
+const omdbMetadata = require("./src/js/omdbMetadata");
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
@@ -1055,7 +1056,8 @@ class M3UEPGAddon {
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
             links: [
-                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
+                ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.links || [])
             ],
             videos
@@ -1392,6 +1394,7 @@ class M3UEPGAddon {
             const providerLookupMs = Date.now() - providerLookupStartedAt;
             const tmdbLookupStartedAt = Date.now();
             const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
+            const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
             this.log.debug('Catalogue metadata stages', {
                 type: 'series',
                 id: seriesItem.id,
@@ -1413,7 +1416,9 @@ class M3UEPGAddon {
                 genres: tmdb.genres,
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
-                runtime: tmdb.runtime,
+                runtime: tmdb.runtime || omdb?.runtime,
+                imdbId: tmdb.imdbId || omdb?.imdbId,
+                imdbRating: omdb?.imdbRating,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: [],
@@ -1436,6 +1441,7 @@ class M3UEPGAddon {
         const providerLookupMs = Date.now() - providerLookupStartedAt;
         const tmdbLookupStartedAt = Date.now();
         const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
+        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
         this.log.debug('Catalogue metadata stages', {
             type: 'movie',
             id: item.id,
@@ -1457,12 +1463,15 @@ class M3UEPGAddon {
             genres: tmdb.genres,
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
-            runtime: tmdb.runtime,
+            runtime: tmdb.runtime || omdb?.runtime,
+            imdbId: tmdb.imdbId || omdb?.imdbId,
+            imdbRating: omdb?.imdbRating,
             director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: [],
             links: [
+                ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                 ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.links || [])
             ]
