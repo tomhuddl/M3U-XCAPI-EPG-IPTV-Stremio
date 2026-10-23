@@ -240,6 +240,7 @@ function mapMovieMetadata(details, credits, videos, images) {
   const year = dateYear(details.release_date);
   return stripEmpty({
     name: details.title,
+    imdbId: nonEmpty(details.imdb_id) || nonEmpty(details.external_ids?.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
@@ -261,7 +262,7 @@ async function getMovieCatalogMetadata(tmdbId) {
   if (!id) return null;
   // Include images in the appended response so Discover can use TMDb's
   // transparent title logo without adding a second network round-trip per movie.
-  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null");
+  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images,external_ids&include_image_language=en,null");
   return mapMovieMetadata(details, details?.credits, null, details?.images);
 }
 
@@ -270,7 +271,7 @@ async function getSeriesCatalogMetadata(tmdbId) {
   if (!id) return null;
   // Append images alongside aggregate credits so Discover receives the
   // transparent title logo without an extra request for each series.
-  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null");
+  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null");
   return mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
 }
 
@@ -304,6 +305,7 @@ function mapSeriesMetadata(details, credits, videos, images) {
     : undefined;
   return stripEmpty({
     name: details.name,
+    imdbId: nonEmpty(details.external_ids?.imdb_id) || nonEmpty(details.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
