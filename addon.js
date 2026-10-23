@@ -1119,22 +1119,61 @@ class M3UEPGAddon {
 
         const job = (async () => {
             const startedAt = Date.now();
+            const statusKey = '__catalog_prefetch_status__:' + type;
+            // Persist the completion timestamp so Railway restarts do not trigger a
+            // needless full-catalogue TMDb walk when the daily refresh is not due.
+            const persistedStatus = await this.persistentCatalogMetaCache.get(statusKey);
+            const persistedCompletedAt = Number(persistedStatus?.value?.completedAt) || 0;
+            const sameCatalogueSize = Number(persistedStatus?.value?.catalogueCount) === items.length;
+            if (persistedStatus?.fresh && sameCatalogueSize &&
+                Date.now() - persistedCompletedAt < refreshInterval) {
+                this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                this.log.debug('Persistent catalogue metadata is already warm', {
+                    type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                });
+                return;
+            }
+
             let processed = 0;
+            let missingMetadata = 0;
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
                 await this.enrichCatalogMetaItems(batch, concurrency);
                 processed += batch.length;
+                // A warm-up only counts as complete if every item has a usable card
+                // preview in the cache. Missing lookups must be retried later rather
+                // than permanently recording a false-success completion marker.
+                for (const item of batch) {
+                    const cached = this.catalogMetaCache.get(item.id);
+                    if (!cached || !String(cached.name || '').trim()) missingMetadata++;
+                }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
-                        type, processed, total: items.length,
+                        type, processed, total: items.length, missingMetadata,
                     });
                 }
             }
-            this.catalogPrefetchLastCompleted.set(type, Date.now());
-            this.log.debug('Background catalogue prefetch complete', {
-                type, processed, total: items.length, ms: Date.now() - startedAt,
-            });
+
+            if (missingMetadata === 0) {
+                const completedAt = Date.now();
+                await this.persistentCatalogMetaCache.set(statusKey, {
+                    completedAt,
+                    catalogueCount: items.length,
+                    version: 1
+                });
+                // Ensure metadata and its completion marker reach the persistent
+                // volume before reporting the warm-up as durable.
+                await this.persistentCatalogMetaCache.flush();
+                this.catalogPrefetchLastCompleted.set(type, completedAt);
+                this.log.info('Persistent catalogue metadata warm-up complete', {
+                    type, processed, total: items.length, ms: Date.now() - startedAt
+                });
+            } else {
+                this.log.warn('Catalogue metadata warm-up incomplete; will retry', {
+                    type, processed, total: items.length, missingMetadata
+                });
+            }
         })();
 
         this.catalogPrefetchJobs.set(type, job);
@@ -1461,6 +1500,18 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
+        // Start the full movie/series metadata warm-up as soon as this configured
+        // addon is built, rather than waiting for the first Discover request.
+        // It is intentionally non-blocking: a saved last-known-good cache remains
+        // available while missing/stale metadata is refreshed in the background.
+        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100);
+        const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
+        if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
+            addonInstance.startContinuousCatalogPrefetch('movie', metadataPrefetchPageSize, metadataPrefetchConcurrency);
+            if (addonInstance.config.includeSeries !== false) {
+                addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
+            }
+        }
         // Keep the catalogue and guide refreshed daily even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
