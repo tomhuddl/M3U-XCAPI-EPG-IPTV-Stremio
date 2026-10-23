@@ -1186,7 +1186,7 @@ class M3UEPGAddon {
         const items = type === 'movie' ? this.movies : this.series;
         if (!Array.isArray(items) || !items.length) return;
         const catalogueFingerprint = crypto.createHash('sha256')
-            .update(items.map(item => String(item?.id || '')).join('\\n'))
+            .update(items.map(item => String(item?.id || '')).join('\n'))
             .digest('hex');
         const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
         if (Date.now() - lastCompleted < refreshInterval &&
