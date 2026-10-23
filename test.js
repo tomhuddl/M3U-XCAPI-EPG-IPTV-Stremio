@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults, getCatalogueFingerprint } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -16,6 +16,23 @@ const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
 const { rebuildDirectEpisodeIndexes } = require("./src/js/providers/directProvider");
+
+function testCatalogueFingerprintIsStableAndOrderSensitive() {
+    const catalogue = [
+        { id: "movie-a", name: "A" },
+        { id: "movie-b", name: "B" }
+    ];
+    const first = getCatalogueFingerprint(catalogue);
+    assert.strictEqual(getCatalogueFingerprint(catalogue), first,
+        "the same immutable catalogue array should reuse its fingerprint");
+    assert.notStrictEqual(getCatalogueFingerprint(catalogue.slice()), "",
+        "a replacement catalogue array should still receive a fingerprint");
+    assert.notStrictEqual(
+        getCatalogueFingerprint([{ id: "movie-b" }, { id: "movie-a" }]),
+        first,
+        "catalogue ordering must remain part of the fingerprint"
+    );
+}
 
 function testCatalogueQueryResultCacheIsBoundedAndPreservesPagination() {
     const catalogue = [
@@ -815,6 +832,7 @@ async function main() {
         testNormalizedSearchMatcherPreservesSearchBehaviour,
         testSearchAllowsConservativeSingleCharacterTypos,
         testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
+        testCatalogueFingerprintIsStableAndOrderSensitive,
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
         testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,
