@@ -4,7 +4,9 @@ const fs = require("fs/promises");
 const path = require("path");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
+// A full movie + series catalogue can exceed 64 MiB once metadata is enriched.
+// Allow room for the current ~27k-title library while still rejecting unexpectedly huge files.
+const MAX_FILE_BYTES = 256 * 1024 * 1024;
 
 function parsePositiveInteger(value, fallback, min, max) {
     const parsed = Number.parseInt(value, 10);
