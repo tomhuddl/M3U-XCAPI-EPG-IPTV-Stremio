@@ -1336,7 +1336,17 @@ class M3UEPGAddon {
         const key = String(id || '');
         if (!key) return null;
         const cached = this.catalogMetaCache.get(key);
-        if (cached !== undefined) return cached;
+        if (cached !== undefined) {
+            // An LRU hit must not keep popular titles permanently exempt from the
+            // 14-day metadata refresh. Check the persisted save timestamp as well.
+            const persisted = await this.persistentCatalogMetaCache.get(key);
+            const refreshInterval = parsePositiveInteger(
+                process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+                60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
+            );
+            if (!persisted || Date.now() - persisted.savedAt < refreshInterval) return cached;
+            // Due entries fall through to the shared in-flight refresh below.
+        }
         const pending = this.catalogMetaInFlight.get(key);
         if (pending) return pending;
 
