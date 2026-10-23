@@ -331,7 +331,7 @@ class M3UEPGAddon {
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
-        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 24 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
@@ -870,12 +870,21 @@ class M3UEPGAddon {
 
     startScheduledRefresh() {
         if (this.refreshTimer) return;
+        const refreshCheckInterval = parsePositiveInteger(process.env.DATA_REFRESH_CHECK_INTERVAL_MS, 60 * 60 * 1000, 5 * 60 * 1000, 6 * 60 * 60 * 1000);
+        // Check hourly against the persisted last-success timestamp, so process restarts
+        // cannot keep postponing the next refresh.
         this.refreshTimer = setInterval(() => {
             if (this.scheduledRefreshInFlight) return;
+            const lastSuccessfulRefresh = Number(this.lastUpdate) || 0;
+            if (lastSuccessfulRefresh && Date.now() - lastSuccessfulRefresh < this.updateInterval) return;
+            this.log.info('Scheduled provider refresh is due', {
+                lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
+                intervalHours: this.updateInterval / (60 * 60 * 1000)
+            });
             this.scheduledRefreshInFlight = this.updateData(true)
                 .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
                 .finally(() => { this.scheduledRefreshInFlight = null; });
-        }, this.updateInterval);
+        }, refreshCheckInterval);
         if (typeof this.refreshTimer.unref === 'function') this.refreshTimer.unref();
     }
 
@@ -1178,7 +1187,7 @@ class M3UEPGAddon {
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
-            process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 12 * 60 * 60 * 1000,
             60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
         );
         // Walk the unfiltered provider catalogue so a search for a small subset does
@@ -1614,7 +1623,7 @@ async function createAddon(config) {
                 addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
             }
         }
-        // Keep the catalogue and guide refreshed daily even if Stremio is idle
+        // Keep the catalogue and guide refreshed every 12 hours even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
 
