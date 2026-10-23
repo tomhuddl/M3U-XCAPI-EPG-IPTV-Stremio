@@ -1606,7 +1606,7 @@ async function createAddon(config) {
         // addon is built, rather than waiting for the first Discover request.
         // It is intentionally non-blocking: a saved last-known-good cache remains
         // available while missing/stale metadata is refreshed in the background.
-        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100);
+        const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100);
         const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
         if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
             addonInstance.startContinuousCatalogPrefetch('movie', metadataPrefetchPageSize, metadataPrefetchConcurrency);
