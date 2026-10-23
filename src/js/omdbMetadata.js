@@ -1,0 +1,69 @@
+const { safeFetch } = require("../../urlSafety");
+const LRUCache = require("../../lruCache");
+
+const API_KEY = (process.env.OMDB_API_KEY || "").trim();
+const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 12 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
+const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MAX_ENTRIES, 2000, 50, 10000), ttl: CACHE_TTL_MS });
+const pending = new Map();
+
+function parsePositiveInteger(value, fallback, min, max) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isSafeInteger(parsed) && parsed >= min ? Math.min(parsed, max) : fallback;
+}
+
+function validImdbId(value) {
+  const id = String(value || "").trim();
+  return /^tt\d{7,10}$/.test(id) ? id : null;
+}
+
+function parseRuntime(value) {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/\b(\d{1,4})\s*min\b/i);
+  return match ? Number(match[1]) : undefined;
+}
+
+async function getByImdbId(value) {
+  const imdbId = validImdbId(value);
+  if (!API_KEY || !imdbId) return null;
+  if (cache.has(imdbId)) return cache.get(imdbId);
+  if (pending.has(imdbId)) return pending.get(imdbId);
+
+  const task = (async () => {
+    try {
+      const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
+        "&apikey=" + encodeURIComponent(API_KEY);
+      const response = await safeFetch(url, {
+        timeout: 8000,
+        reuseConnection: true,
+        headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" }
+      });
+      if (!response || !response.ok) return null;
+      const data = await response.json();
+      if (!data || data.Response !== "True") return null;
+      const ratingValue = Number(data.imdbRating);
+      const result = {
+        imdbId: validImdbId(data.imdbID) || imdbId,
+        imdbRating: Number.isFinite(ratingValue) && ratingValue >= 0 && ratingValue <= 10
+          ? ratingValue.toFixed(1) : undefined,
+        runtimeMinutes: parseRuntime(data.Runtime),
+        runtime: parseRuntime(data.Runtime) ? parseRuntime(data.Runtime) + " min" : undefined,
+      };
+      cache.set(imdbId, result);
+      return result;
+    } catch (error) {
+      // OMDb is optional: a transient outage must never break card delivery.
+      if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
+        console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
+      }
+      return null;
+    }
+  })();
+  pending.set(imdbId, task);
+  try {
+    return await task;
+  } finally {
+    if (pending.get(imdbId) === task) pending.delete(imdbId);
+  }
+}
+
+module.exports = { getByImdbId, validImdbId };
