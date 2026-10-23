@@ -552,6 +552,10 @@ async function testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFail
         await assert.rejects(() => cache.flush(), /EEXIST|ENOTDIR/);
         assert.strictEqual(cache.dirty, true,
             "a failed disk write must leave the cache dirty so a later flush can retry");
+        assert.strictEqual(cache.writeRetryDelayMs, 2000,
+            "the first failed write should increase the next retry delay");
+        assert.ok(cache.writeTimer,
+            "a failed write should schedule a delayed retry rather than dropping the update");
 
         // Avoid leaving the deliberately failing retry timer alive in this test.
         if (cache.writeTimer) {
