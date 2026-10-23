@@ -1722,7 +1722,7 @@ async function createAddon(config) {
                 // page as the user scrolls, so no visible movie/series card depends on a
                 // later background update. Live-TV/EPG retain the existing 100-item size.
                 const catalogPageSize = (args.type === 'movie' || args.type === 'series')
-                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 24, 10, 100)
+                    ? parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100)
                     : 100;
 
                 // Pagination / Skip. Stremio's next-page skip is based on the number
