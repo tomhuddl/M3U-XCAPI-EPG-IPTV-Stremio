@@ -152,7 +152,7 @@ function getCatalogueQueryResultCache(items) {
 }
 
 function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
-    return normalizedSearchQuery ? selectedGenre + '\\u0000' + normalizedSearchQuery : null;
+    return normalizedSearchQuery ? JSON.stringify([selectedGenre, normalizedSearchQuery]) : null;
 }
 
 function cacheCatalogueQueryResults(cache, key, filtered, maxEntries = CATALOGUE_QUERY_RESULT_CACHE_MAX) {
