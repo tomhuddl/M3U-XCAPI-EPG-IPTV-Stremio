@@ -4,10 +4,10 @@ const fs = require("fs");
 const path = require("path");
 
 const API_KEY = (process.env.OMDB_API_KEY || "").trim();
-const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 12 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
+const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MAX_ENTRIES, 2000, 50, 10000), ttl: CACHE_TTL_MS });
 const pending = new Map();
-const DAILY_REQUEST_LIMIT = parsePositiveInteger(process.env.OMDB_DAILY_REQUEST_LIMIT, 900, 1, 100000);
+const DAILY_REQUEST_LIMIT = parsePositiveInteger(process.env.OMDB_DAILY_REQUEST_LIMIT, 100000, 1, 100000);
 const DATA_DIR = process.env.PERSISTENT_DATA_DIR || path.join(process.cwd(), "data");
 const USAGE_FILE = path.join(DATA_DIR, "omdb-usage.json");
 let usageState = null;
