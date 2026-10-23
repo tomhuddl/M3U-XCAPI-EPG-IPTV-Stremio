@@ -407,6 +407,42 @@ function testScheduledProgramsCacheParsedTimestamps() {
 }
 
 
+function testScheduledProgramsIndexReturnsOnlyOverlappingPrograms() {
+    const addon = new M3UEPGAddon({ provider: "direct", epgOffsetHours: 0 });
+    const channel = {
+        id: "iptv_test_channel",
+        type: "tv",
+        attributes: { "tvg-id": "test.indexed.channel" }
+    };
+    addon.epgData = {
+        "test.indexed.channel": [
+            { start: "20261018000000 +0000", stop: "20261018120000 +0000", title: "Long overnight programme" },
+            { start: "20261018100000 +0000", stop: "20261018110000 +0000", title: "Earlier programme" },
+            { start: "20261018120000 +0000", stop: "20261018130000 +0000", title: "Noon programme" },
+            { start: "20261018130000 +0000", stop: "20261018140000 +0000", title: "Afternoon programme" },
+            { start: "20261018150000 +0000", stop: "20261018160000 +0000", title: "Later programme" }
+        ]
+    };
+
+    const start = Date.parse("2026-10-18T12:00:00Z");
+    const end = Date.parse("2026-10-18T14:00:00Z");
+    const first = addon.getScheduledPrograms(channel, start, end);
+    assert.deepStrictEqual(first.map(program => program.title), [
+        "Noon programme", "Afternoon programme"
+    ], "programmes ending exactly at the window start should not overlap");
+
+    const second = addon.getScheduledPrograms(channel, start, end);
+    assert.deepStrictEqual(second, first, "repeated guide requests should reuse the indexed programme window");
+
+    const nextDay = addon.getScheduledPrograms(
+        channel,
+        Date.parse("2026-10-19T00:00:00Z"),
+        Date.parse("2026-10-19T02:00:00Z")
+    );
+    assert.deepStrictEqual(nextDay, [], "a guide window with no overlapping programmes should be empty");
+}
+
+
 async function testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot() {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "iptv-persistent-data-"));
     const data = {
@@ -685,6 +721,7 @@ async function main() {
         testSearchAllowsConservativeSingleCharacterTypos,
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,
+        testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,
         testDirectEpisodeLookupUsesExactIndex,
         testPersistentCatalogMetadataCacheRoundTripAndStaleFallback,
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
