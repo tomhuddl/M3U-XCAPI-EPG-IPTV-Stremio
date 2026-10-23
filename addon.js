@@ -325,6 +325,9 @@ class M3UEPGAddon {
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
         this.catalogPrefetchLastCompleted = new Map();
+        // Remember which ordered catalogue the in-memory completion applies to, so
+        // provider catalogue changes can trigger a new warm-up before the daily interval.
+        this.catalogPrefetchLastFingerprint = new Map();
         // Avoid immediately rescanning thousands of provider items after a partial
         // warm-up or transient metadata outage. A later request can retry after backoff.
         this.catalogPrefetchRetryAfter = new Map();
@@ -1118,20 +1121,20 @@ class M3UEPGAddon {
             process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
             60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
         );
-        const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
-        if (Date.now() - lastCompleted < refreshInterval) return;
-
         // Walk the unfiltered provider catalogue so a search for a small subset does
         // not accidentally define the scope of the background warm-up.
         const items = type === 'movie' ? this.movies : this.series;
         if (!Array.isArray(items) || !items.length) return;
+        const catalogueFingerprint = crypto.createHash('sha256')
+            .update(items.map(item => String(item?.id || '')).join('\n'))
+            .digest('hex');
+        const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
+        if (Date.now() - lastCompleted < refreshInterval &&
+            this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
 
         const job = (async () => {
             const startedAt = Date.now();
             const statusKey = '__catalog_prefetch_status__:' + type;
-            const catalogueFingerprint = crypto.createHash('sha256')
-                .update(items.map(item => String(item?.id || '')).join('\n'))
-                .digest('hex');
             // Persist the completion timestamp and catalogue fingerprint so Railway
             // restarts do not repeat a fresh warm-up, but changed provider catalogues
             // still trigger a full metadata pass even when the item count is unchanged.
@@ -1143,6 +1146,7 @@ class M3UEPGAddon {
             if (persistedStatus && sameCatalogue &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
                 this.log.debug('Persistent catalogue metadata is already warm', {
                     type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
@@ -1189,6 +1193,7 @@ class M3UEPGAddon {
                 // volume before reporting the warm-up as durable.
                 await this.persistentCatalogMetaCache.flush();
                 this.catalogPrefetchLastCompleted.set(type, completedAt);
+                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
                 this.log.info('Persistent catalogue metadata warm-up complete', {
                     type, processed, total: items.length, ms: Date.now() - startedAt
