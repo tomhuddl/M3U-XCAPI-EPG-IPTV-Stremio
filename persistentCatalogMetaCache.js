@@ -31,11 +31,11 @@ class PersistentCatalogMetaCache {
             : null;
         this.ttlMs = parsePositiveInteger(
             options.ttlMs ?? process.env.CATALOG_META_CACHE_TTL_MS,
-            DAY_MS, 1000, 30 * DAY_MS
+            14 * DAY_MS, 1000, 30 * DAY_MS
         );
         this.staleRetentionMs = parsePositiveInteger(
             options.staleRetentionMs ?? process.env.CATALOG_META_STALE_RETENTION_MS,
-            7 * DAY_MS, this.ttlMs, 90 * DAY_MS
+            30 * DAY_MS, this.ttlMs, 90 * DAY_MS
         );
         this.maxEntries = parsePositiveInteger(
             options.maxEntries ?? process.env.CATALOG_META_PERSISTENT_MAX_ENTRIES,
