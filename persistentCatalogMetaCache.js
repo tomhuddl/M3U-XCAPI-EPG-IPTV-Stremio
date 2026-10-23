@@ -170,6 +170,11 @@ class PersistentCatalogMetaCache {
 
         try {
             await this.writePromise;
+        } catch (error) {
+            // Keep the snapshot dirty when disk persistence fails. Otherwise the
+            // next flush would see dirty=false and silently discard this update.
+            this.dirty = true;
+            throw error;
         } finally {
             this.writePromise = null;
             if (this.dirty) this.scheduleWrite(0);
