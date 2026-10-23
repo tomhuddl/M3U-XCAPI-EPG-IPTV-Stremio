@@ -518,6 +518,31 @@ async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
     assert.strictEqual(addon.catalogMetaQueueHead, 0);
 }
 
+async function testCataloguePrefetchBacksOffAfterIncompleteWarmup() {
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
+    let enrichmentCalls = 0;
+    addon.enrichCatalogMetaItems = async () => {
+        enrichmentCalls++;
+        // Simulate a failed metadata lookup: no usable preview is cached.
+    };
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    const firstJob = addon.catalogPrefetchJobs.get("movie");
+    assert.ok(firstJob, "the first warm-up should start");
+    await firstJob;
+    assert.ok(
+        addon.catalogPrefetchRetryAfter.get("movie") > Date.now(),
+        "an incomplete warm-up should schedule a retry backoff"
+    );
+
+    addon.startContinuousCatalogPrefetch("movie", 10, 1);
+    assert.strictEqual(
+        enrichmentCalls, 1,
+        "repeated catalogue requests should not immediately restart a failed full-catalogue scan"
+    );
+}
+
 async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     let calls = 0;
@@ -628,6 +653,7 @@ async function main() {
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
         testCatalogMetadataQueueDrainsWithoutLosingItems,
+        testCataloguePrefetchBacksOffAfterIncompleteWarmup,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
         testMovieMetadataMapping,
