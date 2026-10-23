@@ -1698,18 +1698,11 @@ async function createAddon(config) {
                     const cached = addonInstance.catalogMetaCache.get(i.id);
                     if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
 
-                    // The current page has already completed foreground enrichment.
-                    // If no authoritative result was available, return the best base
-                    // metadata without scheduling a background mutation of this card.
-                    const firstPass = { ...meta, id: i.id, type: i.type };
-                    delete firstPass.genres;
-                    delete firstPass.cast;
-                    delete firstPass.description;
-                    delete firstPass.runtime;
-                    delete firstPass.releaseInfo;
-                    delete firstPass.year;
-                    delete firstPass.links;
-                    return firstPass;
+                    // Foreground enrichment has finished for this page. If TMDb or
+                    // the provider could not supply a richer preview, retain the base
+                    // provider metadata rather than stripping fields from the card.
+                    // We never mutate this already-built response in the background.
+                    return { ...meta, id: i.id, type: i.type };
                 });
                 
                 const responseBuildMs = Date.now() - responseBuildStartedAt;
