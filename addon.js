@@ -329,6 +329,9 @@ class M3UEPGAddon {
         // Without this, a category request and a queued warm-up can race and issue
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
         this.catalogMetaInFlight = new Map();
+        // Track asynchronous disk writes so a completed pre-warm can flush every
+        // metadata preview before its durable completion marker is written.
+        this.catalogMetaPersistWrites = new Set();
         this.catalogMetaQueue = [];
         this.catalogMetaQueueHead = 0;
         this.catalogMetaWorkers = 0;
@@ -1095,9 +1098,11 @@ class M3UEPGAddon {
     cacheCatalogMetaPreview(id, preview, persist = true) {
         this.catalogMetaCache.set(id, preview);
         if (persist) {
-            this.persistentCatalogMetaCache.set(id, preview).catch(error => {
+            const write = this.persistentCatalogMetaCache.set(id, preview);
+            this.catalogMetaPersistWrites.add(write);
+            write.catch(error => {
                 this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
-            });
+            }).finally(() => this.catalogMetaPersistWrites.delete(write));
         }
     }
 
@@ -1157,6 +1162,12 @@ class M3UEPGAddon {
 
             if (missingMetadata === 0) {
                 const completedAt = Date.now();
+                // All set() calls are asynchronous because they initialize the
+                // persistent store on first use. Wait for them before flushing, so the
+                // completion marker can never get ahead of the actual card previews.
+                while (this.catalogMetaPersistWrites.size) {
+                    await Promise.allSettled([...this.catalogMetaPersistWrites]);
+                }
                 await this.persistentCatalogMetaCache.set(statusKey, {
                     completedAt,
                     catalogueCount: items.length,
