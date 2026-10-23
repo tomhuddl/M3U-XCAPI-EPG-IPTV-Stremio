@@ -332,7 +332,7 @@ class M3UEPGAddon {
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
-        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 24 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
@@ -1189,7 +1189,7 @@ class M3UEPGAddon {
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
-            process.env.CATALOG_PREFETCH_REFRESH_MS, 12 * 60 * 60 * 1000,
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
             60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
         );
         // Walk the unfiltered provider catalogue so a search for a small subset does
@@ -1354,12 +1354,14 @@ class M3UEPGAddon {
                 ].filter(field => field !== undefined && field !== null && field !== '').length;
                 return usefulFields >= 2;
             };
-            if (persisted?.fresh && isUsablePreview(persisted.value)) {
+            // Metadata is effectively immutable for this personal-use addon. Reuse
+            // any complete persisted preview regardless of age; only missing/partial
+            // records should trigger TMDb/OMDb calls. New provider items naturally miss
+            // this key and are enriched before their first card is returned.
+            if (persisted?.value && isUsablePreview(persisted.value)) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
-            // Always refresh partial or expired persistent entries. A stale entry is
-            // only a last-resort fallback when refresh fails and the entry is usable.
             const refreshed = await this._getCatalogMetaAsync(id, type);
             if (refreshed) return refreshed;
             if (persisted?.value && isUsablePreview(persisted.value)) {
@@ -1632,7 +1634,7 @@ async function createAddon(config) {
                 addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
             }
         }
-        // Keep the catalogue and guide refreshed every 12 hours even if Stremio is idle
+        // Keep provider catalogue and guide refreshed every 24 hours even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
 
