@@ -134,39 +134,6 @@ function getNormalizedSearchText(value) {
 // this per-catalogue index keeps normalized titles reusable across successive queries.
 const catalogueSearchIndexes = new WeakMap();
 
-// Catalogue arrays are replaced when provider data refreshes, so cache their
-// ordered-ID fingerprint by array identity. This avoids re-hashing thousands of
-// IDs on every Discover request while still detecting a newly loaded catalogue.
-const catalogueFingerprints = new WeakMap();
-
-function getCatalogueFingerprint(items) {
-    if (!Array.isArray(items)) return '';
-    const cached = catalogueFingerprints.get(items);
-    if (cached) return cached;
-    const fingerprint = crypto.createHash('sha256')
-        .update(items.map(item => String(item?.id || '')).join('\n'))
-        .digest('hex');
-    catalogueFingerprints.set(items, fingerprint);
-    return fingerprint;
-}
-
-// Cache the filtered item list for recently repeated identical searches. The
-// cache is keyed by catalogue-array identity, so replacing a provider catalogue
-// naturally invalidates old results without risking stale pagination.
-const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
-    process.env.SEARCH_RESULT_CACHE_MAX, 12, 1, 50
-);
-const catalogueQueryResultCaches = new WeakMap();
-
-function getCatalogueQueryResultCache(items) {
-    let cache = catalogueQueryResultCaches.get(items);
-    if (!cache) {
-        cache = new Map();
-        catalogueQueryResultCaches.set(items, cache);
-    }
-    return cache;
-}
-
 function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
     return normalizedSearchQuery ? JSON.stringify([selectedGenre, normalizedSearchQuery]) : null;
 }
@@ -1201,7 +1168,9 @@ class M3UEPGAddon {
         // not accidentally define the scope of the background warm-up.
         const items = type === 'movie' ? this.movies : this.series;
         if (!Array.isArray(items) || !items.length) return;
-        const catalogueFingerprint = getCatalogueFingerprint(items);
+        const catalogueFingerprint = crypto.createHash('sha256')
+            .update(items.map(item => String(item?.id || '')).join('\\n'))
+            .digest('hex');
         const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
         if (Date.now() - lastCompleted < refreshInterval &&
             this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
@@ -1982,4 +1951,3 @@ module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
 module.exports.getCatalogueQueryResultCache = getCatalogueQueryResultCache;
 module.exports.createCatalogueQueryCacheKey = createCatalogueQueryCacheKey;
 module.exports.cacheCatalogueQueryResults = cacheCatalogueQueryResults;
-module.exports.getCatalogueFingerprint = getCatalogueFingerprint;
