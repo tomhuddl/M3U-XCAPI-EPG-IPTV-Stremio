@@ -46,6 +46,7 @@ class PersistentCatalogMetaCache {
         this.writePromise = null;
         this.writeTimer = null;
         this.dirty = false;
+        this.writeRetryDelayMs = 1000;
     }
 
     async init() {
@@ -168,16 +169,25 @@ class PersistentCatalogMetaCache {
             }
         })();
 
+        let writeFailed = false;
         try {
             await this.writePromise;
+            // A successful write resets the backoff for any future failure.
+            this.writeRetryDelayMs = 1000;
         } catch (error) {
             // Keep the snapshot dirty when disk persistence fails. Otherwise the
             // next flush would see dirty=false and silently discard this update.
+            // Back off retries so an unavailable volume cannot create a hot loop.
             this.dirty = true;
+            writeFailed = true;
             throw error;
         } finally {
             this.writePromise = null;
-            if (this.dirty) this.scheduleWrite(0);
+            if (this.dirty) {
+                const delay = writeFailed ? this.writeRetryDelayMs : 0;
+                if (writeFailed) this.writeRetryDelayMs = Math.min(this.writeRetryDelayMs * 2, 5 * 60 * 1000);
+                this.scheduleWrite(delay);
+            }
         }
     }
 }
