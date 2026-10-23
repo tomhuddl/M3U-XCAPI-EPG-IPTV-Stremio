@@ -1188,6 +1188,9 @@ class M3UEPGAddon {
         const catalogueFingerprint = crypto.createHash('sha256')
             .update(items.map(item => String(item?.id || '')).join('\n'))
             .digest('hex');
+        this.log.info('Starting catalogue metadata warm-up check', {
+            type, total: items.length, pageSize, concurrency
+        });
         const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
         if (Date.now() - lastCompleted < refreshInterval &&
             this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
@@ -1208,7 +1211,7 @@ class M3UEPGAddon {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                 this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
-                this.log.debug('Persistent catalogue metadata is already warm', {
+                this.log.info('Persistent catalogue metadata is already warm', {
                     type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
                 });
                 return;
