@@ -1081,11 +1081,20 @@ class M3UEPGAddon {
     async getDetailOmdbMetadata(imdbId, itemId) {
         if (!imdbId) return null;
 
-        // Reuse the already-enriched catalogue preview on detail opens. This avoids
-        // invoking OMDb again for each title open and also lets persisted catalogue
-        // metadata supply rating/runtime after a process restart.
-        const preview = itemId ? this.catalogMetaCache.get(itemId) : null;
-        if (preview && String(preview.imdbId || preview.imdb_id || '') === String(imdbId)) {
+        // Check the in-memory catalogue first, then the persistent catalogue cache.
+        // This prevents detail opens after a Railway restart from querying OMDb when
+        // the enriched rating/runtime are already saved on disk.
+        let preview = itemId ? this.catalogMetaCache.get(itemId) : null;
+        if (!preview && itemId) {
+            const persisted = await this.persistentCatalogMetaCache.get(String(itemId));
+            if (persisted?.value) {
+                preview = persisted.value;
+                this.catalogMetaCache.set(String(itemId), preview);
+            }
+        }
+
+        const previewImdbId = String(preview?.imdbId || preview?.imdb_id || '');
+        if (preview && previewImdbId === String(imdbId)) {
             if (!omdbMetadataNeedsRefresh(preview)) {
                 return {
                     imdbId: preview.imdbId || preview.imdb_id,
@@ -1095,26 +1104,22 @@ class M3UEPGAddon {
                     omdbCheckedAt: preview.omdbCheckedAt
                 };
             }
-            // An incomplete preview is eligible for a retry only after the shared
-            // retry interval; getByImdbId coalesces concurrent requests and caches
-            // the result. Failed refreshes fall back to the previously saved fields.
+
+            // Incomplete metadata is retried only after the shared 12-hour interval.
+            // A failed/partial refresh keeps any previously saved rating/runtime.
             const refreshed = await omdbMetadata.getByImdbId(imdbId, { refreshIncomplete: true });
-            if (refreshed) return {
-                ...refreshed,
-                imdbRating: refreshed.imdbRating || preview.imdbRating,
-                runtime: refreshed.runtime || preview.runtime
-            };
             return {
-                imdbId: preview.imdbId || preview.imdb_id,
-                imdbRating: preview.imdbRating,
-                runtime: preview.runtime,
-                omdbChecked: preview.omdbChecked === true,
-                omdbCheckedAt: preview.omdbCheckedAt
+                ...(refreshed || {}),
+                imdbId: refreshed?.imdbId || preview.imdbId || preview.imdb_id,
+                imdbRating: refreshed?.imdbRating || preview.imdbRating,
+                runtime: refreshed?.runtime || preview.runtime,
+                omdbChecked: refreshed?.omdbChecked === true || preview.omdbChecked === true,
+                omdbCheckedAt: refreshed?.omdbCheckedAt || preview.omdbCheckedAt
             };
         }
 
-        // The OMDb module's own cache is the fallback when no enriched preview is
-        // available yet; ordinary detail opens read that cache without forcing refresh.
+        // No matching enriched preview: use the OMDb module cache first, which
+        // avoids a request on ordinary opens when this process has seen the title.
         return omdbMetadata.getByImdbId(imdbId);
     }
 
@@ -1614,7 +1619,28 @@ class M3UEPGAddon {
                 return persisted.value;
             }
             const refreshed = await this._getCatalogMetaAsync(id, type, omdbMetadataNeedsRefresh(persisted?.value) || catalogMetadataNeedsRefresh(persisted?.value));
-            if (refreshed) return refreshed;
+            if (refreshed) {
+                // Merge field-by-field so a partial successful upstream refresh cannot
+                // erase useful metadata from the last saved preview. Fresh values win;
+                // missing/empty values fall back to the previous persistent record.
+                const previous = persisted?.value && isUsablePreview(persisted.value) ? persisted.value : null;
+                if (!previous) return refreshed;
+                const merged = { ...previous, ...refreshed };
+                for (const [field, value] of Object.entries(refreshed)) {
+                    const empty = value === undefined || value === null || value === '' ||
+                        (Array.isArray(value) && value.length === 0);
+                    if (empty && previous[field] !== undefined && previous[field] !== null &&
+                        previous[field] !== '' && !(Array.isArray(previous[field]) && previous[field].length === 0)) {
+                        merged[field] = previous[field];
+                    }
+                }
+                // Keep retry timestamps from the latest attempt even if some fields
+                // fell back, so absent upstream fields are not retried on every open.
+                merged.metadataCheckedAt = refreshed.metadataCheckedAt || Date.now();
+                this.catalogMetaCache.set(key, merged);
+                await this.persistentCatalogMetaCache.set(key, merged);
+                return merged;
+            }
             if (persisted?.value && isUsablePreview(persisted.value)) {
                 this.catalogMetaStaleFallbacks.add(key);
                 return persisted.value;
