@@ -1226,7 +1226,7 @@ class M3UEPGAddon {
             // couple daily scheduling to the metadata entries' freshness TTL.
             let cachedCatalogueNeedsRefresh = false;
             if (persistedStatus && sameCatalogue &&
-                Number(persistedStatus.value?.version) >= 2 &&
+                Number(persistedStatus.value?.version) >= 3 &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 // A completion marker alone is not proof that every cached preview
                 // contains the current OMDb lookup state. Older markers can survive
@@ -1235,7 +1235,8 @@ class M3UEPGAddon {
                     const saved = await this.persistentCatalogMetaCache.get(String(item.id));
                     const value = saved?.value;
                     if (!value || !String(value.name || '').trim() ||
-                        value.metadataVersion < 2 ||
+                        value.metadataVersion < 3 ||
+                        (value._tmdbId && !value.imdbId && value.imdbIdChecked !== true) ||
                         value.omdbPending === true ||
                         (value.imdbId && !value.imdbRating && value.omdbChecked !== true)) {
                         cachedCatalogueNeedsRefresh = true;
@@ -1268,7 +1269,7 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 2 || cached.omdbPending === true || (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true)) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || cached.omdbPending === true || (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true)) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1327,7 +1328,7 @@ class M3UEPGAddon {
                     completedAt,
                     catalogueCount: items.length,
                     catalogueFingerprint,
-                    version: 2
+                    version: 3
                 });
                 // Ensure metadata and its completion marker reach the persistent
                 // volume before reporting the warm-up as durable.
@@ -1410,7 +1411,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 2 && !persisted.value?.omdbPending && !(persisted.value?.imdbId && !persisted.value?.imdbRating && persisted.value?.omdbChecked !== true) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !persisted.value?.omdbPending && !(persisted.value?.imdbId && !persisted.value?.imdbRating && persisted.value?.omdbChecked !== true) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
@@ -1439,7 +1440,8 @@ class M3UEPGAddon {
             );
             const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
             const persistedIsDue = persistedIsUsable &&
-                (persisted.value.metadataVersion < 2 ||
+                (persisted.value.metadataVersion < 3 ||
+                    (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
                     persisted.value.omdbPending === true ||
                     (persisted.value.imdbId && !persisted.value.imdbRating && persisted.value.omdbChecked !== true) ||
                     Date.now() - persisted.savedAt >= metadataRefreshInterval);
@@ -1504,7 +1506,9 @@ class M3UEPGAddon {
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
                 runtime: tmdb.runtime || omdb?.runtime,
-                metadataVersion: 2,
+                metadataVersion: 3,
+                _tmdbId: tmdbId || null,
+                imdbIdChecked: Boolean(tmdb),
                 imdbId: tmdb.imdbId || omdb?.imdbId,
                 imdbRating: omdb?.imdbRating,
                 omdbChecked: omdb?.omdbChecked === true,
@@ -1554,7 +1558,9 @@ class M3UEPGAddon {
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
             runtime: tmdb.runtime || omdb?.runtime,
-            metadataVersion: 2,
+            metadataVersion: 3,
+            _tmdbId: tmdbId || null,
+            imdbIdChecked: Boolean(tmdb),
             imdbId: tmdb.imdbId || omdb?.imdbId,
             imdbRating: omdb?.imdbRating,
             omdbChecked: omdb?.omdbChecked === true,
