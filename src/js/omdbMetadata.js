@@ -186,7 +186,7 @@ async function getByImdbId(value, options = {}) {
         return result;
       }
       const ratingValue = Number(data.imdbRating);
-      const result = {
+      const freshResult = {
         imdbId: validImdbId(data.imdbID) || imdbId,
         omdbChecked: true,
         omdbCheckedAt: Date.now(),
@@ -194,6 +194,15 @@ async function getByImdbId(value, options = {}) {
           ? ratingValue.toFixed(1) : undefined,
         runtimeMinutes: parseRuntime(data.Runtime),
         runtime: parseRuntime(data.Runtime) ? parseRuntime(data.Runtime) + " min" : undefined,
+      };
+      // OMDb can return a valid response with one field missing. Keep any
+      // previously known rating/runtime rather than replacing it with blanks.
+      const result = {
+        ...staleCached,
+        ...freshResult,
+        imdbRating: freshResult.imdbRating || staleCached?.imdbRating,
+        runtime: freshResult.runtime || staleCached?.runtime,
+        runtimeMinutes: freshResult.runtimeMinutes || staleCached?.runtimeMinutes
       };
       cache.set(imdbId, result);
       retryableFailures.delete(imdbId);
