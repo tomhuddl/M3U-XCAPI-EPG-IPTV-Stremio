@@ -121,7 +121,7 @@ function parseRuntime(value) {
   return match ? Number(match[1]) : undefined;
 }
 
-async function getByImdbId(value) {
+async function getByImdbId(value, options = {}) {
   const imdbId = validImdbId(value);
   if (!imdbId) {
     diagnostics.skippedInvalidImdbId++;
@@ -134,8 +134,16 @@ async function getByImdbId(value) {
     return null;
   }
   if (cache.has(imdbId)) {
-    retryableFailures.delete(imdbId);
-    return cache.get(imdbId);
+    const cached = cache.get(imdbId);
+    const refreshIncomplete = options.refreshIncomplete === true &&
+      cached && (!cached.imdbRating || !cached.runtime);
+    if (!refreshIncomplete) {
+      retryableFailures.delete(imdbId);
+      return cached;
+    }
+    // A warm-up may explicitly refresh a stale cached response when OMDb
+    // previously returned no rating or runtime. Complete results stay cached.
+    cache.delete(imdbId);
   }
   if (pending.has(imdbId)) return pending.get(imdbId);
 
@@ -171,7 +179,7 @@ async function getByImdbId(value) {
           recordOutcome("retryable-failure", { response: "not-true" });
           return null;
         }
-        const result = { imdbId, omdbChecked: true };
+        const result = { imdbId, omdbChecked: true, omdbCheckedAt: Date.now() };
         cache.set(imdbId, result);
         recordOutcome("definitive-no-match");
         return result;
@@ -180,6 +188,7 @@ async function getByImdbId(value) {
       const result = {
         imdbId: validImdbId(data.imdbID) || imdbId,
         omdbChecked: true,
+        omdbCheckedAt: Date.now(),
         imdbRating: Number.isFinite(ratingValue) && ratingValue >= 0 && ratingValue <= 10
           ? ratingValue.toFixed(1) : undefined,
         runtimeMinutes: parseRuntime(data.Runtime),
