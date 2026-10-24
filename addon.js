@@ -1248,7 +1248,7 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 2 || cached.omdbPending === true) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 2 || cached.omdbPending === true || (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true)) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1383,6 +1383,7 @@ class M3UEPGAddon {
             const persistedIsDue = persistedIsUsable &&
                 (persisted.value.metadataVersion < 2 ||
                     persisted.value.omdbPending === true ||
+                    (persisted.value.imdbId && !persisted.value.imdbRating && persisted.value.omdbChecked !== true) ||
                     Date.now() - persisted.savedAt >= metadataRefreshInterval);
             if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
@@ -1448,6 +1449,7 @@ class M3UEPGAddon {
                 metadataVersion: 2,
                 imdbId: tmdb.imdbId || omdb?.imdbId,
                 imdbRating: omdb?.imdbRating,
+                omdbChecked: omdb?.omdbChecked === true,
                 omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
@@ -1497,6 +1499,7 @@ class M3UEPGAddon {
             metadataVersion: 2,
             imdbId: tmdb.imdbId || omdb?.imdbId,
             imdbRating: omdb?.imdbRating,
+            omdbChecked: omdb?.omdbChecked === true,
             omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
             director: tmdb.director,
             cast: tmdb.cast,
