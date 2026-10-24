@@ -1094,8 +1094,6 @@ class M3UEPGAddon {
                         this.catalogMetaStaleFallbacks.delete(item.id)
                     );
                     const preview = { ...detailed };
-                    if (Array.isArray(preview.links)) {
-                    }
                     const providerGenre = item.category || item.attributes?.['group-title'];
                     let fallbackPreview;
                     if (!Array.isArray(preview.genres) || !preview.genres.length) {
@@ -1144,8 +1142,6 @@ class M3UEPGAddon {
                             const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined ||
                                 this.catalogMetaStaleFallbacks.delete(next.id);
                             const preview = { ...detailed };
-                            if (Array.isArray(preview.links)) {
-                            }
                             const providerGenre = next.category || next.attributes?.['group-title'];
                             let fallbackPreview;
                             if (!Array.isArray(preview.genres) || !preview.genres.length) {
