@@ -123,9 +123,13 @@ function parseRuntime(value) {
 
 async function getByImdbId(value) {
   const imdbId = validImdbId(value);
-  if (!imdbId) return null;
+  if (!imdbId) {
+    diagnostics.skippedInvalidImdbId++;
+    return null;
+  }
   if (!API_KEY) {
     retryableFailures.set(imdbId, true);
+    recordOutcome("retryable-failure", { reason: "api-key-unavailable" });
     if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
     return null;
   }
@@ -145,6 +149,7 @@ async function getByImdbId(value) {
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
         "&apikey=" + encodeURIComponent(API_KEY);
+      diagnostics.attempts++;
       const response = await safeFetch(url, {
         timeout: 8000,
         reuseConnection: true,
@@ -152,6 +157,7 @@ async function getByImdbId(value) {
       });
       if (!response || !response.ok) {
         retryableFailures.set(imdbId, true);
+        recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
         return null;
       }
       const data = await response.json();
@@ -161,9 +167,13 @@ async function getByImdbId(value) {
         const errorText = String(data?.Error || "").toLowerCase();
         const retryable = /request limit|too many requests|temporarily unavailable|timeout|server error|invalid api key|api key/.test(errorText);
         retryableFailures.set(imdbId, retryable);
-        if (retryable) return null;
+        if (retryable) {
+          recordOutcome("retryable-failure", { response: "not-true" });
+          return null;
+        }
         const result = { imdbId, omdbChecked: true };
         cache.set(imdbId, result);
+        recordOutcome("definitive-no-match");
         return result;
       }
       const ratingValue = Number(data.imdbRating);
@@ -177,9 +187,11 @@ async function getByImdbId(value) {
       };
       cache.set(imdbId, result);
       retryableFailures.delete(imdbId);
+      recordOutcome(result.imdbRating ? "success-with-rating" : "success-without-rating");
       return result;
     } catch (error) {
       retryableFailures.set(imdbId, true);
+      recordOutcome("retryable-failure", { error: error?.name || "Error" });
       // OMDb is optional: a transient outage must never break card delivery.
       if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
         console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
