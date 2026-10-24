@@ -36,6 +36,7 @@ function catalogMetadataNeedsRefresh(value) {
         !value.runtime,
         !(value.tmdbRating || value.imdbRating),
         !Array.isArray(value.cast) || value.cast.length === 0,
+        Boolean(value._tmdbId && !value.imdbId),
         value.type === 'movie' && !value.director
     ].some(Boolean);
     if (!missing) return false;
