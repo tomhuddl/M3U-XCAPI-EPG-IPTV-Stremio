@@ -45,18 +45,23 @@ async function reserveDailyRequest() {
   if (state.count >= DAILY_REQUEST_LIMIT) return false;
   state.count++;
   const snapshot = { day: state.day, count: state.count };
-  usageWriteQueue = usageWriteQueue.then(async () => {
+  let persisted = true;
+  // Recover the queue after a previous write error, then retry this latest
+  // snapshot. Never spend an OMDb request if the daily budget cannot be saved:
+  // a restart must not reset the guard and accidentally exceed the daily limit.
+  usageWriteQueue = usageWriteQueue.catch(() => {}).then(async () => {
     await fs.promises.mkdir(DATA_DIR, { recursive: true });
     const temp = USAGE_FILE + ".tmp";
     await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
     await fs.promises.rename(temp, USAGE_FILE);
   }).catch(error => {
+    persisted = false;
     if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
       console.warn("[DEBUG] Could not persist OMDb usage counter", error?.name || "Error");
     }
   });
   await usageWriteQueue;
-  return true;
+  return persisted;
 }
 
 function parsePositiveInteger(value, fallback, min, max) {
