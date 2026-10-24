@@ -1108,14 +1108,26 @@ class M3UEPGAddon {
             // Incomplete metadata is retried only after the shared 12-hour interval.
             // A failed/partial refresh keeps any previously saved rating/runtime.
             const refreshed = await omdbMetadata.getByImdbId(imdbId, { refreshIncomplete: true });
-            return {
+            const result = {
                 ...(refreshed || {}),
                 imdbId: refreshed?.imdbId || preview.imdbId || preview.imdb_id,
                 imdbRating: refreshed?.imdbRating || preview.imdbRating,
                 runtime: refreshed?.runtime || preview.runtime,
                 omdbChecked: refreshed?.omdbChecked === true || preview.omdbChecked === true,
-                omdbCheckedAt: refreshed?.omdbCheckedAt || preview.omdbCheckedAt
+                omdbCheckedAt: refreshed?.omdbCheckedAt || Date.now()
             };
+            // Persist the attempt timestamp as well as the retained values. Without
+            // this write, a restart or repeated detail open could retry immediately.
+            const updatedPreview = {
+                ...preview,
+                imdbId: result.imdbId,
+                imdbRating: result.imdbRating,
+                runtime: result.runtime,
+                omdbChecked: result.omdbChecked,
+                omdbCheckedAt: result.omdbCheckedAt
+            };
+            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true);
+            return result;
         }
 
         // No matching enriched preview: use the OMDb module cache first, which
