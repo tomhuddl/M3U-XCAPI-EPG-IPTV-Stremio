@@ -26,6 +26,28 @@ function omdbMetadataNeedsRefresh(value) {
 
 // Retry incomplete combined catalogue metadata from any source on the same
 // 12-hour cadence, without making complete cards refresh more often than 14 days.
+/** Remove TMDb score fields/links from user-facing metadata while retaining
+ * TMDb-sourced artwork, descriptions, cast, dates and other metadata. */
+function stripTmdbRatings(meta) {
+    if (!meta || typeof meta !== 'object') return meta;
+    delete meta.tmdbRating;
+    if (Array.isArray(meta.links)) {
+        meta.links = meta.links.filter(link =>
+            !/^TMDb rating:/i.test(String(link?.name || '').trim())
+        );
+    }
+    if (Array.isArray(meta.videos)) {
+        for (const video of meta.videos) {
+            if (video && Array.isArray(video.links)) {
+                video.links = video.links.filter(link =>
+                    !/^TMDb rating:/i.test(String(link?.name || '').trim())
+                );
+            }
+        }
+    }
+    return meta;
+}
+
 function catalogMetadataNeedsRefresh(value) {
     if (!value || typeof value !== 'object') return false;
     const missing = [
@@ -35,7 +57,7 @@ function catalogMetadataNeedsRefresh(value) {
         !Array.isArray(value.genres) || value.genres.length === 0,
         !(value.year || value.releaseInfo),
         !value.runtime,
-        !(value.tmdbRating || value.imdbRating),
+        !value.imdbRating,
         !Array.isArray(value.cast) || value.cast.length === 0,
         Boolean(value._tmdbId && !value.imdbId),
         value.type === 'movie' && !value.director
@@ -2009,6 +2031,8 @@ async function createAddon(config) {
                     return { ...meta, id: i.id, type: i.type };
                 });
                 
+                metas.forEach(stripTmdbRatings);
+
                 const responseBuildMs = Date.now() - responseBuildStartedAt;
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
@@ -2068,6 +2092,7 @@ async function createAddon(config) {
                 // links section; promote that same score to the documented top-level field.
                 const exposeNativeImdbRating = (meta) => {
                     if (!meta || typeof meta !== 'object') return meta;
+                    stripTmdbRatings(meta);
                     const isValidRating = (value) => {
                         if (value == null || value === '') return false;
                         const numeric = Number(value);
