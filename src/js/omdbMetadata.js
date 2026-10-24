@@ -190,7 +190,12 @@ async function getByImdbId(value, options = {}) {
           recordOutcome("retryable-failure", { response: "not-true" });
           return retryableResult(imdbId, staleCached);
         }
-        const result = { imdbId, omdbChecked: true, omdbCheckedAt: Date.now() };
+        const result = {
+          ...(staleCached || {}),
+          imdbId,
+          omdbChecked: true,
+          omdbCheckedAt: Date.now()
+        };
         cache.set(imdbId, result);
         recordOutcome("definitive-no-match");
         return result;
