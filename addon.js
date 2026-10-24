@@ -30,6 +30,16 @@ function omdbMetadataNeedsRefresh(value) {
  * TMDb-sourced artwork, descriptions, cast, dates and other metadata. */
 function stripTmdbRatings(meta) {
     if (!meta || typeof meta !== 'object') return meta;
+
+    // Keep the add-on's own IMDb ID field for existing integrations, and also
+    // expose the snake_case alias present in native Cinemeta metadata. This is
+    // additive only: the IPTV meta ID and stream IDs must never be replaced.
+    const nativeImdbId = String(meta.imdb_id || meta.imdbId || '').trim();
+    if (/^tt\\d+$/.test(nativeImdbId)) {
+        meta.imdb_id = nativeImdbId;
+        if (!meta.imdbId) meta.imdbId = nativeImdbId;
+    }
+
     delete meta.tmdbRating;
     if (Array.isArray(meta.links)) {
         meta.links = meta.links
