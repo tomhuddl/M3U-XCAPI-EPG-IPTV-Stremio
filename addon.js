@@ -45,14 +45,25 @@ function stripTmdbRatings(meta) {
         meta.links = meta.links
             .filter(link => !/^TMDb rating:/i.test(String(link?.name || '').trim()))
             .map(link => {
+                // Stremio Web currently recognizes the IMDb badge only when the
+                // URL hostname is exactly "imdb.com", not "www.imdb.com".
+                const url = String(link?.url || '').trim();
+                let normalizedLink = link;
+                if (String(link?.category || '').toLowerCase() === 'imdb' &&
+                    /^https?:\/\/(?:www\.)?imdb\.com\/title\//i.test(url)) {
+                    normalizedLink = {
+                        ...link,
+                        url: url.replace(/^https?:\/\/(?:www\.)?imdb\.com/i, 'https://imdb.com')
+                    };
+                }
+
                 // Stremio Core treats category "imdb" specially: the link label
                 // becomes the native IMDb score/logo in the metadata header.
-                // A generic "Rating" link only renders as an ordinary text link.
-                const match = String(link?.name || '').trim().match(
-                    /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+                const match = String(normalizedLink?.name || '').trim().match(
+                    /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.\d+)?)$/i
                 );
-                if (!match) return link;
-                return { ...link, name: match[1], category: 'imdb' };
+                if (!match) return normalizedLink;
+                return { ...normalizedLink, name: match[1], category: 'imdb' };
             });
 
         // Catalogue previews also need the canonical IMDb link. The numeric
@@ -69,7 +80,7 @@ function stripTmdbRatings(meta) {
             meta.links.push({
                 name: imdbRating,
                 category: 'imdb',
-                url: 'https://www.imdb.com/title/' + encodeURIComponent(imdbId)
+                url: 'https://imdb.com/title/' + encodeURIComponent(imdbId)
             });
         }
     } else if (meta.imdbId && meta.imdbRating != null && meta.imdbRating !== '') {
@@ -79,7 +90,7 @@ function stripTmdbRatings(meta) {
             meta.links = [{
                 name: imdbRating,
                 category: 'imdb',
-                url: 'https://www.imdb.com/title/' + encodeURIComponent(String(meta.imdbId).trim())
+                url: 'https://imdb.com/title/' + encodeURIComponent(String(meta.imdbId).trim())
             }];
         }
     }
@@ -1638,7 +1649,7 @@ class M3UEPGAddon {
                 tmdbRating: tmdb.rating,
                 trailers: [],
                 links: [
-                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
+                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.links || [])
                 ]
@@ -1693,7 +1704,7 @@ class M3UEPGAddon {
             tmdbRating: tmdb.rating,
             trailers: [],
             links: [
-                ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
+                ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                 ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.links || [])
             ]
@@ -1739,7 +1750,7 @@ class M3UEPGAddon {
                 tmdbRating: tmdb.rating,
                 trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
                 links: [
-                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
+                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.links || [])
                 ]
