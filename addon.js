@@ -1352,7 +1352,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 2 && !persisted.value?.omdbPending && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            if (!persisted || (persisted.value?.metadataVersion >= 2 && !persisted.value?.omdbPending && !(persisted.value?.imdbId && !persisted.value?.imdbRating && persisted.value?.omdbChecked !== true) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
