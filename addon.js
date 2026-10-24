@@ -1490,7 +1490,22 @@ class M3UEPGAddon {
             const providerLookupMs = Date.now() - providerLookupStartedAt;
             const tmdbLookupStartedAt = Date.now();
             const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
-            const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
+            // Some provider series have no TMDb ID. Do not title-search as a fallback;
+            // keep a durable provider-backed card so these legitimate no-match items
+            // do not make the full-catalogue warm-up retry forever.
+            if (!tmdb && !tmdbId) {
+                const fallback = this.generateMetaPreview(seriesItem);
+                return {
+                    ...fallback,
+                    metadataVersion: 3,
+                    _tmdbId: null,
+                    imdbIdChecked: true,
+                    omdbChecked: true,
+                    omdbPending: false
+                };
+            }
+            if (!tmdb) return null;
+            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
             this.log.debug('Catalogue metadata stages', {
                 type: 'series',
                 id: seriesItem.id,
