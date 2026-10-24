@@ -830,6 +830,9 @@ function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
         ...complete, poster: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
     }), true, "missing poster should retry after twelve hours");
     assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, background: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing backdrop should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
         ...complete, runtime: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
     }), true, "missing runtime should retry after twelve hours");
     assert.strictEqual(catalogMetadataNeedsRefresh({
