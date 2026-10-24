@@ -1595,13 +1595,22 @@ class M3UEPGAddon {
         const cached = this.catalogMetaCache.get(key);
         if (cached !== undefined) {
             // An LRU hit must not keep popular titles permanently exempt from the
-            // 14-day metadata refresh. Check the persisted save timestamp as well.
+            // 14-day metadata refresh. If persistent storage is disabled/unavailable,
+            // make the same due decision from the in-memory preview instead.
             const persisted = await this.persistentCatalogMetaCache.get(key);
             const refreshInterval = parsePositiveInteger(
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - (Number(persisted.value?.metadataCheckedAt) || persisted.savedAt) < refreshInterval)) return cached;
+            const cachedValue = persisted?.value || cached;
+            const metadataTimestamp = Number(cachedValue?.metadataCheckedAt) ||
+                Number(persisted?.savedAt) || 0;
+            const refreshDue = cachedValue?.metadataVersion < 3 ||
+                (cachedValue?._tmdbId && !cachedValue?.imdbId && cachedValue?.imdbIdChecked !== true) ||
+                omdbMetadataNeedsRefresh(cachedValue) ||
+                catalogMetadataNeedsRefresh(cachedValue) ||
+                Date.now() - metadataTimestamp >= refreshInterval;
+            if (!refreshDue) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
