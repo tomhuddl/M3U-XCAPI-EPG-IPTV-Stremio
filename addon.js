@@ -44,6 +44,34 @@ function stripTmdbRatings(meta) {
                 if (!match) return link;
                 return { ...link, name: match[1], category: 'imdb' };
             });
+
+        // Catalogue previews also need the canonical IMDb link. The numeric
+        // imdbRating field is supported by the Meta Preview schema, but some
+        // Stremio clients render the native IMDb badge from an IMDb-category link.
+        // Add it only when a valid IMDb ID and rating exist, and avoid duplicates.
+        const imdbId = String(meta.imdbId || '').trim();
+        const imdbRating = String(meta.imdbRating ?? '').trim();
+        const validRating = /^(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/.test(imdbRating);
+        if (imdbId && validRating && !meta.links.some(link =>
+            String(link?.category || '').toLowerCase() === 'imdb' &&
+            String(link?.url || '').includes('/title/' + imdbId)
+        )) {
+            meta.links.push({
+                name: imdbRating,
+                category: 'imdb',
+                url: 'https://www.imdb.com/title/' + encodeURIComponent(imdbId)
+            });
+        }
+    } else if (meta.imdbId && meta.imdbRating != null && meta.imdbRating !== '') {
+        // Ensure a links array exists for enriched catalogue preview metadata.
+        const imdbRating = String(meta.imdbRating).trim();
+        if (/^(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/.test(imdbRating)) {
+            meta.links = [{
+                name: imdbRating,
+                category: 'imdb',
+                url: 'https://www.imdb.com/title/' + encodeURIComponent(String(meta.imdbId).trim())
+            }];
+        }
     }
     if (Array.isArray(meta.videos)) {
         for (const video of meta.videos) {
