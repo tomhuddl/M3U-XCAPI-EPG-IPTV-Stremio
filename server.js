@@ -629,12 +629,22 @@ app.get("/:token/manifest.json", (req, res) => {
 // res.end(), so intercept that boundary rather than res.json().
 app.use("/:token", (req, res, next) => {
   const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
+  const pathIsCatalog = /^\/catalog\/(movie|series)\//.test(req.path);
+  const pathIsMetadataResponse = pathIsMeta || pathIsCatalog;
   const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
   const isIosStremioClient =
     userAgent.includes("stremio") &&
     /iphone|ipad|ipod|ios/.test(userAgent);
 
-  if (pathIsMeta) {
+  if (pathIsMetadataResponse) {
+    // Catalogue previews and detail responses both drive the rating shown in
+    // Stremio's native UI. Avoid serving stale previews/details after metadata
+    // enrichment, and make the top-level IMDb field authoritative even for
+    // older cache entries that only have the rating link.
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     const originalEnd = res.end.bind(res);
     res.end = function (chunk, encoding, callback) {
       const contentType = String(res.getHeader("content-type") || "").toLowerCase();
@@ -642,7 +652,26 @@ app.use("/:token", (req, res, next) => {
         try {
           const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
           const body = JSON.parse(jsonText);
-          if (body && body.meta && typeof body.meta === "object") {
+          const normalizeRating = (meta) => {
+            if (!meta || typeof meta !== "object") return;
+            let rating = meta.imdbRating;
+            const valid = (value) => value != null && value !== "" &&
+              Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
+            if (!valid(rating) && Array.isArray(meta.links)) {
+              const link = meta.links.find(item =>
+                item && typeof item.name === "string" &&
+                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim())
+              );
+              const match = link?.name?.trim().match(
+                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+              );
+              if (match) rating = match[1];
+            }
+            if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
+          };
+
+          if (pathIsMeta && body?.meta && typeof body.meta === "object") {
+            normalizeRating(body.meta);
             const meta = body.meta;
             const links = Array.isArray(meta.links) ? meta.links : [];
             if (isIosStremioClient) {
@@ -651,13 +680,12 @@ app.use("/:token", (req, res, next) => {
             } else {
               meta.links = links.filter(link => link?.category !== "Writers");
             }
-            const output = JSON.stringify(body);
-            if (Buffer.isBuffer(chunk)) {
-              chunk = Buffer.from(output, "utf8");
-            } else {
-              chunk = output;
-            }
+          } else if (pathIsCatalog && Array.isArray(body?.metas)) {
+            body.metas.forEach(normalizeRating);
           }
+
+          const output = JSON.stringify(body);
+          chunk = Buffer.isBuffer(chunk) ? Buffer.from(output, "utf8") : output;
         } catch {
           // Leave non-JSON or unexpected SDK responses untouched.
         }
