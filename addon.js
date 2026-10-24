@@ -30,6 +30,7 @@ function catalogMetadataNeedsRefresh(value) {
     if (!value || typeof value !== 'object') return false;
     const missing = [
         !value.poster,
+        !value.background,
         !value.description || value.description === 'Series / Show',
         !Array.isArray(value.genres) || value.genres.length === 0,
         !(value.year || value.releaseInfo),
