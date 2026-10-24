@@ -121,6 +121,16 @@ function parseRuntime(value) {
   return match ? Number(match[1]) : undefined;
 }
 
+function retryableResult(imdbId, previous = null) {
+  return {
+    ...(previous || {}),
+    imdbId,
+    // Record failed attempts so the caller's 12-hour policy can throttle retries.
+    omdbCheckedAt: Date.now(),
+    omdbRetryableFailure: true
+  };
+}
+
 async function getByImdbId(value, options = {}) {
   const imdbId = validImdbId(value);
   if (!imdbId) {
@@ -131,7 +141,7 @@ async function getByImdbId(value, options = {}) {
     retryableFailures.set(imdbId, true);
     recordOutcome("retryable-failure", { reason: "api-key-unavailable" });
     if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
-    return null;
+    return retryableResult(imdbId, cache.get(imdbId) || null);
   }
   let staleCached = null;
   if (cache.has(imdbId)) {
@@ -154,7 +164,7 @@ async function getByImdbId(value, options = {}) {
       if (!(await reserveDailyRequest())) {
         retryableFailures.set(imdbId, true);
         if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb daily request budget reached");
-        return staleCached;
+        return retryableResult(imdbId, staleCached);
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
         "&apikey=" + encodeURIComponent(API_KEY);
@@ -167,7 +177,7 @@ async function getByImdbId(value, options = {}) {
       if (!response || !response.ok) {
         retryableFailures.set(imdbId, true);
         recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
-        return staleCached;
+        return retryableResult(imdbId, staleCached);
       }
       const data = await response.json();
       if (!data || data.Response !== "True") {
@@ -178,7 +188,7 @@ async function getByImdbId(value, options = {}) {
         retryableFailures.set(imdbId, retryable);
         if (retryable) {
           recordOutcome("retryable-failure", { response: "not-true" });
-          return staleCached;
+          return retryableResult(imdbId, staleCached);
         }
         const result = { imdbId, omdbChecked: true, omdbCheckedAt: Date.now() };
         cache.set(imdbId, result);
@@ -215,7 +225,7 @@ async function getByImdbId(value, options = {}) {
       if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
         console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
       }
-      return staleCached;
+      return retryableResult(imdbId, staleCached);
     }
   })();
   pending.set(imdbId, task);
