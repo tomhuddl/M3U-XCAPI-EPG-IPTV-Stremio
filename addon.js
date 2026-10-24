@@ -2144,8 +2144,26 @@ async function createAddon(config) {
                         meta.videos = videos;
                     }
                 }
+                if (meta && (type === 'movie' || type === 'series')) {
+                    // Keep the native Stremio header field explicit on the final response,
+                    // after all enrichment/fallback paths have completed.
+                    const finalRating = meta.imdbRating;
+                    if (finalRating != null && finalRating !== '') {
+                        const numericRating = Number(finalRating);
+                        if (Number.isFinite(numericRating) && numericRating >= 0 && numericRating <= 10) {
+                            meta.imdbRating = numericRating.toFixed(1);
+                        }
+                    }
+                }
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Meta request', { id, type, found: !!meta });
+                    console.log('[DEBUG] Meta request', {
+                        id, type, found: !!meta,
+                        imdbRating: meta?.imdbRating ?? null,
+                        imdbId: meta?.imdbId ?? null,
+                        ratingLinks: Array.isArray(meta?.links)
+                            ? meta.links.filter(link => /^IMDb rating:/i.test(String(link?.name || ''))).length
+                            : 0
+                    });
                 }
                 return { meta };
             } catch (e) {
