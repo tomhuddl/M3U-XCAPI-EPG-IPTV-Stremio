@@ -1206,7 +1206,7 @@ class M3UEPGAddon {
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
-            process.env.CATALOG_PREFETCH_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 12 * 60 * 60 * 1000,
             60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000
         );
         // Walk the unfiltered provider catalogue so a search for a small subset does
