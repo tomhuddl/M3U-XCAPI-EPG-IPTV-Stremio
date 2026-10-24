@@ -133,6 +133,7 @@ async function getByImdbId(value, options = {}) {
     if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
     return null;
   }
+  let staleCached = null;
   if (cache.has(imdbId)) {
     const cached = cache.get(imdbId);
     const refreshIncomplete = options.refreshIncomplete === true &&
@@ -141,9 +142,9 @@ async function getByImdbId(value, options = {}) {
       retryableFailures.delete(imdbId);
       return cached;
     }
-    // A warm-up may explicitly refresh a stale cached response when OMDb
-    // previously returned no rating or runtime. Complete results stay cached.
-    cache.delete(imdbId);
+    // Keep the previous response while refreshing an incomplete one. If the
+    // request fails, callers can still use the last known rating/runtime.
+    staleCached = cached;
   }
   if (pending.has(imdbId)) return pending.get(imdbId);
 
@@ -153,7 +154,7 @@ async function getByImdbId(value, options = {}) {
       if (!(await reserveDailyRequest())) {
         retryableFailures.set(imdbId, true);
         if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb daily request budget reached");
-        return null;
+        return staleCached;
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
         "&apikey=" + encodeURIComponent(API_KEY);
@@ -166,7 +167,7 @@ async function getByImdbId(value, options = {}) {
       if (!response || !response.ok) {
         retryableFailures.set(imdbId, true);
         recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
-        return null;
+        return staleCached;
       }
       const data = await response.json();
       if (!data || data.Response !== "True") {
@@ -177,7 +178,7 @@ async function getByImdbId(value, options = {}) {
         retryableFailures.set(imdbId, retryable);
         if (retryable) {
           recordOutcome("retryable-failure", { response: "not-true" });
-          return null;
+          return staleCached;
         }
         const result = { imdbId, omdbChecked: true, omdbCheckedAt: Date.now() };
         cache.set(imdbId, result);
@@ -205,7 +206,7 @@ async function getByImdbId(value, options = {}) {
       if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
         console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
       }
-      return null;
+      return staleCached;
     }
   })();
   pending.set(imdbId, task);
