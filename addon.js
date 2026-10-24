@@ -1071,12 +1071,14 @@ class M3UEPGAddon {
         };
     }
 
-    async enrichCatalogMetaItems(items, concurrency = 3) {
+    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false) {
         const startedAt = Date.now();
         const candidates = items.filter(item => {
             if (!item || (item.type !== 'movie' && item.type !== 'series')) return false;
-            // LRUCache.has() delegates to get(), so use one lookup to test for a hit.
-            return this.catalogMetaCache.get(item.id) === undefined;
+            // A scheduled warm-up must revisit cached items when the metadata schema
+            // or IMDb enrichment state has changed; ordinary foreground enrichment
+            // continues to skip items already present in the LRU.
+            return forceRefresh || this.catalogMetaCache.get(item.id) === undefined;
         });
         let nextIndex = 0;
         const worker = async () => {
@@ -1087,8 +1089,10 @@ class M3UEPGAddon {
                     if (!detailed) continue;
                     // A fresh persistent hit is already stored on disk; don't reset its
                     // daily refresh timestamp just because the card was viewed again.
-                    const loadedFromCache = this.catalogMetaCache.get(item.id) !== undefined ||
-                        this.catalogMetaStaleFallbacks.delete(item.id);
+                    const loadedFromCache = !forceRefresh && (
+                        this.catalogMetaCache.get(item.id) !== undefined ||
+                        this.catalogMetaStaleFallbacks.delete(item.id)
+                    );
                     const preview = { ...detailed };
                     delete preview.tmdbRating;
                     if (Array.isArray(preview.links)) {
@@ -1262,7 +1266,10 @@ class M3UEPGAddon {
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
-                await this.enrichCatalogMetaItems(batch, concurrency);
+                // Force the warm-up through the metadata refresh path even when an old
+                // preview is already in the LRU. Refreshed values must also replace
+                // the persistent preview, not merely update memory.
+                await this.enrichCatalogMetaItems(batch, concurrency, true);
                 processed += batch.length;
                 // A warm-up only counts as complete if every item has a usable card
                 // preview in the cache. Missing lookups must be retried later rather
