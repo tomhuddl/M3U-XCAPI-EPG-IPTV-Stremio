@@ -35,7 +35,7 @@ function stripTmdbRatings(meta) {
     // expose the snake_case alias present in native Cinemeta metadata. This is
     // additive only: the IPTV meta ID and stream IDs must never be replaced.
     const nativeImdbId = String(meta.imdb_id || meta.imdbId || '').trim();
-    if (/^tt\\d+$/.test(nativeImdbId)) {
+    if (/^tt\d+$/.test(nativeImdbId)) {
         meta.imdb_id = nativeImdbId;
         if (!meta.imdbId) meta.imdbId = nativeImdbId;
     }
