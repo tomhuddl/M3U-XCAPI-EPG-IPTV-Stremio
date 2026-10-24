@@ -1647,6 +1647,10 @@ class M3UEPGAddon {
             }
             const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
             if (!tmdb) return this.getDetailedMeta(id);
+            // Keep the detailed movie response consistent with the enriched catalogue
+            // preview: Stremio needs imdbRating on the returned meta object, not just
+            // in the persistent catalogue cache or as a labelled link.
+            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
             return {
                 id: item.id,
                 type: 'movie',
@@ -1658,12 +1662,15 @@ class M3UEPGAddon {
                 genres: tmdb.genres,
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
-                runtime: tmdb.runtime,
+                runtime: tmdb.runtime || item.runtime || omdb?.runtime,
+                imdbId: tmdb.imdbId || omdb?.imdbId,
+                imdbRating: omdb?.imdbRating,
                 director: tmdb.director,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
                 links: [
+                    ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.links || [])
                 ]
