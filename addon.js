@@ -1277,6 +1277,33 @@ class M3UEPGAddon {
                 }
             }
 
+            const omdbCatalogueSummary = {
+                items: items.length,
+                cachedEntries: 0,
+                withImdbId: 0,
+                withImdbRating: 0,
+                awaitingOmdbCheck: 0,
+                omdbPending: 0,
+                missingPreview: 0
+            };
+            for (const item of items) {
+                const cached = this.catalogMetaCache.get(item.id);
+                if (!cached) {
+                    omdbCatalogueSummary.missingPreview++;
+                    continue;
+                }
+                omdbCatalogueSummary.cachedEntries++;
+                if (cached.imdbId) omdbCatalogueSummary.withImdbId++;
+                if (cached.imdbRating) omdbCatalogueSummary.withImdbRating++;
+                if (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true) omdbCatalogueSummary.awaitingOmdbCheck++;
+                if (cached.omdbPending === true) omdbCatalogueSummary.omdbPending++;
+            }
+            this.log.info('Catalogue metadata diagnostics', {
+                type,
+                ...omdbCatalogueSummary,
+                omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
+            });
+
             if (missingMetadata === 0) {
                 const completedAt = Date.now();
                 // All set() calls are asynchronous because they initialize the
