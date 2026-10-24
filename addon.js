@@ -1126,7 +1126,10 @@ class M3UEPGAddon {
                 omdbChecked: result.omdbChecked,
                 omdbCheckedAt: result.omdbCheckedAt
             };
-            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true);
+            // This write updates OMDb fields only. Preserve the catalogue/TMDb
+            // refresh timestamp so opening a detail page cannot postpone the next
+            // scheduled metadata refresh.
+            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true, true);
             return result;
         }
 
@@ -1354,10 +1357,17 @@ class M3UEPGAddon {
         runNext();
     }
 
-    cacheCatalogMetaPreview(id, preview, persist = true) {
-        // Record the last successful enrichment attempt even when an upstream source
+    cacheCatalogMetaPreview(id, preview, persist = true, preserveMetadataCheckedAt = false) {
+        // Record the last catalogue enrichment attempt even when an upstream source
         // has no value for a field, preventing repeated retries on every card request.
-        preview = { ...preview, metadataCheckedAt: Date.now() };
+        // Detail-page OMDb-only writes must not reset this separate timestamp.
+        const previousMetadataCheckedAt = Number(preview?.metadataCheckedAt) || 0;
+        preview = {
+            ...preview,
+            metadataCheckedAt: preserveMetadataCheckedAt && previousMetadataCheckedAt > 0
+                ? previousMetadataCheckedAt
+                : Date.now()
+        };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
             const write = this.persistentCatalogMetaCache.set(id, preview);
@@ -1591,7 +1601,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - (Number(persisted.value?.metadataCheckedAt) || persisted.savedAt) < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
@@ -1623,7 +1633,7 @@ class M3UEPGAddon {
                 (persisted.value.metadataVersion < 3 ||
                     (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
                     (omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) ||
-                    Date.now() - persisted.savedAt >= metadataRefreshInterval);
+                    Date.now() - (Number(persisted.value.metadataCheckedAt) || persisted.savedAt) >= metadataRefreshInterval);
             if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
