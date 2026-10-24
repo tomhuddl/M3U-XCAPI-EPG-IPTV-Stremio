@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults, omdbMetadataNeedsRefresh } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -804,6 +804,36 @@ async function testStreamingEpgParserHonorsSharedAggregateBudget() {
     assert.strictEqual(Object.values(parsed).reduce((sum, items) => sum + items.length, 0), 1);
 }
 
+function testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow() {
+    const now = Date.now();
+    const recentMissingRating = {
+        imdbId: "tt1234567",
+        runtime: "120 min",
+        omdbChecked: true,
+        omdbCheckedAt: now
+    };
+    assert.strictEqual(omdbMetadataNeedsRefresh(recentMissingRating), false,
+        "a recently checked missing rating should respect the retry window");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        ...recentMissingRating,
+        omdbCheckedAt: now - 12 * 60 * 60 * 1000 - 1000
+    }), true, "a missing rating should become refreshable after twelve hours");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        imdbId: "tt1234567",
+        imdbRating: "7.8",
+        runtime: "120 min",
+        omdbCheckedAt: now - 30 * 24 * 60 * 60 * 1000
+    }), false, "complete OMDb rating and runtime should not be retried by the missing-data path");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        imdbId: "tt1234567",
+        imdbRating: "7.8",
+        omdbCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "a missing runtime should also trigger a retry after twelve hours");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        name: "No IMDb ID"
+    }), false, "items without an IMDb ID cannot be looked up by OMDb");
+}
+
 async function main() {
     const tests = [
         testEncryptedConfigRoundTrip,
@@ -829,6 +859,7 @@ async function main() {
         testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
         testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
+        testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
         testMovieMetadataMapping,
