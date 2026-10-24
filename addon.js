@@ -1605,7 +1605,7 @@ class M3UEPGAddon {
             const cachedValue = persisted?.value || cached;
             const metadataTimestamp = Number(cachedValue?.metadataCheckedAt) ||
                 Number(persisted?.savedAt) || 0;
-            const refreshDue = cachedValue?.metadataVersion < 3 ||
+            const refreshDue = !(Number(cachedValue?.metadataVersion) >= 3) ||
                 (cachedValue?._tmdbId && !cachedValue?.imdbId && cachedValue?.imdbIdChecked !== true) ||
                 omdbMetadataNeedsRefresh(cachedValue) ||
                 catalogMetadataNeedsRefresh(cachedValue) ||
