@@ -2063,11 +2063,47 @@ async function createAddon(config) {
 
         builder.defineMetaHandler(async ({ type, id }) => {
             try {
+                // Ensure Stremio's native header rating is populated on detailed pages.
+                // Some cached/legacy metadata has the IMDb score only in the "Rating"
+                // links section; promote that same score to the documented top-level field.
+                const exposeNativeImdbRating = (meta) => {
+                    if (!meta || typeof meta !== 'object') return meta;
+                    const isValidRating = (value) => {
+                        if (value == null || value === '') return false;
+                        const numeric = Number(value);
+                        return Number.isFinite(numeric) && numeric >= 0 && numeric <= 10;
+                    };
+
+                    let rating = meta.imdbRating;
+                    if (!isValidRating(rating)) {
+                        const cachedPreview = addonInstance.catalogMetaCache?.get(id);
+                        if (isValidRating(cachedPreview?.imdbRating)) {
+                            rating = cachedPreview.imdbRating;
+                        }
+                    }
+                    if (!isValidRating(rating) && Array.isArray(meta.links)) {
+                        const imdbRatingLink = meta.links.find((link) =>
+                            link && typeof link.name === 'string' &&
+                            /^IMDb rating:\\s*(?:10(?:\\.0+)?|[0-9](?:\\.[0-9]+)?)$/i.test(link.name.trim())
+                        );
+                        if (imdbRatingLink) {
+                            const match = imdbRatingLink.name.trim().match(
+                                /^IMDb rating:\\s*(10(?:\\.0+)?|[0-9](?:\\.[0-9]+)?)$/i
+                            );
+                            if (match) rating = match[1];
+                        }
+                    }
+                    if (isValidRating(rating)) meta.imdbRating = String(rating);
+                    return meta;
+                };
+
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Meta handler called', { type, id, seriesCount: addonInstance.series.length });
                 }
                 if (type === 'series' || id.startsWith('iptv_series_')) {
-                    const meta = await addonInstance.getDetailedMetaAsync(id, 'series');
+                    const meta = exposeNativeImdbRating(
+                        await addonInstance.getDetailedMetaAsync(id, 'series')
+                    );
                     if (addonInstance.config.debug) {
                         console.log('[DEBUG] Series meta result', { id, found: !!meta, videos: meta?.videos?.length });
                     }
@@ -2089,7 +2125,9 @@ async function createAddon(config) {
                     }
                     return { meta: meta || null };
                 }
-                const meta = await addonInstance.getDetailedMetaAsync(id, type);
+                const meta = exposeNativeImdbRating(
+                    await addonInstance.getDetailedMetaAsync(id, type)
+                );
                 if (meta && type === 'tv' && meta.type === 'tv') {
                     const channel = addonInstance.channels.find(item => item.id === id);
                     if (channel) {
