@@ -671,7 +671,27 @@ async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
         get: async key => key === "__catalog_prefetch_status__:movie"
             ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 3 }, fresh: true }
             : key === "movie-1"
-                ? { value: { name: "Movie 1", description: "Cached preview", metadataVersion: 3, _tmdbId: null, imdbIdChecked: true }, savedAt: Date.now(), fresh: true }
+                ? { value: {
+                    name: "Movie 1",
+                    type: "movie",
+                    description: "Cached preview",
+                    poster: "https://example.com/poster.jpg",
+                    background: "https://example.com/background.jpg",
+                    genres: ["Drama"],
+                    year: 2020,
+                    runtime: "120 min",
+                    tmdbRating: "7.2",
+                    imdbRating: "7.5",
+                    cast: ["Actor One"],
+                    director: "Director One",
+                    metadataVersion: 3,
+                    metadataCheckedAt: Date.now(),
+                    _tmdbId: null,
+                    imdbId: "tt1234567",
+                    imdbIdChecked: true,
+                    omdbChecked: true,
+                    omdbCheckedAt: Date.now()
+                }, savedAt: Date.now(), fresh: true }
                 : null,
         set: async () => {},
         flush: async () => {},
