@@ -82,7 +82,12 @@ function parseRuntime(value) {
 
 async function getByImdbId(value) {
   const imdbId = validImdbId(value);
-  if (!API_KEY || !imdbId) return null;
+  if (!imdbId) return null;
+  if (!API_KEY) {
+    retryableFailures.set(imdbId, true);
+    if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
+    return null;
+  }
   if (cache.has(imdbId)) {
     retryableFailures.delete(imdbId);
     return cache.get(imdbId);
@@ -113,12 +118,17 @@ async function getByImdbId(value) {
         // A missing title or invalid key is not helped by repeatedly retrying
         // every hour; quota and temporary service errors should be retried.
         const errorText = String(data?.Error || "").toLowerCase();
-        retryableFailures.set(imdbId, /request limit|too many requests|temporarily unavailable|timeout|server error/.test(errorText));
-        return null;
+        const retryable = /request limit|too many requests|temporarily unavailable|timeout|server error|invalid api key|api key/.test(errorText);
+        retryableFailures.set(imdbId, retryable);
+        if (retryable) return null;
+        const result = { imdbId, omdbChecked: true };
+        cache.set(imdbId, result);
+        return result;
       }
       const ratingValue = Number(data.imdbRating);
       const result = {
         imdbId: validImdbId(data.imdbID) || imdbId,
+        omdbChecked: true,
         imdbRating: Number.isFinite(ratingValue) && ratingValue >= 0 && ratingValue <= 10
           ? ratingValue.toFixed(1) : undefined,
         runtimeMinutes: parseRuntime(data.Runtime),
