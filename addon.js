@@ -1338,7 +1338,7 @@ class M3UEPGAddon {
                 if (value.imdbId) {
                     omdbCatalogueSummary.withImdbId++;
                     if (value.imdbRating) omdbCatalogueSummary.withImdbRating++;
-                    if ((omdbMetadataNeedsRefresh(value) || catalogMetadataNeedsRefresh(value))) omdbCatalogueSummary.awaitingOmdbCheck++;
+                    if (omdbMetadataNeedsRefresh(value)) omdbCatalogueSummary.awaitingOmdbCheck++;
                     if (!value.imdbRating && value.omdbChecked === true) omdbCatalogueSummary.markedCheckedWithoutRating++;
                 } else {
                     omdbCatalogueSummary.withoutImdbId++;
