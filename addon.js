@@ -39,7 +39,7 @@ function stripTmdbRatings(meta) {
                 // becomes the native IMDb score/logo in the metadata header.
                 // A generic "Rating" link only renders as an ordinary text link.
                 const match = String(link?.name || '').trim().match(
-                    /^IMDb rating:\\s*(10(?:\\.0+)?|[0-9](?:\\.[0-9]+)?)$/i
+                    /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
                 );
                 if (!match) return link;
                 return { ...link, name: match[1], category: 'imdb' };
