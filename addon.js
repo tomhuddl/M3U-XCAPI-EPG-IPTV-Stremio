@@ -1078,6 +1078,46 @@ class M3UEPGAddon {
         return this.directSeriesEpisodeById.get(epId) || null;
     }
 
+    async getDetailOmdbMetadata(imdbId, itemId) {
+        if (!imdbId) return null;
+
+        // Reuse the already-enriched catalogue preview on detail opens. This avoids
+        // invoking OMDb again for each title open and also lets persisted catalogue
+        // metadata supply rating/runtime after a process restart.
+        const preview = itemId ? this.catalogMetaCache.get(itemId) : null;
+        if (preview && String(preview.imdbId || preview.imdb_id || '') === String(imdbId)) {
+            if (!omdbMetadataNeedsRefresh(preview)) {
+                return {
+                    imdbId: preview.imdbId || preview.imdb_id,
+                    imdbRating: preview.imdbRating,
+                    runtime: preview.runtime,
+                    omdbChecked: preview.omdbChecked === true,
+                    omdbCheckedAt: preview.omdbCheckedAt
+                };
+            }
+            // An incomplete preview is eligible for a retry only after the shared
+            // retry interval; getByImdbId coalesces concurrent requests and caches
+            // the result. Failed refreshes fall back to the previously saved fields.
+            const refreshed = await omdbMetadata.getByImdbId(imdbId, { refreshIncomplete: true });
+            if (refreshed) return {
+                ...refreshed,
+                imdbRating: refreshed.imdbRating || preview.imdbRating,
+                runtime: refreshed.runtime || preview.runtime
+            };
+            return {
+                imdbId: preview.imdbId || preview.imdb_id,
+                imdbRating: preview.imdbRating,
+                runtime: preview.runtime,
+                omdbChecked: preview.omdbChecked === true,
+                omdbCheckedAt: preview.omdbCheckedAt
+            };
+        }
+
+        // The OMDb module's own cache is the fallback when no enriched preview is
+        // available yet; ordinary detail opens read that cache without forcing refresh.
+        return omdbMetadata.getByImdbId(imdbId);
+    }
+
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
         const info = await this.ensureSeriesInfo(seriesIdRaw);
@@ -1086,7 +1126,7 @@ class M3UEPGAddon {
         // The detailed series view also exposes IMDb rating/runtime fallbacks.
         // Keep this lookup local to the function rather than referencing an
         // undefined catalogue-preview variable.
-        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
+        const omdb = tmdb?.imdbId ? await this.getDetailOmdbMetadata(tmdb.imdbId, seriesItem.id) : null;
         const tmdbSeasons = new Map();
         if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
             const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
@@ -1738,7 +1778,7 @@ class M3UEPGAddon {
             // Keep the detailed movie response consistent with the enriched catalogue
             // preview: Stremio needs imdbRating on the returned meta object, not just
             // in the persistent catalogue cache or as a labelled link.
-            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
+            const omdb = tmdb.imdbId ? await this.getDetailOmdbMetadata(tmdb.imdbId, item.id) : null;
             return {
                 id: item.id,
                 type: 'movie',
