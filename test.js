@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults, omdbMetadataNeedsRefresh } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults, omdbMetadataNeedsRefresh, catalogMetadataNeedsRefresh } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -804,6 +804,39 @@ async function testStreamingEpgParserHonorsSharedAggregateBudget() {
     assert.strictEqual(Object.values(parsed).reduce((sum, items) => sum + items.length, 0), 1);
 }
 
+function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
+    const now = Date.now();
+    const complete = {
+        type: "movie",
+        poster: "poster.jpg",
+        description: "A description",
+        genres: ["Drama"],
+        year: 2020,
+        runtime: "120 min",
+        tmdbRating: "7.2",
+        cast: ["Actor One"],
+        director: "Director One",
+        metadataCheckedAt: now
+    };
+    assert.strictEqual(catalogMetadataNeedsRefresh(complete), false,
+        "complete metadata should not use the missing-data retry path");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, description: undefined, metadataCheckedAt: now
+    }), false, "recently checked missing fields should respect the retry window");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, description: undefined, metadataCheckedAt: now - 12 * 60 * 60 * 1000 - 1000
+    }), true, "missing description should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, poster: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing poster should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, runtime: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing runtime should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, type: "series", director: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), false, "series should not be considered incomplete solely for lacking a movie director");
+}
+
 function testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow() {
     const now = Date.now();
     const recentMissingRating = {
@@ -860,6 +893,7 @@ async function main() {
         testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
         testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow,
+        testCatalogMissingMetadataUsesTwelveHourRetryWindow,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
         testMovieMetadataMapping,
