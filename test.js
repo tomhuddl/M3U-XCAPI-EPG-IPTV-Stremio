@@ -835,6 +835,7 @@ function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
         year: 2020,
         runtime: "120 min",
         tmdbRating: "7.2",
+        imdbRating: "7.5",
         cast: ["Actor One"],
         director: "Director One",
         metadataCheckedAt: now
