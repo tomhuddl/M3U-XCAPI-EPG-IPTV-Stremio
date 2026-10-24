@@ -2179,7 +2179,7 @@ async function createAddon(config) {
                         meta.imdb_id || meta.imdbId ||
                         cachedPreview?.imdb_id || cachedPreview?.imdbId || ''
                     ).trim();
-                    if (/^tt\\d+$/.test(imdbId)) {
+                    if (/^tt\d+$/.test(imdbId)) {
                         meta.imdb_id = imdbId;
                         if (!meta.imdbId) meta.imdbId = imdbId;
                     }
@@ -2197,11 +2197,11 @@ async function createAddon(config) {
                         }
                     }
                     if (isValidRating(rating)) meta.imdbRating = String(rating);
-                    if (/^tt\\d+$/.test(imdbId) && isValidRating(rating)) {
+                    if (/^tt\d+$/.test(imdbId) && isValidRating(rating)) {
                         if (!Array.isArray(meta.links)) meta.links = [];
                         const existingImdbLink = meta.links.some(link =>
                             String(link?.category || '').toLowerCase() === 'imdb' &&
-                            /imdb\\.com\\/title\\//i.test(String(link?.url || ''))
+                            /imdb\.com\/title\//i.test(String(link?.url || ''))
                         );
                         if (!existingImdbLink) {
                             meta.links.unshift({
