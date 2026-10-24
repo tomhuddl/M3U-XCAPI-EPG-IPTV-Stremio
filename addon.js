@@ -8,6 +8,73 @@ const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
+const omdbMetadata = require("./src/js/omdbMetadata");
+
+// Retry incomplete OMDb data independently of the longer metadata refresh interval.
+// Missing ratings/runtime are retried at most once per configured interval.
+const OMDB_MISSING_DATA_RETRY_MS = parsePositiveInteger(
+    process.env.OMDB_MISSING_DATA_RETRY_MS, 12 * 60 * 60 * 1000,
+    60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+);
+
+function omdbMetadataNeedsRefresh(value) {
+    if (!value || !value.imdbId) return false;
+    if (value.imdbRating && value.runtime) return false;
+    const checkedAt = Number(value.omdbCheckedAt) || 0;
+    return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+}
+
+// Retry incomplete combined catalogue metadata from any source on the same
+// 12-hour cadence, without making complete cards refresh more often than 14 days.
+/** Remove TMDb score fields/links from user-facing metadata while retaining
+ * TMDb-sourced artwork, descriptions, cast, dates and other metadata. */
+function stripTmdbRatings(meta) {
+    if (!meta || typeof meta !== 'object') return meta;
+    delete meta.tmdbRating;
+    if (Array.isArray(meta.links)) {
+        meta.links = meta.links
+            .filter(link => !/^TMDb rating:/i.test(String(link?.name || '').trim()))
+            .map(link => {
+                // Stremio Core treats category "imdb" specially: the link label
+                // becomes the native IMDb score/logo in the metadata header.
+                // A generic "Rating" link only renders as an ordinary text link.
+                const match = String(link?.name || '').trim().match(
+                    /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+                );
+                if (!match) return link;
+                return { ...link, name: match[1], category: 'imdb' };
+            });
+    }
+    if (Array.isArray(meta.videos)) {
+        for (const video of meta.videos) {
+            if (video && Array.isArray(video.links)) {
+                video.links = video.links.filter(link =>
+                    !/^TMDb rating:/i.test(String(link?.name || '').trim())
+                );
+            }
+        }
+    }
+    return meta;
+}
+
+function catalogMetadataNeedsRefresh(value) {
+    if (!value || typeof value !== 'object') return false;
+    const missing = [
+        !value.poster,
+        !value.background,
+        !value.description || value.description === 'Series / Show',
+        !Array.isArray(value.genres) || value.genres.length === 0,
+        !(value.year || value.releaseInfo),
+        !value.runtime,
+        !value.imdbRating,
+        !Array.isArray(value.cast) || value.cast.length === 0,
+        Boolean(value._tmdbId && !value.imdbId),
+        value.type === 'movie' && !value.director
+    ].some(Boolean);
+    if (!missing) return false;
+    const checkedAt = Number(value.metadataCheckedAt) || 0;
+    return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+}
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
@@ -331,7 +398,7 @@ class M3UEPGAddon {
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
-        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 24 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
         this.series = [];   // Series (shows)
@@ -870,12 +937,21 @@ class M3UEPGAddon {
 
     startScheduledRefresh() {
         if (this.refreshTimer) return;
+        const refreshCheckInterval = parsePositiveInteger(process.env.DATA_REFRESH_CHECK_INTERVAL_MS, 60 * 60 * 1000, 5 * 60 * 1000, 6 * 60 * 60 * 1000);
+        // Check hourly against the persisted last-success timestamp, so process restarts
+        // cannot keep postponing the next refresh.
         this.refreshTimer = setInterval(() => {
             if (this.scheduledRefreshInFlight) return;
+            const lastSuccessfulRefresh = Number(this.lastUpdate) || 0;
+            if (lastSuccessfulRefresh && Date.now() - lastSuccessfulRefresh < this.updateInterval) return;
+            this.log.info('Scheduled provider refresh is due', {
+                lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
+                intervalHours: this.updateInterval / (60 * 60 * 1000)
+            });
             this.scheduledRefreshInFlight = this.updateData(true)
                 .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
                 .finally(() => { this.scheduledRefreshInFlight = null; });
-        }, this.updateInterval);
+        }, refreshCheckInterval);
         if (typeof this.refreshTimer.unref === 'function') this.refreshTimer.unref();
     }
 
@@ -958,6 +1034,10 @@ class M3UEPGAddon {
         const info = await this.ensureSeriesInfo(seriesIdRaw);
         const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
         const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
+        // The detailed series view also exposes IMDb rating/runtime fallbacks.
+        // Keep this lookup local to the function rather than referencing an
+        // undefined catalogue-preview variable.
+        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
         const tmdbSeasons = new Map();
         if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
             const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
@@ -1041,24 +1121,29 @@ class M3UEPGAddon {
             genres: tmdb.genres,
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
-            runtime: tmdb.runtime,
+            runtime: tmdb.runtime || seriesItem.runtime || omdb?.runtime,
+            metadataVersion: 2,
+            imdbId: tmdb.imdbId || omdb?.imdbId,
+            imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
             links: [
-                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
+                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.links || [])
             ],
             videos
         };
     }
 
-    async enrichCatalogMetaItems(items, concurrency = 3) {
+    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false) {
         const startedAt = Date.now();
         const candidates = items.filter(item => {
             if (!item || (item.type !== 'movie' && item.type !== 'series')) return false;
-            // LRUCache.has() delegates to get(), so use one lookup to test for a hit.
-            return this.catalogMetaCache.get(item.id) === undefined;
+            // A scheduled warm-up must revisit cached items when the metadata schema
+            // or IMDb enrichment state has changed; ordinary foreground enrichment
+            // continues to skip items already present in the LRU.
+            return forceRefresh || this.catalogMetaCache.get(item.id) === undefined;
         });
         let nextIndex = 0;
         const worker = async () => {
@@ -1069,13 +1154,11 @@ class M3UEPGAddon {
                     if (!detailed) continue;
                     // A fresh persistent hit is already stored on disk; don't reset its
                     // daily refresh timestamp just because the card was viewed again.
-                    const loadedFromCache = this.catalogMetaCache.get(item.id) !== undefined ||
-                        this.catalogMetaStaleFallbacks.delete(item.id);
+                    const loadedFromCache = !forceRefresh && (
+                        this.catalogMetaCache.get(item.id) !== undefined ||
+                        this.catalogMetaStaleFallbacks.delete(item.id)
+                    );
                     const preview = { ...detailed };
-                    delete preview.tmdbRating;
-                    if (Array.isArray(preview.links)) {
-                        preview.links = preview.links.filter(link => link?.category !== 'Rating');
-                    }
                     const providerGenre = item.category || item.attributes?.['group-title'];
                     let fallbackPreview;
                     if (!Array.isArray(preview.genres) || !preview.genres.length) {
@@ -1124,10 +1207,6 @@ class M3UEPGAddon {
                             const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined ||
                                 this.catalogMetaStaleFallbacks.delete(next.id);
                             const preview = { ...detailed };
-                            delete preview.tmdbRating;
-                            if (Array.isArray(preview.links)) {
-                                preview.links = preview.links.filter(link => link?.category !== 'Rating');
-                            }
                             const providerGenre = next.category || next.attributes?.['group-title'];
                             let fallbackPreview;
                             if (!Array.isArray(preview.genres) || !preview.genres.length) {
@@ -1162,6 +1241,9 @@ class M3UEPGAddon {
     }
 
     cacheCatalogMetaPreview(id, preview, persist = true) {
+        // Record the last successful enrichment attempt even when an upstream source
+        // has no value for a field, preventing repeated retries on every card request.
+        preview = { ...preview, metadataCheckedAt: Date.now() };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
             const write = this.persistentCatalogMetaCache.set(id, preview);
@@ -1178,8 +1260,8 @@ class M3UEPGAddon {
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
 
         const refreshInterval = parsePositiveInteger(
-            process.env.CATALOG_PREFETCH_REFRESH_MS, 24 * 60 * 60 * 1000,
-            60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+            process.env.CATALOG_PREFETCH_REFRESH_MS, 12 * 60 * 60 * 1000,
+            60 * 60 * 1000, 30 * 24 * 60 * 60 * 1000
         );
         // Walk the unfiltered provider catalogue so a search for a small subset does
         // not accidentally define the scope of the background warm-up.
@@ -1206,15 +1288,37 @@ class M3UEPGAddon {
             const sameCatalogue = persistedStatus?.value?.catalogueFingerprint === catalogueFingerprint;
             // The completion marker has its own completedAt timestamp; do not
             // couple daily scheduling to the metadata entries' freshness TTL.
+            let cachedCatalogueNeedsRefresh = false;
             if (persistedStatus && sameCatalogue &&
+                Number(persistedStatus.value?.version) >= 3 &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
-                this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
-                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
-                this.catalogPrefetchRetryAfter.delete(type);
-                this.log.info('Persistent catalogue metadata is already warm', {
-                    type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                // A completion marker alone is not proof that every cached preview
+                // contains the current OMDb lookup state. Older markers can survive
+                // code changes, so inspect saved entries before skipping the warm-up.
+                for (const item of items) {
+                    const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                    const value = saved?.value;
+                    if (!value || !String(value.name || '').trim() ||
+                        value.metadataVersion < 3 ||
+                        (value._tmdbId && !value.imdbId && value.imdbIdChecked !== true) ||
+                        value.omdbPending === true ||
+                        (omdbMetadataNeedsRefresh(value) || catalogMetadataNeedsRefresh(value))) {
+                        cachedCatalogueNeedsRefresh = true;
+                        break;
+                    }
+                }
+                if (!cachedCatalogueNeedsRefresh) {
+                    this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                    this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
+                    this.catalogPrefetchRetryAfter.delete(type);
+                    this.log.info('Persistent catalogue metadata is already warm', {
+                        type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                    });
+                    return;
+                }
+                this.log.info('Persistent catalogue metadata requires refresh despite completion marker', {
+                    type, total: items.length
                 });
-                return;
             }
 
             let processed = 0;
@@ -1222,14 +1326,17 @@ class M3UEPGAddon {
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
-                await this.enrichCatalogMetaItems(batch, concurrency);
+                // Force the warm-up through the metadata refresh path even when an old
+                // preview is already in the LRU. Refreshed values must also replace
+                // the persistent preview, not merely update memory.
+                await this.enrichCatalogMetaItems(batch, concurrency, true);
                 processed += batch.length;
                 // A warm-up only counts as complete if every item has a usable card
                 // preview in the cache. Missing lookups must be retried later rather
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim()) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || cached.omdbPending === true || (omdbMetadataNeedsRefresh(cached) || catalogMetadataNeedsRefresh(cached))) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1237,6 +1344,44 @@ class M3UEPGAddon {
                     });
                 }
             }
+
+            const omdbCatalogueSummary = {
+                items: items.length,
+                persistentEntries: 0,
+                missingPersistentPreview: 0,
+                withImdbId: 0,
+                withImdbRating: 0,
+                awaitingOmdbCheck: 0,
+                omdbPending: 0,
+                withoutImdbId: 0,
+                markedCheckedWithoutRating: 0
+            };
+            // Read the persistent cache rather than catalogMetaCache (an LRU capped
+            // at 1,000 items); otherwise this report falsely labels the rest of the
+            // provider catalogue as missing.
+            for (const item of items) {
+                const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                const value = saved?.value;
+                if (!value) {
+                    omdbCatalogueSummary.missingPersistentPreview++;
+                    continue;
+                }
+                omdbCatalogueSummary.persistentEntries++;
+                if (value.imdbId) {
+                    omdbCatalogueSummary.withImdbId++;
+                    if (value.imdbRating) omdbCatalogueSummary.withImdbRating++;
+                    if (omdbMetadataNeedsRefresh(value)) omdbCatalogueSummary.awaitingOmdbCheck++;
+                    if (!value.imdbRating && value.omdbChecked === true) omdbCatalogueSummary.markedCheckedWithoutRating++;
+                } else {
+                    omdbCatalogueSummary.withoutImdbId++;
+                }
+                if (value.omdbPending === true) omdbCatalogueSummary.omdbPending++;
+            }
+            this.log.info('Catalogue metadata diagnostics', {
+                type,
+                ...omdbCatalogueSummary,
+                omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
+            });
 
             if (missingMetadata === 0) {
                 const completedAt = Date.now();
@@ -1250,7 +1395,7 @@ class M3UEPGAddon {
                     completedAt,
                     catalogueCount: items.length,
                     catalogueFingerprint,
-                    version: 1
+                    version: 3
                 });
                 // Ensure metadata and its completion marker reach the persistent
                 // volume before reporting the warm-up as durable.
@@ -1325,7 +1470,17 @@ class M3UEPGAddon {
         const key = String(id || '');
         if (!key) return null;
         const cached = this.catalogMetaCache.get(key);
-        if (cached !== undefined) return cached;
+        if (cached !== undefined) {
+            // An LRU hit must not keep popular titles permanently exempt from the
+            // 14-day metadata refresh. Check the persisted save timestamp as well.
+            const persisted = await this.persistentCatalogMetaCache.get(key);
+            const refreshInterval = parsePositiveInteger(
+                process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+                60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
+            );
+            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !persisted.value?.omdbPending && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            // Due entries fall through to the shared in-flight refresh below.
+        }
         const pending = this.catalogMetaInFlight.get(key);
         if (pending) return pending;
 
@@ -1343,13 +1498,25 @@ class M3UEPGAddon {
                 ].filter(field => field !== undefined && field !== null && field !== '').length;
                 return usefulFields >= 2;
             };
-            if (persisted?.fresh && isUsablePreview(persisted.value)) {
+            // Reuse complete persisted metadata until its 14-day refresh interval expires.
+            // Refresh due records when the catalogue warm-up reaches them; if a lookup
+            // fails, keep the last saved preview available for the card.
+            const metadataRefreshInterval = parsePositiveInteger(
+                process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+                60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
+            );
+            const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
+            const persistedIsDue = persistedIsUsable &&
+                (persisted.value.metadataVersion < 3 ||
+                    (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
+                    persisted.value.omdbPending === true ||
+                    (omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) ||
+                    Date.now() - persisted.savedAt >= metadataRefreshInterval);
+            if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
-            // Always refresh partial or expired persistent entries. A stale entry is
-            // only a last-resort fallback when refresh fails and the entry is usable.
-            const refreshed = await this._getCatalogMetaAsync(id, type);
+            const refreshed = await this._getCatalogMetaAsync(id, type, omdbMetadataNeedsRefresh(persisted?.value) || catalogMetadataNeedsRefresh(persisted?.value));
             if (refreshed) return refreshed;
             if (persisted?.value && isUsablePreview(persisted.value)) {
                 this.catalogMetaStaleFallbacks.add(key);
@@ -1367,7 +1534,7 @@ class M3UEPGAddon {
         }
     }
 
-    async _getCatalogMetaAsync(id, type) {
+    async _getCatalogMetaAsync(id, type, refreshIncompleteMetadata = false) {
         // Discover cards do not need episode lists, trailers, or logo-image lookups.
         // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
         if (type === 'series' || id.startsWith('iptv_series_')) {
@@ -1382,7 +1549,23 @@ class M3UEPGAddon {
             }
             const providerLookupMs = Date.now() - providerLookupStartedAt;
             const tmdbLookupStartedAt = Date.now();
-            const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId);
+            const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, { refresh: refreshIncompleteMetadata });
+            // Some provider series have no TMDb ID. Do not title-search as a fallback;
+            // keep a durable provider-backed card so these legitimate no-match items
+            // do not make the full-catalogue warm-up retry forever.
+            if (!tmdb && !tmdbId) {
+                const fallback = this.generateMetaPreview(seriesItem);
+                return {
+                    ...fallback,
+                    metadataVersion: 3,
+                    _tmdbId: null,
+                    imdbIdChecked: true,
+                    omdbChecked: true,
+                    omdbPending: false
+                };
+            }
+            if (!tmdb) return null;
+            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteMetadata }) : null;
             this.log.debug('Catalogue metadata stages', {
                 type: 'series',
                 id: seriesItem.id,
@@ -1404,11 +1587,20 @@ class M3UEPGAddon {
                 genres: tmdb.genres,
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
-                runtime: tmdb.runtime,
+                runtime: tmdb.runtime || seriesItem.runtime || omdb?.runtime,
+                metadataVersion: 3,
+                _tmdbId: tmdbId || null,
+                imdbIdChecked: Boolean(tmdb),
+                imdbId: tmdb.imdbId || omdb?.imdbId,
+                imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
+                omdbChecked: omdb?.omdbChecked === true,
+                omdbCheckedAt: omdb?.omdbCheckedAt,
+                omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: [],
                 links: [
+                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.links || [])
                 ]
@@ -1426,7 +1618,8 @@ class M3UEPGAddon {
         }
         const providerLookupMs = Date.now() - providerLookupStartedAt;
         const tmdbLookupStartedAt = Date.now();
-        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
+        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId, { refresh: refreshIncompleteMetadata });
+        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteMetadata }) : null;
         this.log.debug('Catalogue metadata stages', {
             type: 'movie',
             id: item.id,
@@ -1448,12 +1641,21 @@ class M3UEPGAddon {
             genres: tmdb.genres,
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
-            runtime: tmdb.runtime,
+            runtime: tmdb.runtime || item.runtime || omdb?.runtime,
+            metadataVersion: 3,
+            _tmdbId: tmdbId || null,
+            imdbIdChecked: Boolean(tmdb),
+            imdbId: tmdb.imdbId || omdb?.imdbId,
+            imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
+            omdbChecked: omdb?.omdbChecked === true,
+            omdbCheckedAt: omdb?.omdbCheckedAt,
+            omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
             director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: [],
             links: [
+                ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                 ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                 ...(tmdb.links || [])
             ]
@@ -1476,6 +1678,10 @@ class M3UEPGAddon {
             }
             const tmdb = await tmdbMetadata.getMovieMetadata(tmdbId);
             if (!tmdb) return this.getDetailedMeta(id);
+            // Keep the detailed movie response consistent with the enriched catalogue
+            // preview: Stremio needs imdbRating on the returned meta object, not just
+            // in the persistent catalogue cache or as a labelled link.
+            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
             return {
                 id: item.id,
                 type: 'movie',
@@ -1487,12 +1693,15 @@ class M3UEPGAddon {
                 genres: tmdb.genres,
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
-                runtime: tmdb.runtime,
+                runtime: tmdb.runtime || item.runtime || omdb?.runtime,
+                imdbId: tmdb.imdbId || omdb?.imdbId,
+                imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
                 director: tmdb.director,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
                 links: [
+                    ...(omdb?.imdbRating ? [{ name: String(omdb.imdbRating), category: 'imdb', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
                     ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
                     ...(tmdb.links || [])
                 ]
@@ -1602,10 +1811,14 @@ async function createAddon(config) {
             console.error('[ADDON] Initial update failed:', e && e.name ? e.name : 'Error');
         }
         addonInstance.buildGenresInManifest();
+        // Load the complete persistent metadata index before serving requests, so
+        // saved OMDb/TMDb previews are immediately available after a Railway restart.
+        // This loads saved data only; it does not wait for network refreshes.
+        await addonInstance.persistentCatalogMetaCache.init();
         // Start the full movie/series metadata warm-up as soon as this configured
         // addon is built, rather than waiting for the first Discover request.
-        // It is intentionally non-blocking: a saved last-known-good cache remains
-        // available while missing/stale metadata is refreshed in the background.
+        // It is intentionally non-blocking: saved previews remain available while
+        // missing or 14-day-due metadata is refreshed in the background.
         const metadataPrefetchPageSize = parsePositiveInteger(process.env.CATALOG_PAGE_SIZE, 50, 10, 100);
         const metadataPrefetchConcurrency = parsePositiveInteger(process.env.CATALOG_PREFETCH_CONCURRENCY, 3, 1, 6);
         if ((process.env.CATALOG_PREFETCH_NEXT_PAGE || 'true').toLowerCase() !== 'false') {
@@ -1614,7 +1827,7 @@ async function createAddon(config) {
                 addonInstance.startContinuousCatalogPrefetch('series', metadataPrefetchPageSize, metadataPrefetchConcurrency);
             }
         }
-        // Keep the catalogue and guide refreshed daily even if Stremio is idle
+        // Keep provider catalogue and guide refreshed every 12 hours even if Stremio is idle
         // after startup. The timer is unref'd so it does not keep Node alive.
         addonInstance.startScheduledRefresh();
 
@@ -1808,7 +2021,17 @@ async function createAddon(config) {
                     if (i.type !== 'movie' && i.type !== 'series') return meta;
 
                     const cached = addonInstance.catalogMetaCache.get(i.id);
-                    if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
+                    if (cached) return {
+                        ...meta,
+                        ...cached,
+                        id: i.id,
+                        type: i.type,
+                        // Stremio's MetaPreview schema specifies imdbRating as a string.
+                        // Normalize older persisted numeric values as well as new lookups.
+                        ...(cached.imdbRating != null && cached.imdbRating !== ''
+                            ? { imdbRating: String(cached.imdbRating) }
+                            : {})
+                    };
 
                     // Foreground enrichment has finished for this page. If TMDb or
                     // the provider could not supply a richer preview, retain the base
@@ -1817,6 +2040,8 @@ async function createAddon(config) {
                     return { ...meta, id: i.id, type: i.type };
                 });
                 
+                metas.forEach(stripTmdbRatings);
+
                 const responseBuildMs = Date.now() - responseBuildStartedAt;
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
@@ -1871,11 +2096,48 @@ async function createAddon(config) {
 
         builder.defineMetaHandler(async ({ type, id }) => {
             try {
+                // Ensure Stremio's native header rating is populated on detailed pages.
+                // Some cached/legacy metadata has the IMDb score only in the "Rating"
+                // links section; promote that same score to the documented top-level field.
+                const exposeNativeImdbRating = (meta) => {
+                    if (!meta || typeof meta !== 'object') return meta;
+                    stripTmdbRatings(meta);
+                    const isValidRating = (value) => {
+                        if (value == null || value === '') return false;
+                        const numeric = Number(value);
+                        return Number.isFinite(numeric) && numeric >= 0 && numeric <= 10;
+                    };
+
+                    let rating = meta.imdbRating;
+                    if (!isValidRating(rating)) {
+                        const cachedPreview = addonInstance.catalogMetaCache?.get(id);
+                        if (isValidRating(cachedPreview?.imdbRating)) {
+                            rating = cachedPreview.imdbRating;
+                        }
+                    }
+                    if (!isValidRating(rating) && Array.isArray(meta.links)) {
+                        const imdbRatingLink = meta.links.find((link) =>
+                            link && typeof link.name === 'string' &&
+                            /^IMDb rating:\s*(?:10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(link.name.trim())
+                        );
+                        if (imdbRatingLink) {
+                            const match = imdbRatingLink.name.trim().match(
+                                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+                            );
+                            if (match) rating = match[1];
+                        }
+                    }
+                    if (isValidRating(rating)) meta.imdbRating = String(rating);
+                    return meta;
+                };
+
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Meta handler called', { type, id, seriesCount: addonInstance.series.length });
                 }
                 if (type === 'series' || id.startsWith('iptv_series_')) {
-                    const meta = await addonInstance.getDetailedMetaAsync(id, 'series');
+                    const meta = exposeNativeImdbRating(
+                        await addonInstance.getDetailedMetaAsync(id, 'series')
+                    );
                     if (addonInstance.config.debug) {
                         console.log('[DEBUG] Series meta result', { id, found: !!meta, videos: meta?.videos?.length });
                     }
@@ -1897,7 +2159,9 @@ async function createAddon(config) {
                     }
                     return { meta: meta || null };
                 }
-                const meta = await addonInstance.getDetailedMetaAsync(id, type);
+                const meta = exposeNativeImdbRating(
+                    await addonInstance.getDetailedMetaAsync(id, type)
+                );
                 if (meta && type === 'tv' && meta.type === 'tv') {
                     const channel = addonInstance.channels.find(item => item.id === id);
                     if (channel) {
@@ -1914,12 +2178,38 @@ async function createAddon(config) {
                         meta.videos = videos;
                     }
                 }
+                if (meta && (type === 'movie' || type === 'series')) {
+                    // Keep the native Stremio header field explicit on the final response,
+                    // after all enrichment/fallback paths have completed.
+                    const finalRating = meta.imdbRating;
+                    if (finalRating != null && finalRating !== '') {
+                        const numericRating = Number(finalRating);
+                        if (Number.isFinite(numericRating) && numericRating >= 0 && numericRating <= 10) {
+                            meta.imdbRating = numericRating.toFixed(1);
+                        }
+                    }
+                }
+                if (meta && (type === 'movie' || type === 'series')) {
+                    // Log the final field Stremio uses for the native rating header even
+                    // when general debug logging is disabled, so live deployments can be
+                    // diagnosed without enabling verbose request logs.
+                    console.log('[META-RATING] Final detail response', {
+                        id,
+                        type,
+                        imdbRating: meta.imdbRating ?? null,
+                        imdbRatingType: typeof meta.imdbRating,
+                        imdbId: meta.imdbId ?? null,
+                        ratingLinks: Array.isArray(meta.links)
+                            ? meta.links.filter(link => /^IMDb rating:/i.test(String(link?.name || ''))).length
+                            : 0
+                    });
+                }
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Meta request', { id, type, found: !!meta });
                 }
                 return { meta };
             } catch (e) {
-                console.error('[META] Error', e && e.name ? e.name : 'Error');
+                console.error('[META] Error', e && e.name ? e.name : 'Error', e && e.message ? e.message : 'No error message', e && e.stack ? e.stack : 'No stack trace');
                 return { meta: null };
             }
         });
@@ -1968,3 +2258,5 @@ module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
 module.exports.getCatalogueQueryResultCache = getCatalogueQueryResultCache;
 module.exports.createCatalogueQueryCacheKey = createCatalogueQueryCacheKey;
 module.exports.cacheCatalogueQueryResults = cacheCatalogueQueryResults;
+module.exports.omdbMetadataNeedsRefresh = omdbMetadataNeedsRefresh;
+module.exports.catalogMetadataNeedsRefresh = catalogMetadataNeedsRefresh;

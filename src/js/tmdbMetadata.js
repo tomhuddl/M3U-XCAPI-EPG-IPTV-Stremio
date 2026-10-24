@@ -4,7 +4,7 @@ const LRUCache = require("../../lruCache");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
-const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
+const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({
   max: parsePositiveInteger(process.env.TMDB_CACHE_MAX_ENTRIES, 1000, 1, 5000),
   ttl: CACHE_TTL_MS,
@@ -67,15 +67,15 @@ function logRequestDebug(event, details) {
   if (TMDB_DEBUG) console.log("[DEBUG] TMDb request", { event, ...details });
 }
 
-async function request(path) {
+async function request(path, { refresh = false } = {}) {
   if (!tmdbConfigured()) return null;
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
-  if (cached !== undefined) {
+  if (!refresh && cached !== undefined) {
     logRequestDebug("cache-hit", { path, ms: 0 });
     return cached;
   }
-  if (negativeCache.has(cacheKey)) {
+  if (!refresh && negativeCache.has(cacheKey)) {
     logRequestDebug("negative-cache-hit", { path, ms: 0 });
     return null;
   }
@@ -240,6 +240,7 @@ function mapMovieMetadata(details, credits, videos, images) {
   const year = dateYear(details.release_date);
   return stripEmpty({
     name: details.title,
+    imdbId: nonEmpty(details.imdb_id) || nonEmpty(details.external_ids?.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
@@ -256,21 +257,21 @@ function mapMovieMetadata(details, credits, videos, images) {
   });
 }
 
-async function getMovieCatalogMetadata(tmdbId) {
+async function getMovieCatalogMetadata(tmdbId, options = {}) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
   // Include images in the appended response so Discover can use TMDb's
   // transparent title logo without adding a second network round-trip per movie.
-  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null");
+  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images,external_ids&include_image_language=en,null", options);
   return mapMovieMetadata(details, details?.credits, null, details?.images);
 }
 
-async function getSeriesCatalogMetadata(tmdbId) {
+async function getSeriesCatalogMetadata(tmdbId, options = {}) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
   // Append images alongside aggregate credits so Discover receives the
   // transparent title logo without an extra request for each series.
-  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null");
+  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null", options);
   return mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
 }
 
@@ -304,6 +305,7 @@ function mapSeriesMetadata(details, credits, videos, images) {
     : undefined;
   return stripEmpty({
     name: details.name,
+    imdbId: nonEmpty(details.external_ids?.imdb_id) || nonEmpty(details.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),

@@ -7,7 +7,7 @@ const { isPublicAddress, resolvePublicAddresses, safeFetch, getPinnedAgent } = r
 const { validateConfig } = require("./configValidation");
 const { Readable } = require("stream");
 const { parseEPGStream, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL } = require("./src/js/epgStreamParser");
-const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults } = require("./addon");
+const { M3UEPGAddon, normalizeGenre, matchesGenre, normalizeSearchText, matchesSearchText, matchesNormalizedSearchText, getCatalogueQueryResultCache, createCatalogueQueryCacheKey, cacheCatalogueQueryResults, omdbMetadataNeedsRefresh, catalogMetadataNeedsRefresh } = require("./addon");
 const { validTmdbId, tmdbConfigured, getMovieMetadata, getSeriesMetadata, mapMovieMetadata, mapSeriesMetadata, mapSeasonEpisodes } = require("./src/js/tmdbMetadata");
 const { normalizeTmdbId } = require("./src/js/providers/xtreamProvider");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
@@ -669,8 +669,10 @@ async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
     let enrichmentCalls = 0;
     addon.persistentCatalogMetaCache = {
         get: async key => key === "__catalog_prefetch_status__:movie"
-            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 1 }, fresh: true }
-            : null,
+            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 3 }, fresh: true }
+            : key === "movie-1"
+                ? { value: { name: "Movie 1", description: "Cached preview", metadataVersion: 3, _tmdbId: null, imdbIdChecked: true }, savedAt: Date.now(), fresh: true }
+                : null,
         set: async () => {},
         flush: async () => {},
     };
@@ -802,6 +804,72 @@ async function testStreamingEpgParserHonorsSharedAggregateBudget() {
     assert.strictEqual(Object.values(parsed).reduce((sum, items) => sum + items.length, 0), 1);
 }
 
+function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
+    const now = Date.now();
+    const complete = {
+        type: "movie",
+        poster: "poster.jpg",
+        description: "A description",
+        genres: ["Drama"],
+        year: 2020,
+        runtime: "120 min",
+        tmdbRating: "7.2",
+        cast: ["Actor One"],
+        director: "Director One",
+        metadataCheckedAt: now
+    };
+    assert.strictEqual(catalogMetadataNeedsRefresh(complete), false,
+        "complete metadata should not use the missing-data retry path");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, description: undefined, metadataCheckedAt: now
+    }), false, "recently checked missing fields should respect the retry window");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, description: undefined, metadataCheckedAt: now - 12 * 60 * 60 * 1000 - 1000
+    }), true, "missing description should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, poster: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing poster should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, background: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing backdrop should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, runtime: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "missing runtime should retry after twelve hours");
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete, type: "series", director: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
+    }), false, "series should not be considered incomplete solely for lacking a movie director");
+}
+
+function testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow() {
+    const now = Date.now();
+    const recentMissingRating = {
+        imdbId: "tt1234567",
+        runtime: "120 min",
+        omdbChecked: true,
+        omdbCheckedAt: now
+    };
+    assert.strictEqual(omdbMetadataNeedsRefresh(recentMissingRating), false,
+        "a recently checked missing rating should respect the retry window");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        ...recentMissingRating,
+        omdbCheckedAt: now - 12 * 60 * 60 * 1000 - 1000
+    }), true, "a missing rating should become refreshable after twelve hours");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        imdbId: "tt1234567",
+        imdbRating: "7.8",
+        runtime: "120 min",
+        omdbCheckedAt: now - 30 * 24 * 60 * 60 * 1000
+    }), false, "complete OMDb rating and runtime should not be retried by the missing-data path");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        imdbId: "tt1234567",
+        imdbRating: "7.8",
+        omdbCheckedAt: now - 13 * 60 * 60 * 1000
+    }), true, "a missing runtime should also trigger a retry after twelve hours");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
+        name: "No IMDb ID"
+    }), false, "items without an IMDb ID cannot be looked up by OMDb");
+}
+
 async function main() {
     const tests = [
         testEncryptedConfigRoundTrip,
@@ -827,6 +895,8 @@ async function main() {
         testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
         testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
+        testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow,
+        testCatalogMissingMetadataUsesTwelveHourRetryWindow,
         testConcurrentSeriesInfoLookupsAreDeduplicated,
         testMovieTmdbMissIsCached,
         testMovieMetadataMapping,

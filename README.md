@@ -181,7 +181,7 @@ curl -X POST http://localhost:7000/api/prefetch \
 
 Set `PERSISTENT_DATA_DIR` to a **mounted persistent volume**, for example `/data` when that is the mount path configured for the service. The addon stores a configuration-namespaced snapshot of the full live/movie/series catalogue and parsed XMLTV guide, plus enhanced movie/series metadata in a subdirectory. Writes use a temporary file and atomic rename; incomplete refreshes do not replace the last-known-good snapshot.
 
-The provider catalogue and EPG refresh after 24 hours by default. Enhanced metadata entries are considered fresh for 24 hours and may be served from the saved snapshot at startup. If a refresh fails, the addon retains the previous catalogue/guide and can fall back to saved metadata for up to seven days. These files contain provider URLs and catalogue data, so the mounted volume should be private to this service.
+The provider catalogue and EPG refresh after 12 hours by default. Catalogue metadata warm-up also checks every 12 hours, while complete enriched metadata remains fresh for 14 days by default. Entries missing key combined metadata fields across provider/TMDb/OMDb (poster, description, genres, year/release info, runtime, rating, or cast; plus director for movies) are eligible for a retry after 12 hours (configured by OMDB_MISSING_DATA_RETRY_MS). Incomplete records re-check TMDb while bypassing its response cache, and retry OMDb when its rating/runtime are missing; complete enriched metadata still uses the normal 14-day refresh interval. If a refresh fails, the addon retains the previous catalogue/guide and can fall back to saved metadata for up to seven days. These files contain provider URLs and catalogue data, so the mounted volume should be private to this service.
 
 **Important:** setting the environment variable alone does not create persistent storage. Configure a persistent volume in the hosting service and set the variable to its actual mount path. If the variable is unset, the addon continues using its existing in-memory/optional Redis caches and disk persistence is disabled.
 
@@ -197,9 +197,11 @@ The provider catalogue and EPG refresh after 24 hours by default. Enhanced metad
 | `CACHE_ENABLED` | `true` | Master toggle for LRU + Redis |
 | `CACHE_TTL_MS` | `21600000` (6h) | TTL for cached data |
 | `PERSISTENT_DATA_DIR` | unset | Mounted persistent directory for full provider catalogue + XMLTV EPG and enhanced metadata; set to the mount path (for Railway, commonly `/data`) to enable disk persistence |
-| `DATA_REFRESH_INTERVAL_MS` | `86400000` (24h) | Minimum interval between successful provider catalogue and EPG refreshes |
+| `DATA_REFRESH_INTERVAL_MS` | `43200000` (12h) | Minimum interval between successful provider catalogue and EPG refreshes |
 | `CATALOG_META_CACHE_TTL_MS` | `86400000` (24h) | Freshness window for persisted enhanced movie/series metadata |
 | `CATALOG_META_STALE_RETENTION_MS` | `604800000` (7d) | How long last-good enhanced metadata may be used if refresh fails |
+| `CATALOG_PREFETCH_REFRESH_MS` | `43200000` (12h) | How often the full catalogue warm-up rechecks metadata completeness; per-item metadata retains its own freshness window |
+| `OMDB_MISSING_DATA_RETRY_MS` | `43200000` (12h) | Retry interval for items with missing key metadata fields across provider/TMDb/OMDb |
 | `MAX_CACHE_ENTRIES` | `100` | Maximum entries in each in-memory cache; values are bounded by the server | LRU entry cap; values are bounded by the server |
 | `CONFIG_SECRET` | unset | Required to create/decrypt encrypted tokens; use a unique random secret (prefer 32+ random bytes; minimum 16 characters) |
 | `DEBUG_MODE` | `false` | Enables verbose diagnostic logs |

@@ -4,7 +4,9 @@ const fs = require("fs/promises");
 const path = require("path");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
+// A full movie + series catalogue can exceed 64 MiB once metadata is enriched.
+// Allow room for the current ~27k-title library while still rejecting unexpectedly huge files.
+const MAX_FILE_BYTES = 256 * 1024 * 1024;
 
 function parsePositiveInteger(value, fallback, min, max) {
     const parsed = Number.parseInt(value, 10);
@@ -31,11 +33,11 @@ class PersistentCatalogMetaCache {
             : null;
         this.ttlMs = parsePositiveInteger(
             options.ttlMs ?? process.env.CATALOG_META_CACHE_TTL_MS,
-            DAY_MS, 1000, 30 * DAY_MS
+            14 * DAY_MS, 1000, 30 * DAY_MS
         );
         this.staleRetentionMs = parsePositiveInteger(
             options.staleRetentionMs ?? process.env.CATALOG_META_STALE_RETENTION_MS,
-            7 * DAY_MS, this.ttlMs, 90 * DAY_MS
+            30 * DAY_MS, this.ttlMs, 90 * DAY_MS
         );
         this.maxEntries = parsePositiveInteger(
             options.maxEntries ?? process.env.CATALOG_META_PERSISTENT_MAX_ENTRIES,
@@ -71,6 +73,12 @@ class PersistentCatalogMetaCache {
                         this.entries.set(key, { savedAt: entry.savedAt, value: entry.value });
                     }
                     this.prune();
+                    console.log("[CATALOG-CACHE] Loaded persistent metadata cache", {
+                        entries: this.entries.size,
+                        bytes: stat.size,
+                        freshEntries: [...this.entries.values()].filter(entry => now - entry.savedAt < this.ttlMs).length,
+                        staleFallbackEntries: [...this.entries.values()].filter(entry => now - entry.savedAt >= this.ttlMs).length
+                    });
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
                         console.warn("[CATALOG-CACHE] Could not load persistent metadata cache:", error?.name || "Error");
@@ -158,12 +166,20 @@ class PersistentCatalogMetaCache {
             version: 1,
             entries: Object.fromEntries(this.entries),
         });
+        if (Buffer.byteLength(snapshot, "utf8") > MAX_FILE_BYTES) {
+            this.dirty = true;
+            throw new Error("persistent catalogue metadata cache exceeds the 256 MiB safety limit");
+        }
         this.writePromise = (async () => {
             await fs.mkdir(this.directory, { recursive: true });
             const tempPath = this.filePath + "." + process.pid + ".tmp";
             try {
                 await fs.writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
                 await fs.rename(tempPath, this.filePath);
+                console.log("[CATALOG-CACHE] Saved persistent metadata cache", {
+                    entries: this.entries.size,
+                    bytes: Buffer.byteLength(snapshot, "utf8")
+                });
             } finally {
                 await fs.unlink(tempPath).catch(() => {});
             }
