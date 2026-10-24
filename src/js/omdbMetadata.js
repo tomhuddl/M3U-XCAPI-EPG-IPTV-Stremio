@@ -14,6 +14,47 @@ const USAGE_FILE = path.join(DATA_DIR, "omdb-usage.json");
 let usageState = null;
 let usageLoadPromise = null;
 let usageWriteQueue = Promise.resolve();
+const diagnostics = {
+  apiKeyConfigured: Boolean(API_KEY),
+  attempts: 0,
+  successWithRating: 0,
+  successWithoutRating: 0,
+  retryableFailures: 0,
+  definitiveNoMatch: 0,
+  skippedInvalidImdbId: 0,
+  lastOutcome: "not-started"
+};
+let diagnosticLogCount = 0;
+
+function recordOutcome(outcome, details = {}) {
+  diagnostics.lastOutcome = outcome;
+  if (outcome === "success-with-rating") diagnostics.successWithRating++;
+  else if (outcome === "success-without-rating") diagnostics.successWithoutRating++;
+  else if (outcome === "retryable-failure") diagnostics.retryableFailures++;
+  else if (outcome === "definitive-no-match") diagnostics.definitiveNoMatch++;
+  // Emit a small, bounded sample plus periodic counters. Never log the API key or full URL.
+  diagnosticLogCount++;
+  if (diagnosticLogCount <= 5 || diagnosticLogCount % 100 === 0) {
+    console.info("[OMDB] Lookup diagnostic", {
+      outcome,
+      attempts: diagnostics.attempts,
+      successWithRating: diagnostics.successWithRating,
+      successWithoutRating: diagnostics.successWithoutRating,
+      retryableFailures: diagnostics.retryableFailures,
+      definitiveNoMatch: diagnostics.definitiveNoMatch,
+      ...details
+    });
+  }
+}
+
+function getDiagnostics() {
+  return { ...diagnostics };
+}
+
+console.info("[OMDB] Runtime configuration", {
+  apiKeyConfigured: diagnostics.apiKeyConfigured,
+  dailyRequestLimit: DAILY_REQUEST_LIMIT
+});
 
 async function loadUsageState() {
   if (usageState) return usageState;
@@ -159,4 +200,4 @@ function shouldRetryLookup(value) {
   return Boolean(imdbId && retryableFailures.get(imdbId));
 }
 
-module.exports = { getByImdbId, validImdbId, shouldRetryLookup };
+module.exports = { getByImdbId, validImdbId, shouldRetryLookup, getDiagnostics };
