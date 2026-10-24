@@ -1403,7 +1403,6 @@ class M3UEPGAddon {
                     if (!value || !String(value.name || '').trim() ||
                         value.metadataVersion < 3 ||
                         (value._tmdbId && !value.imdbId && value.imdbIdChecked !== true) ||
-                        value.omdbPending === true ||
                         (omdbMetadataNeedsRefresh(value) || catalogMetadataNeedsRefresh(value))) {
                         cachedCatalogueNeedsRefresh = true;
                         break;
@@ -1438,7 +1437,7 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || cached.omdbPending === true || (omdbMetadataNeedsRefresh(cached) || catalogMetadataNeedsRefresh(cached))) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || (omdbMetadataNeedsRefresh(cached) || catalogMetadataNeedsRefresh(cached))) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1580,7 +1579,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !persisted.value?.omdbPending && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !(omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
@@ -1611,7 +1610,6 @@ class M3UEPGAddon {
             const persistedIsDue = persistedIsUsable &&
                 (persisted.value.metadataVersion < 3 ||
                     (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
-                    persisted.value.omdbPending === true ||
                     (omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) ||
                     Date.now() - persisted.savedAt >= metadataRefreshInterval);
             if (persistedIsUsable && !persistedIsDue) {
