@@ -2165,13 +2165,25 @@ async function createAddon(config) {
                         return Number.isFinite(numeric) && numeric >= 0 && numeric <= 10;
                     };
 
+                    const cachedPreview = addonInstance.catalogMetaCache?.get(id);
                     let rating = meta.imdbRating;
-                    if (!isValidRating(rating)) {
-                        const cachedPreview = addonInstance.catalogMetaCache?.get(id);
-                        if (isValidRating(cachedPreview?.imdbRating)) {
-                            rating = cachedPreview.imdbRating;
-                        }
+                    if (!isValidRating(rating) && isValidRating(cachedPreview?.imdbRating)) {
+                        rating = cachedPreview.imdbRating;
                     }
+
+                    // A series detail response can have its rating recovered from the
+                    // catalogue cache while its IMDb ID/link is missing from TMDb metadata.
+                    // Recover the ID from that same enriched preview and expose the native
+                    // IMDb link on the final detail response.
+                    const imdbId = String(
+                        meta.imdb_id || meta.imdbId ||
+                        cachedPreview?.imdb_id || cachedPreview?.imdbId || ''
+                    ).trim();
+                    if (/^tt\\d+$/.test(imdbId)) {
+                        meta.imdb_id = imdbId;
+                        if (!meta.imdbId) meta.imdbId = imdbId;
+                    }
+
                     if (!isValidRating(rating) && Array.isArray(meta.links)) {
                         const imdbRatingLink = meta.links.find((link) =>
                             link && typeof link.name === 'string' &&
@@ -2185,6 +2197,20 @@ async function createAddon(config) {
                         }
                     }
                     if (isValidRating(rating)) meta.imdbRating = String(rating);
+                    if (/^tt\\d+$/.test(imdbId) && isValidRating(rating)) {
+                        if (!Array.isArray(meta.links)) meta.links = [];
+                        const existingImdbLink = meta.links.some(link =>
+                            String(link?.category || '').toLowerCase() === 'imdb' &&
+                            /imdb\\.com\\/title\\//i.test(String(link?.url || ''))
+                        );
+                        if (!existingImdbLink) {
+                            meta.links.unshift({
+                                name: String(rating),
+                                category: 'imdb',
+                                url: 'https://imdb.com/title/' + encodeURIComponent(imdbId)
+                            });
+                        }
+                    }
                     return meta;
                 };
 
