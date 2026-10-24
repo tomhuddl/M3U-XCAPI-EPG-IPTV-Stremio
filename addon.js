@@ -2119,3 +2119,4 @@ module.exports.createNormalizedSearchMatcher = createNormalizedSearchMatcher;
 module.exports.getCatalogueQueryResultCache = getCatalogueQueryResultCache;
 module.exports.createCatalogueQueryCacheKey = createCatalogueQueryCacheKey;
 module.exports.cacheCatalogueQueryResults = cacheCatalogueQueryResults;
+module.exports.omdbMetadataNeedsRefresh = omdbMetadataNeedsRefresh;
