@@ -2084,11 +2084,11 @@ async function createAddon(config) {
                     if (!isValidRating(rating) && Array.isArray(meta.links)) {
                         const imdbRatingLink = meta.links.find((link) =>
                             link && typeof link.name === 'string' &&
-                            /^IMDb rating:\\s*(?:10(?:\\.0+)?|[0-9](?:\\.[0-9]+)?)$/i.test(link.name.trim())
+                            /^IMDb rating:\s*(?:10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(link.name.trim())
                         );
                         if (imdbRatingLink) {
                             const match = imdbRatingLink.name.trim().match(
-                                /^IMDb rating:\\s*(10(?:\\.0+)?|[0-9](?:\\.[0-9]+)?)$/i
+                                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
                             );
                             if (match) rating = match[1];
                         }
