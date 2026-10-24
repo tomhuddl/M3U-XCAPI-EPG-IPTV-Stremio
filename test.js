@@ -829,6 +829,7 @@ function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
     const complete = {
         type: "movie",
         poster: "poster.jpg",
+        background: "background.jpg",
         description: "A description",
         genres: ["Drama"],
         year: 2020,
