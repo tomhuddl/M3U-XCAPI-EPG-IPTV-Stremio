@@ -1279,24 +1279,35 @@ class M3UEPGAddon {
 
             const omdbCatalogueSummary = {
                 items: items.length,
-                cachedEntries: 0,
+                persistentEntries: 0,
+                missingPersistentPreview: 0,
                 withImdbId: 0,
                 withImdbRating: 0,
                 awaitingOmdbCheck: 0,
                 omdbPending: 0,
-                missingPreview: 0
+                withoutImdbId: 0,
+                markedCheckedWithoutRating: 0
             };
+            // Read the persistent cache rather than catalogMetaCache (an LRU capped
+            // at 1,000 items); otherwise this report falsely labels the rest of the
+            // provider catalogue as missing.
             for (const item of items) {
-                const cached = this.catalogMetaCache.get(item.id);
-                if (!cached) {
-                    omdbCatalogueSummary.missingPreview++;
+                const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                const value = saved?.value;
+                if (!value) {
+                    omdbCatalogueSummary.missingPersistentPreview++;
                     continue;
                 }
-                omdbCatalogueSummary.cachedEntries++;
-                if (cached.imdbId) omdbCatalogueSummary.withImdbId++;
-                if (cached.imdbRating) omdbCatalogueSummary.withImdbRating++;
-                if (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true) omdbCatalogueSummary.awaitingOmdbCheck++;
-                if (cached.omdbPending === true) omdbCatalogueSummary.omdbPending++;
+                omdbCatalogueSummary.persistentEntries++;
+                if (value.imdbId) {
+                    omdbCatalogueSummary.withImdbId++;
+                    if (value.imdbRating) omdbCatalogueSummary.withImdbRating++;
+                    if (!value.imdbRating && value.omdbChecked !== true) omdbCatalogueSummary.awaitingOmdbCheck++;
+                    if (!value.imdbRating && value.omdbChecked === true) omdbCatalogueSummary.markedCheckedWithoutRating++;
+                } else {
+                    omdbCatalogueSummary.withoutImdbId++;
+                }
+                if (value.omdbPending === true) omdbCatalogueSummary.omdbPending++;
             }
             this.log.info('Catalogue metadata diagnostics', {
                 type,
