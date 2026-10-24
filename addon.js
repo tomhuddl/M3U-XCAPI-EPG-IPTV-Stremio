@@ -968,6 +968,10 @@ class M3UEPGAddon {
         const info = await this.ensureSeriesInfo(seriesIdRaw);
         const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
         const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
+        // The detailed series view also exposes IMDb rating/runtime fallbacks.
+        // Keep this lookup local to the function rather than referencing an
+        // undefined catalogue-preview variable.
+        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
         const tmdbSeasons = new Map();
         if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
             const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
@@ -1051,7 +1055,10 @@ class M3UEPGAddon {
             genres: tmdb.genres,
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
-            runtime: tmdb.runtime,
+            runtime: tmdb.runtime || omdb?.runtime,
+            metadataVersion: 2,
+            imdbId: tmdb.imdbId || omdb?.imdbId,
+            imdbRating: omdb?.imdbRating,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
