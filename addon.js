@@ -10,6 +10,20 @@ const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
 
+// Retry incomplete OMDb data independently of the longer metadata refresh interval.
+// Missing ratings/runtime are retried at most once per configured interval.
+const OMDB_MISSING_DATA_RETRY_MS = parsePositiveInteger(
+    process.env.OMDB_MISSING_DATA_RETRY_MS, 12 * 60 * 60 * 1000,
+    60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+);
+
+function omdbMetadataNeedsRefresh(value) {
+    if (!value || !value.imdbId) return false;
+    if (value.imdbRating && value.runtime) return false;
+    const checkedAt = Number(value.omdbCheckedAt) || 0;
+    return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+}
+
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
 
 let redisClient = null;
@@ -1234,7 +1248,7 @@ class M3UEPGAddon {
                         value.metadataVersion < 3 ||
                         (value._tmdbId && !value.imdbId && value.imdbIdChecked !== true) ||
                         value.omdbPending === true ||
-                        (value.imdbId && !value.imdbRating && value.omdbChecked !== true)) {
+                        omdbMetadataNeedsRefresh(value)) {
                         cachedCatalogueNeedsRefresh = true;
                         break;
                     }
@@ -1268,7 +1282,7 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || cached.omdbPending === true || (cached.imdbId && !cached.imdbRating && cached.omdbChecked !== true)) missingMetadata++;
+                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || cached.omdbPending === true || omdbMetadataNeedsRefresh(cached)) missingMetadata++;
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
@@ -1410,7 +1424,7 @@ class M3UEPGAddon {
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
-            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !persisted.value?.omdbPending && !(persisted.value?.imdbId && !persisted.value?.imdbRating && persisted.value?.omdbChecked !== true) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
+            if (!persisted || (persisted.value?.metadataVersion >= 3 && !(persisted.value?._tmdbId && !persisted.value?.imdbId && persisted.value?.imdbIdChecked !== true) && !persisted.value?.omdbPending && !omdbMetadataNeedsRefresh(persisted.value) && Date.now() - persisted.savedAt < refreshInterval)) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
@@ -1442,13 +1456,13 @@ class M3UEPGAddon {
                 (persisted.value.metadataVersion < 3 ||
                     (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
                     persisted.value.omdbPending === true ||
-                    (persisted.value.imdbId && !persisted.value.imdbRating && persisted.value.omdbChecked !== true) ||
+                    omdbMetadataNeedsRefresh(persisted.value) ||
                     Date.now() - persisted.savedAt >= metadataRefreshInterval);
             if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
-            const refreshed = await this._getCatalogMetaAsync(id, type);
+            const refreshed = await this._getCatalogMetaAsync(id, type, omdbMetadataNeedsRefresh(persisted?.value));
             if (refreshed) return refreshed;
             if (persisted?.value && isUsablePreview(persisted.value)) {
                 this.catalogMetaStaleFallbacks.add(key);
@@ -1466,7 +1480,7 @@ class M3UEPGAddon {
         }
     }
 
-    async _getCatalogMetaAsync(id, type) {
+    async _getCatalogMetaAsync(id, type, refreshIncompleteOmdb = false) {
         // Discover cards do not need episode lists, trailers, or logo-image lookups.
         // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
         if (type === 'series' || id.startsWith('iptv_series_')) {
@@ -1497,7 +1511,7 @@ class M3UEPGAddon {
                 };
             }
             if (!tmdb) return null;
-            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
+            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteOmdb }) : null;
             this.log.debug('Catalogue metadata stages', {
                 type: 'series',
                 id: seriesItem.id,
@@ -1526,6 +1540,7 @@ class M3UEPGAddon {
                 imdbId: tmdb.imdbId || omdb?.imdbId,
                 imdbRating: omdb?.imdbRating,
                 omdbChecked: omdb?.omdbChecked === true,
+                omdbCheckedAt: omdb?.omdbCheckedAt,
                 omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
@@ -1549,7 +1564,7 @@ class M3UEPGAddon {
         const providerLookupMs = Date.now() - providerLookupStartedAt;
         const tmdbLookupStartedAt = Date.now();
         const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId);
-        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId) : null;
+        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteOmdb }) : null;
         this.log.debug('Catalogue metadata stages', {
             type: 'movie',
             id: item.id,
@@ -1578,6 +1593,7 @@ class M3UEPGAddon {
             imdbId: tmdb.imdbId || omdb?.imdbId,
             imdbRating: omdb?.imdbRating,
             omdbChecked: omdb?.omdbChecked === true,
+            omdbCheckedAt: omdb?.omdbCheckedAt,
             omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
             director: tmdb.director,
             cast: tmdb.cast,
