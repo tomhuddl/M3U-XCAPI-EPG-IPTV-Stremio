@@ -1093,7 +1093,7 @@ class M3UEPGAddon {
             runtime: tmdb.runtime || seriesItem.runtime || omdb?.runtime,
             metadataVersion: 2,
             imdbId: tmdb.imdbId || omdb?.imdbId,
-            imdbRating: omdb?.imdbRating,
+            imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
@@ -1562,7 +1562,7 @@ class M3UEPGAddon {
                 _tmdbId: tmdbId || null,
                 imdbIdChecked: Boolean(tmdb),
                 imdbId: tmdb.imdbId || omdb?.imdbId,
-                imdbRating: omdb?.imdbRating,
+                imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
                 omdbChecked: omdb?.omdbChecked === true,
                 omdbCheckedAt: omdb?.omdbCheckedAt,
                 omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
@@ -1615,7 +1615,7 @@ class M3UEPGAddon {
             _tmdbId: tmdbId || null,
             imdbIdChecked: Boolean(tmdb),
             imdbId: tmdb.imdbId || omdb?.imdbId,
-            imdbRating: omdb?.imdbRating,
+            imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
             omdbChecked: omdb?.omdbChecked === true,
             omdbCheckedAt: omdb?.omdbCheckedAt,
             omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
@@ -1664,7 +1664,7 @@ class M3UEPGAddon {
                 year: tmdb.year,
                 runtime: tmdb.runtime || item.runtime || omdb?.runtime,
                 imdbId: tmdb.imdbId || omdb?.imdbId,
-                imdbRating: omdb?.imdbRating,
+                imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
                 director: tmdb.director,
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
@@ -1990,7 +1990,17 @@ async function createAddon(config) {
                     if (i.type !== 'movie' && i.type !== 'series') return meta;
 
                     const cached = addonInstance.catalogMetaCache.get(i.id);
-                    if (cached) return { ...meta, ...cached, id: i.id, type: i.type };
+                    if (cached) return {
+                        ...meta,
+                        ...cached,
+                        id: i.id,
+                        type: i.type,
+                        // Stremio's MetaPreview schema specifies imdbRating as a string.
+                        // Normalize older persisted numeric values as well as new lookups.
+                        ...(cached.imdbRating != null && cached.imdbRating !== ''
+                            ? { imdbRating: String(cached.imdbRating) }
+                            : {})
+                    };
 
                     // Foreground enrichment has finished for this page. If TMDb or
                     // the provider could not supply a richer preview, retain the base
