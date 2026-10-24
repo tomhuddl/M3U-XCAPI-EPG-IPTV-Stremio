@@ -1119,10 +1119,6 @@ class M3UEPGAddon {
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
-            links: [
-                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
-                ...(tmdb.links || [])
-            ],
             videos
         };
     }
@@ -1590,11 +1586,6 @@ class M3UEPGAddon {
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: [],
-                links: [
-                    ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
-                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) }] : []),
-                    ...(tmdb.links || [])
-                ]
             };
         }
 
@@ -1645,11 +1636,6 @@ class M3UEPGAddon {
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
             trailers: [],
-            links: [
-                ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
-                ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
-                ...(tmdb.links || [])
-            ]
         };
     }
 
@@ -1691,11 +1677,6 @@ class M3UEPGAddon {
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: tmdb.trailer ? [{ source: tmdb.trailer.id, type: 'Trailer' }] : [],
-                links: [
-                    ...(omdb?.imdbRating ? [{ name: 'IMDb rating: ' + omdb.imdbRating, category: 'Rating', url: 'https://www.imdb.com/title/' + encodeURIComponent(String(tmdb.imdbId)) }] : []),
-                    ...(tmdb.rating ? [{ name: 'TMDb rating: ' + tmdb.rating, category: 'Rating', url: 'https://www.themoviedb.org/movie/' + encodeURIComponent(String(tmdbId)) }] : []),
-                    ...(tmdb.links || [])
-                ]
             };
         }
         // Live-channel metadata remains unchanged; it is not film/series metadata.
