@@ -2155,15 +2155,23 @@ async function createAddon(config) {
                         }
                     }
                 }
-                if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Meta request', {
-                        id, type, found: !!meta,
-                        imdbRating: meta?.imdbRating ?? null,
-                        imdbId: meta?.imdbId ?? null,
-                        ratingLinks: Array.isArray(meta?.links)
+                if (meta && (type === 'movie' || type === 'series')) {
+                    // Log the final field Stremio uses for the native rating header even
+                    // when general debug logging is disabled, so live deployments can be
+                    // diagnosed without enabling verbose request logs.
+                    console.log('[META-RATING] Final detail response', {
+                        id,
+                        type,
+                        imdbRating: meta.imdbRating ?? null,
+                        imdbRatingType: typeof meta.imdbRating,
+                        imdbId: meta.imdbId ?? null,
+                        ratingLinks: Array.isArray(meta.links)
                             ? meta.links.filter(link => /^IMDb rating:/i.test(String(link?.name || ''))).length
                             : 0
                     });
+                }
+                if (addonInstance.config.debug) {
+                    console.log('[DEBUG] Meta request', { id, type, found: !!meta });
                 }
                 return { meta };
             } catch (e) {
