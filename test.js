@@ -669,9 +669,9 @@ async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
     let enrichmentCalls = 0;
     addon.persistentCatalogMetaCache = {
         get: async key => key === "__catalog_prefetch_status__:movie"
-            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 2 }, fresh: true }
+            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 3 }, fresh: true }
             : key === "movie-1"
-                ? { value: { name: "Movie 1", description: "Cached preview", metadataVersion: 2 }, savedAt: Date.now(), fresh: true }
+                ? { value: { name: "Movie 1", description: "Cached preview", metadataVersion: 3, _tmdbId: null, imdbIdChecked: true }, savedAt: Date.now(), fresh: true }
                 : null,
         set: async () => {},
         flush: async () => {},
