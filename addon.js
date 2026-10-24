@@ -1094,9 +1094,7 @@ class M3UEPGAddon {
                         this.catalogMetaStaleFallbacks.delete(item.id)
                     );
                     const preview = { ...detailed };
-                    delete preview.tmdbRating;
                     if (Array.isArray(preview.links)) {
-                        preview.links = preview.links.filter(link => link?.category !== 'Rating');
                     }
                     const providerGenre = item.category || item.attributes?.['group-title'];
                     let fallbackPreview;
@@ -1146,9 +1144,7 @@ class M3UEPGAddon {
                             const loadedFromCache = this.catalogMetaCache.get(next.id) !== undefined ||
                                 this.catalogMetaStaleFallbacks.delete(next.id);
                             const preview = { ...detailed };
-                            delete preview.tmdbRating;
                             if (Array.isArray(preview.links)) {
-                                preview.links = preview.links.filter(link => link?.category !== 'Rating');
                             }
                             const providerGenre = next.category || next.attributes?.['group-title'];
                             let fallbackPreview;
