@@ -1224,16 +1224,36 @@ class M3UEPGAddon {
             const sameCatalogue = persistedStatus?.value?.catalogueFingerprint === catalogueFingerprint;
             // The completion marker has its own completedAt timestamp; do not
             // couple daily scheduling to the metadata entries' freshness TTL.
+            let cachedCatalogueNeedsRefresh = false;
             if (persistedStatus && sameCatalogue &&
                 Number(persistedStatus.value?.version) >= 2 &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
-                this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
-                this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
-                this.catalogPrefetchRetryAfter.delete(type);
-                this.log.info('Persistent catalogue metadata is already warm', {
-                    type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                // A completion marker alone is not proof that every cached preview
+                // contains the current OMDb lookup state. Older markers can survive
+                // code changes, so inspect saved entries before skipping the warm-up.
+                for (const item of items) {
+                    const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                    const value = saved?.value;
+                    if (!value || !String(value.name || '').trim() ||
+                        value.metadataVersion < 2 ||
+                        value.omdbPending === true ||
+                        (value.imdbId && !value.imdbRating && value.omdbChecked !== true)) {
+                        cachedCatalogueNeedsRefresh = true;
+                        break;
+                    }
+                }
+                if (!cachedCatalogueNeedsRefresh) {
+                    this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                    this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
+                    this.catalogPrefetchRetryAfter.delete(type);
+                    this.log.info('Persistent catalogue metadata is already warm', {
+                        type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
+                    });
+                    return;
+                }
+                this.log.info('Persistent catalogue metadata requires refresh despite completion marker', {
+                    type, total: items.length
                 });
-                return;
             }
 
             let processed = 0;
