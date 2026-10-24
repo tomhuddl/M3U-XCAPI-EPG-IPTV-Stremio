@@ -1218,6 +1218,7 @@ class M3UEPGAddon {
             // The completion marker has its own completedAt timestamp; do not
             // couple daily scheduling to the metadata entries' freshness TTL.
             if (persistedStatus && sameCatalogue &&
+                Number(persistedStatus.value?.version) >= 2 &&
                 Date.now() - persistedCompletedAt < refreshInterval) {
                 this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                 this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
@@ -1261,7 +1262,7 @@ class M3UEPGAddon {
                     completedAt,
                     catalogueCount: items.length,
                     catalogueFingerprint,
-                    version: 1
+                    version: 2
                 });
                 // Ensure metadata and its completion marker reach the persistent
                 // volume before reporting the warm-up as durable.
