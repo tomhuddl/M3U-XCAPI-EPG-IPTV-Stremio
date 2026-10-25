@@ -988,12 +988,15 @@ class M3UEPGAddon {
                 }
             }
             this.buildGenresInManifest();
-            this.log.debug('Data update complete', {
+            this.log.info('Provider data refresh complete', {
                 channels: this.channels.length,
                 movies: this.movies.length,
                 series: this.series.length,
                 epgChannels: Object.keys(this.epgData || {}).length,
-                ms: Date.now() - start
+                epgProgrammes: Object.values(this.epgData || {}).reduce(
+                    (total, programmes) => total + (Array.isArray(programmes) ? programmes.length : 0), 0
+                ),
+                durationMs: Date.now() - start
             });
         } catch (e) {
             this.channels = previous.channels;
