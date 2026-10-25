@@ -1393,10 +1393,10 @@ class M3UEPGAddon {
         const now = Date.now();
         preview = {
             ...preview,
-            metadataCheckedAt: preserveMetadataCheckedAt && previousMetadataCheckedAt > 0
+            metadataCheckedAt: previousMetadataCheckedAt > 0
                 ? previousMetadataCheckedAt
                 : now,
-            missingMetadataCheckedAt: preserveMissingMetadataCheckedAt && previousMissingMetadataCheckedAt > 0
+            missingMetadataCheckedAt: previousMissingMetadataCheckedAt > 0
                 ? previousMissingMetadataCheckedAt
                 : now
         };
@@ -1698,6 +1698,7 @@ class M3UEPGAddon {
                 // Keep retry timestamps from the latest attempt even if some fields
                 // fell back, so absent upstream fields are not retried on every open.
                 merged.metadataCheckedAt = refreshed.metadataCheckedAt || Date.now();
+                merged.missingMetadataCheckedAt = Date.now();
                 this.catalogMetaCache.set(key, merged);
                 await this.persistentCatalogMetaCache.set(key, merged);
                 return merged;
