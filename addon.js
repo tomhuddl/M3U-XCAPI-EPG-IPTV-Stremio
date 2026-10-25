@@ -121,7 +121,10 @@ function catalogMetadataNeedsRefresh(value) {
         value.type === 'movie' && !value.director
     ].some(Boolean);
     if (!missing) return false;
-    const checkedAt = Number(value.metadataCheckedAt) || 0;
+    // Keep missing-field retry timing separate from the normal metadata
+    // refresh timestamp. Older persisted entries migrate via metadataCheckedAt.
+    const checkedAt = Number(value.missingMetadataCheckedAt) ||
+        Number(value.metadataCheckedAt) || 0;
     return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
 }
 
@@ -1153,7 +1156,7 @@ class M3UEPGAddon {
             // This write updates OMDb fields only. Preserve the catalogue/TMDb
             // refresh timestamp so opening a detail page cannot postpone the next
             // scheduled metadata refresh.
-            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true, true);
+            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true, true, true);
             return result;
         }
 
@@ -1381,16 +1384,21 @@ class M3UEPGAddon {
         runNext();
     }
 
-    cacheCatalogMetaPreview(id, preview, persist = true, preserveMetadataCheckedAt = false) {
-        // Record the last catalogue enrichment attempt even when an upstream source
-        // has no value for a field, preventing repeated retries on every card request.
-        // Detail-page OMDb-only writes must not reset this separate timestamp.
+    cacheCatalogMetaPreview(id, preview, persist = true, preserveMetadataCheckedAt = false, preserveMissingMetadataCheckedAt = false) {
+        // Record completed catalogue attempts separately from the normal metadata
+        // refresh clock. Missing fields should be reconsidered after 12 hours, while
+        // detail-page OMDb-only writes must not postpone either catalogue schedule.
         const previousMetadataCheckedAt = Number(preview?.metadataCheckedAt) || 0;
+        const previousMissingMetadataCheckedAt = Number(preview?.missingMetadataCheckedAt) || 0;
+        const now = Date.now();
         preview = {
             ...preview,
             metadataCheckedAt: preserveMetadataCheckedAt && previousMetadataCheckedAt > 0
                 ? previousMetadataCheckedAt
-                : Date.now()
+                : now,
+            missingMetadataCheckedAt: preserveMissingMetadataCheckedAt && previousMissingMetadataCheckedAt > 0
+                ? previousMissingMetadataCheckedAt
+                : now
         };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
@@ -1695,8 +1703,17 @@ class M3UEPGAddon {
                 return merged;
             }
             if (persisted?.value && isUsablePreview(persisted.value)) {
+                // A failed/empty upstream refresh is still an attempt. Persist its
+                // timestamp while retaining all known fields, otherwise a stale
+                // incomplete record can trigger a lookup on every request.
+                const retained = {
+                    ...persisted.value,
+                    missingMetadataCheckedAt: Date.now()
+                };
+                this.catalogMetaCache.set(key, retained);
+                await this.persistentCatalogMetaCache.set(key, retained);
                 this.catalogMetaStaleFallbacks.add(key);
-                return persisted.value;
+                return retained;
             }
             return null;
         })();
