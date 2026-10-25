@@ -461,7 +461,7 @@ class M3UEPGAddon {
         // rich cards without waiting on TMDb/Xtream for every item.
         this.catalogMetaCache = new LRUCache({
             max: parsePositiveInteger(process.env.CATALOG_META_CACHE_MAX, 1000, 50, 5000),
-            ttl: parsePositiveInteger(process.env.CATALOG_META_CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
+            ttl: parsePositiveInteger(process.env.CATALOG_META_MEMORY_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
         });
         this.catalogMetaPending = new Map();
         this.persistentCatalogMetaCache = new PersistentCatalogMetaCache(this.cacheKey);
@@ -523,17 +523,19 @@ class M3UEPGAddon {
     }
 
     async loadFromCache() {
-        if (!CACHE_ENABLED) return;
         const cacheKey = 'addon:data:' + this.cacheKey;
-        let cached = dataCache.get(cacheKey);
-        if (!cached && redisClient) {
+        // CACHE_ENABLED controls the in-memory/Redis layers only. A configured
+        // persistent snapshot must still be loaded when those layers are disabled,
+        // otherwise a saved last-good catalogue would be ignored on every restart.
+        let cached = CACHE_ENABLED ? dataCache.get(cacheKey) : null;
+        if (CACHE_ENABLED && !cached && redisClient) {
             cached = await redisGetJSON(cacheKey);
             if (cached) dataCache.set(cacheKey, cached);
         }
         if (!cached) {
             cached = await this.persistentAddonDataCache.load();
             if (cached) {
-                dataCache.set(cacheKey, cached);
+                if (CACHE_ENABLED) dataCache.set(cacheKey, cached);
                 this.log.info('Loaded provider catalogue and EPG from persistent storage');
             }
         }
@@ -929,6 +931,25 @@ class M3UEPGAddon {
             const start = Date.now();
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
             await providerModule.fetchData(this);
+
+            // Providers can return a partial success (for example, Xtream live and
+            // VOD endpoints work while get_series fails). Never let an unexpectedly
+            // empty section erase a previously populated section while other sections
+            // make the overall refresh look successful. Preserve ordering and IDs by
+            // retaining the exact last-good array; a truly empty provider section can
+            // still be accepted on first load when no previous data exists.
+            for (const section of ['channels', 'movies', 'series']) {
+                const previousItems = previous[section];
+                const currentItems = this[section];
+                if (Array.isArray(previousItems) && previousItems.length > 0 &&
+                    Array.isArray(currentItems) && currentItems.length === 0) {
+                    this[section] = previousItems;
+                    this.log.warn('Provider refresh returned an empty section; retaining last-known-good data', {
+                        section,
+                        previousCount: previousItems.length
+                    });
+                }
+            }
 
             // A catalogue refresh may succeed while an optional EPG source is down.
             // Keep the last-known-good guide instead of replacing it with an empty one.
