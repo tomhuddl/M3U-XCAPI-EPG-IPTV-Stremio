@@ -1163,7 +1163,7 @@ class M3UEPGAddon {
             // This write updates OMDb fields only. Preserve the catalogue/TMDb
             // refresh timestamp so opening a detail page cannot postpone the next
             // scheduled metadata refresh.
-            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true, true, true);
+            this.cacheCatalogMetaPreview(String(itemId), updatedPreview, true);
             return result;
         }
 
@@ -1391,21 +1391,17 @@ class M3UEPGAddon {
         runNext();
     }
 
-    cacheCatalogMetaPreview(id, preview, persist = true, preserveMetadataCheckedAt = false, preserveMissingMetadataCheckedAt = false) {
-        // Record completed catalogue attempts separately from the normal metadata
-        // refresh clock. Missing fields should be reconsidered after 12 hours, while
-        // detail-page OMDb-only writes must not postpone either catalogue schedule.
+    cacheCatalogMetaPreview(id, preview, persist = true) {
+        // A fresh metadata result sets its own timestamps in getCatalogMetaAsync.
+        // For first-time entries, initialize both clocks; cached entries retain
+        // their existing timestamps rather than postponing a due retry on every view.
         const previousMetadataCheckedAt = Number(preview?.metadataCheckedAt) || 0;
         const previousMissingMetadataCheckedAt = Number(preview?.missingMetadataCheckedAt) || 0;
         const now = Date.now();
         preview = {
             ...preview,
-            metadataCheckedAt: previousMetadataCheckedAt > 0
-                ? previousMetadataCheckedAt
-                : now,
-            missingMetadataCheckedAt: previousMissingMetadataCheckedAt > 0
-                ? previousMissingMetadataCheckedAt
-                : now
+            metadataCheckedAt: previousMetadataCheckedAt || now,
+            missingMetadataCheckedAt: previousMissingMetadataCheckedAt || now
         };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
@@ -1677,11 +1673,13 @@ class M3UEPGAddon {
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
             const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
+            const normalMetadataRefreshDue = !persistedIsUsable ||
+                persisted.value.metadataVersion < 3 ||
+                (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
+                Date.now() - (Number(persisted.value.metadataCheckedAt) || persisted.savedAt) >= metadataRefreshInterval;
             const persistedIsDue = persistedIsUsable &&
-                (persisted.value.metadataVersion < 3 ||
-                    (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
-                    (omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value)) ||
-                    Date.now() - (Number(persisted.value.metadataCheckedAt) || persisted.savedAt) >= metadataRefreshInterval);
+                (normalMetadataRefreshDue ||
+                    omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value));
             if (persistedIsUsable && !persistedIsDue) {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
@@ -1704,7 +1702,11 @@ class M3UEPGAddon {
                 }
                 // Keep retry timestamps from the latest attempt even if some fields
                 // fell back, so absent upstream fields are not retried on every open.
-                merged.metadataCheckedAt = refreshed.metadataCheckedAt || Date.now();
+                // Missing-field retries must not restart the longer normal refresh
+                // interval. Advance the normal clock only for a full/due refresh.
+                merged.metadataCheckedAt = normalMetadataRefreshDue
+                    ? (refreshed.metadataCheckedAt || Date.now())
+                    : (Number(previous.metadataCheckedAt) || Number(persisted.savedAt) || Date.now());
                 merged.missingMetadataCheckedAt = Date.now();
                 this.catalogMetaCache.set(key, merged);
                 await this.persistentCatalogMetaCache.set(key, merged);
