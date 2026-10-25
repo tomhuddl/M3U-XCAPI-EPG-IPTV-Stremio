@@ -158,28 +158,15 @@ async function fetchData(addonInstance) {
 
     if (config.includeSeries !== false) {
       const seriesFetchStartedAt = Date.now();
-      console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series-list request started", {
-        providerHost: (() => { try { return new URL(xtreamUrl).host; } catch { return "unknown"; } })(),
-        timeoutMs: 35000,
-      });
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
           fetch(`${base}&action=get_series`, { timeout: 35000 }),
           fetch(`${base}&action=get_series_categories`, {
             timeout: 20000,
           }).catch((error) => {
-            console.warn("[SERIES-CATALOGUE-DIAG] Series categories request failed", {
-              name: error?.name,
-              error: error?.message || String(error),
-            });
             return null;
           }),
         ]);
-        console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series-list response received", {
-          status: seriesResp.status,
-          ok: seriesResp.ok,
-          elapsedMs: Date.now() - seriesFetchStartedAt,
-        });
         let seriesCatMap = {};
         try {
           if (seriesCatsResp && seriesCatsResp.ok) {
@@ -197,10 +184,6 @@ async function fetchData(addonInstance) {
         if (seriesResp.ok) {
           const seriesList = await seriesResp.json();
           if (Array.isArray(seriesList)) {
-            console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series list parsed", {
-              count: seriesList.length,
-              elapsedMs: Date.now() - seriesFetchStartedAt,
-            });
             addonInstance.series = seriesList.map((s) => {
               const cat =
                 seriesCatMap[s.category_id] || s.category_name || "Series";
@@ -221,24 +204,10 @@ async function fetchData(addonInstance) {
               };
             });
           } else {
-            console.error("[SERIES-CATALOGUE-DIAG] Provider series-list response was not an array", {
-              responseType: seriesList === null ? "null" : typeof seriesList,
-              keys: seriesList && typeof seriesList === "object" ? Object.keys(seriesList).slice(0, 12) : [],
-              elapsedMs: Date.now() - seriesFetchStartedAt,
-            });
           }
         } else {
-          console.error("[SERIES-CATALOGUE-DIAG] Provider series-list request returned non-success status", {
-            status: seriesResp.status,
-            elapsedMs: Date.now() - seriesFetchStartedAt,
-          });
         }
       } catch (e) {
-        console.error("[SERIES-CATALOGUE-DIAG] Fresh provider series-list request failed", {
-          name: e?.name,
-          error: e?.message || String(e),
-          elapsedMs: Date.now() - seriesFetchStartedAt,
-        });
       }
     }
   }
@@ -346,29 +315,15 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
 
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   const startedAt = Date.now();
-  console.log("[SERIES-DIAG] Xtream get_series_info request started", {
-    seriesId: String(seriesId),
-    providerHost: (() => { try { return new URL(config.xtreamUrl).host; } catch { return "invalid-provider-url"; } })()
-  });
   try {
     const infoResp = await fetch(
       `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
       { timeout: 25000 },
     );
     if (!infoResp.ok) {
-      console.warn("[SERIES-DIAG] Xtream get_series_info returned non-OK HTTP status", {
-        seriesId: String(seriesId), status: infoResp.status, elapsedMs: Date.now() - startedAt
-      });
       return { videos: [], fetchError: `HTTP ${infoResp.status}`, fetchedAt: Date.now() };
     }
     const infoJson = await infoResp.json();
-    console.log("[SERIES-DIAG] Xtream get_series_info response shape", {
-      seriesId: String(seriesId),
-      elapsedMs: Date.now() - startedAt,
-      topLevelKeys: infoJson && typeof infoJson === "object" ? Object.keys(infoJson).slice(0, 20) : [],
-      episodesType: infoJson?.episodes === null ? "null" : Array.isArray(infoJson?.episodes) ? "array" : typeof infoJson?.episodes,
-      seasonKeys: infoJson?.episodes && typeof infoJson.episodes === "object" ? Object.keys(infoJson.episodes).slice(0, 30) : []
-    });
     const videos = [];
     const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
     const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
@@ -421,21 +376,8 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     });
     // Sort by season then episode
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
-    console.log("[SERIES-DIAG] Xtream episode parsing complete", {
-      seriesId: String(seriesId),
-      seasons: Object.keys(episodesObj).length,
-      videos: videos.length,
-      tmdbIdFound: !!tmdbId,
-      elapsedMs: Date.now() - startedAt
-    });
     return { videos, tmdbId, fetchedAt: Date.now() };
   } catch (error) {
-    console.error("[SERIES-DIAG] Xtream get_series_info failed", {
-      seriesId: String(seriesId),
-      error: error?.message || String(error),
-      name: error?.name || "Error",
-      elapsedMs: Date.now() - startedAt
-    });
     return { videos: [], fetchError: error?.message || String(error), fetchedAt: Date.now() };
   }
 }
