@@ -902,6 +902,12 @@ function testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow() {
         omdbCheckedAt: now - 13 * 60 * 60 * 1000
     }), true, "a missing runtime should also trigger a retry after twelve hours");
     assert.strictEqual(omdbMetadataNeedsRefresh({
+        imdbId: "tt1234567",
+        imdbRating: "7.8",
+        omdbCheckedAt: now - 24 * 60 * 60 * 1000,
+        missingMetadataCheckedAt: now
+    }), false, "a recent shared metadata attempt must throttle an old OMDb timestamp");
+    assert.strictEqual(omdbMetadataNeedsRefresh({
         name: "No IMDb ID"
     }), false, "items without an IMDb ID cannot be looked up by OMDb");
 }
