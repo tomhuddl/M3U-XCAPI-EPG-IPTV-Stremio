@@ -860,6 +860,20 @@ function testCatalogMissingMetadataUsesTwelveHourRetryWindow() {
     assert.strictEqual(catalogMetadataNeedsRefresh({
         ...complete, type: "series", director: undefined, metadataCheckedAt: now - 13 * 60 * 60 * 1000
     }), false, "series should not be considered incomplete solely for lacking a movie director");
+
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete,
+        description: undefined,
+        metadataCheckedAt: now - 20 * 24 * 60 * 60 * 1000,
+        missingMetadataCheckedAt: now
+    }), false, "a recent missing-field attempt must throttle retries independently of the normal refresh age");
+
+    assert.strictEqual(catalogMetadataNeedsRefresh({
+        ...complete,
+        runtime: undefined,
+        metadataCheckedAt: now,
+        missingMetadataCheckedAt: now - 12 * 60 * 60 * 1000 - 1000
+    }), true, "a missing field must retry after twelve hours even if normal metadata was refreshed recently");
 }
 
 function testOmdbMissingRatingOrRuntimeUsesTwelveHourRetryWindow() {
