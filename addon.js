@@ -2388,19 +2388,23 @@ async function createAddon(config) {
                         }
                     }
                 }
-                if (meta && (type === 'movie' || type === 'series')) {
-                    // Log the final field Stremio uses for the native rating header even
-                    // when general debug logging is disabled, so live deployments can be
-                    // diagnosed without enabling verbose request logs.
-                    console.log('[META-RATING] Final detail response', {
-                        id,
+                if (meta && (type === 'movie' || type === 'series') &&
+                    (process.env.TESTING_LOGS || 'true').toLowerCase() !== 'false') {
+                    // Keep Railway logs focused on fields useful during practical testing.
+                    // Never include credentials, provider URLs, or full metadata payloads.
+                    console.log('[TEST] Detail metadata', {
                         type,
+                        id,
                         imdbRating: meta.imdbRating ?? null,
-                        imdbRatingType: typeof meta.imdbRating,
-                        imdbId: meta.imdbId ?? null,
-                        ratingLinks: Array.isArray(meta.links)
-                            ? meta.links.filter(link => /^IMDb rating:/i.test(String(link?.name || ''))).length
-                            : 0
+                        imdbId: meta.imdbId ?? meta.imdb_id ?? null,
+                        runtime: meta.runtime ?? null,
+                        year: meta.year ?? meta.releaseInfo ?? null,
+                        hasPoster: Boolean(meta.poster),
+                        hasDescription: Boolean(meta.description),
+                        castCount: Array.isArray(meta.cast) ? meta.cast.length : 0,
+                        directorCount: Array.isArray(meta.director)
+                            ? meta.director.length
+                            : (meta.director ? 1 : 0)
                     });
                 }
                 if (addonInstance.config.debug) {
