@@ -924,8 +924,18 @@ class M3UEPGAddon {
                         seriesId: String(seriesId),
                         videos: Array.isArray(info?.videos) ? info.videos.length : null,
                         tmdbIdFound: !!info?.tmdbId,
+                        fetchError: info?.fetchError || null,
                         fetchedAt: info?.fetchedAt || null
                     });
+                    // A failed provider request is not a valid empty series.
+                    // Do not cache it, so a later detail open can retry immediately.
+                    if (info?.fetchError) {
+                        this.log.warn('Series info request failed; result not cached', {
+                            seriesId: String(seriesId),
+                            error: String(info.fetchError)
+                        });
+                        return info;
+                    }
                     this.seriesInfoCache.set(seriesId, info);
                     return info;
                 }
