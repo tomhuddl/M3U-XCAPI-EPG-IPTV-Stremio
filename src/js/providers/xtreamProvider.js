@@ -157,13 +157,29 @@ async function fetchData(addonInstance) {
     });
 
     if (config.includeSeries !== false) {
+      const seriesFetchStartedAt = Date.now();
+      console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series-list request started", {
+        providerHost: (() => { try { return new URL(xtreamUrl).host; } catch { return "unknown"; } })(),
+        timeoutMs: 35000,
+      });
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
           fetch(`${base}&action=get_series`, { timeout: 35000 }),
           fetch(`${base}&action=get_series_categories`, {
             timeout: 20000,
-          }).catch(() => null),
+          }).catch((error) => {
+            console.warn("[SERIES-CATALOGUE-DIAG] Series categories request failed", {
+              name: error?.name,
+              error: error?.message || String(error),
+            });
+            return null;
+          }),
         ]);
+        console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series-list response received", {
+          status: seriesResp.status,
+          ok: seriesResp.ok,
+          elapsedMs: Date.now() - seriesFetchStartedAt,
+        });
         let seriesCatMap = {};
         try {
           if (seriesCatsResp && seriesCatsResp.ok) {
@@ -181,6 +197,10 @@ async function fetchData(addonInstance) {
         if (seriesResp.ok) {
           const seriesList = await seriesResp.json();
           if (Array.isArray(seriesList)) {
+            console.info("[SERIES-CATALOGUE-DIAG] Fresh provider series list parsed", {
+              count: seriesList.length,
+              elapsedMs: Date.now() - seriesFetchStartedAt,
+            });
             addonInstance.series = seriesList.map((s) => {
               const cat =
                 seriesCatMap[s.category_id] || s.category_name || "Series";
@@ -200,10 +220,25 @@ async function fetchData(addonInstance) {
                 },
               };
             });
+          } else {
+            console.error("[SERIES-CATALOGUE-DIAG] Provider series-list response was not an array", {
+              responseType: seriesList === null ? "null" : typeof seriesList,
+              keys: seriesList && typeof seriesList === "object" ? Object.keys(seriesList).slice(0, 12) : [],
+              elapsedMs: Date.now() - seriesFetchStartedAt,
+            });
           }
+        } else {
+          console.error("[SERIES-CATALOGUE-DIAG] Provider series-list request returned non-success status", {
+            status: seriesResp.status,
+            elapsedMs: Date.now() - seriesFetchStartedAt,
+          });
         }
       } catch (e) {
-        // Series optional
+        console.error("[SERIES-CATALOGUE-DIAG] Fresh provider series-list request failed", {
+          name: e?.name,
+          error: e?.message || String(e),
+          elapsedMs: Date.now() - seriesFetchStartedAt,
+        });
       }
     }
   }
