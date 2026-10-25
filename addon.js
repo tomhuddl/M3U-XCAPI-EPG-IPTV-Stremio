@@ -892,12 +892,19 @@ class M3UEPGAddon {
 
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) {
+            return null;
+        }
+        const cached = this.seriesInfoCache.get(seriesId);
+        if (cached !== undefined) {
             return cached;
         }
 
         const pendingKey = 'series-info:' + String(seriesId);
         const pending = this.providerInfoInFlight.get(pendingKey);
         if (pending) {
+            return pending;
+        }
+
         const task = (async () => {
             try {
                 const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
