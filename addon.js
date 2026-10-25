@@ -399,6 +399,12 @@ const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 10
 const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
 const buildPromiseCache = new Map();
 
+// Multiple configuration tokens can create separate addon instances for the same
+// provider account. Keep refresh timestamps and scheduled jobs shared by provider
+// cache key so those instances do not repeatedly refresh from stale local clocks.
+const providerRefreshState = new Map();
+const providerRefreshInFlight = new Map();
+
 async function redisGetJSON(key) {
     if (!redisClient) return null;
     try {
@@ -555,6 +561,8 @@ class M3UEPGAddon {
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
+            const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
+            providerRefreshState.set(this.cacheKey, Math.max(sharedLastUpdate, Number(this.lastUpdate) || 0));
             this.log.debug('Cache hit for data', {
                 channels: this.channels.length,
                 movies: this.movies.length,
@@ -983,6 +991,7 @@ class M3UEPGAddon {
             }
 
             this.lastUpdate = Date.now();
+            providerRefreshState.set(this.cacheKey, this.lastUpdate);
             if (CACHE_ENABLED) await this.saveToCache();
             else {
                 try {
@@ -1024,16 +1033,27 @@ class M3UEPGAddon {
         // Check hourly against the persisted last-success timestamp, so process restarts
         // cannot keep postponing the next refresh.
         this.refreshTimer = setInterval(() => {
-            if (this.scheduledRefreshInFlight) return;
-            const lastSuccessfulRefresh = Number(this.lastUpdate) || 0;
-            if (lastSuccessfulRefresh && Date.now() - lastSuccessfulRefresh < this.updateInterval) return;
+            if (this.scheduledRefreshInFlight || providerRefreshInFlight.has(this.cacheKey)) return;
+            const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
+            const lastSuccessfulRefresh = Math.max(Number(this.lastUpdate) || 0, sharedLastUpdate);
+            if (lastSuccessfulRefresh && Date.now() - lastSuccessfulRefresh < this.updateInterval) {
+                this.lastUpdate = lastSuccessfulRefresh;
+                return;
+            }
             this.log.info('Scheduled provider refresh is due', {
                 lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
                 intervalHours: this.updateInterval / (60 * 60 * 1000)
             });
-            this.scheduledRefreshInFlight = this.updateData(true)
+            const refreshPromise = this.updateData(true)
                 .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
-                .finally(() => { this.scheduledRefreshInFlight = null; });
+                .finally(() => {
+                    if (providerRefreshInFlight.get(this.cacheKey) === refreshPromise) {
+                        providerRefreshInFlight.delete(this.cacheKey);
+                    }
+                    this.scheduledRefreshInFlight = null;
+                });
+            this.scheduledRefreshInFlight = refreshPromise;
+            providerRefreshInFlight.set(this.cacheKey, refreshPromise);
         }, refreshCheckInterval);
         if (typeof this.refreshTimer.unref === 'function') this.refreshTimer.unref();
     }
