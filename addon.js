@@ -147,19 +147,757 @@ if (process.env.REDIS_URL && CACHE_ENABLED) {
         });
         redisClient.on('error', e => console.error('[REDIS] Error:', e && e.name ? e.name : 'Error'));
         redisClient.connect().catch(err => console.error('[REDIS] Connect failed:', err && err.name ? err.name : 'Error'));
-            return null;
+        console.log('[REDIS] Enabled');
+    } catch (e) {
+        console.warn('[REDIS] ioredis not installed or failed, falling back to in-memory LRU');
+        redisClient = null;
+    }
+}
+
+const ADDON_NAME = "M3U/EPG TV Addon";
+const ADDON_ID = "org.stremio.m3u-epg-addon";
+
+/**
+ * Compare catalogue genre labels defensively. Xtream category names and
+ * Stremio's selected genre can differ only by casing or whitespace
+ * (including non-breaking spaces), which should not hide otherwise matching
+ * channels from a filtered catalogue.
+ */
+function normalizeGenre(value) {
+    return String(value ?? '')
+        .normalize('NFKC')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+}
+
+// Cache exact ID lookups for immutable provider catalogue arrays. When a refresh
+// replaces an array, its new identity naturally gets a fresh index.
+const catalogueIdIndexes = new WeakMap();
+
+// Genre labels are stable for a loaded catalogue. Cache their normalised values
+// per catalogue array so browsing different genres doesn't repeatedly run Unicode
+// normalisation over every item in large movie/series libraries.
+const catalogueGenreIndexes = new WeakMap();
+
+function getCatalogueGenreIndex(items) {
+    let index = catalogueGenreIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (!item || index.has(item)) continue;
+        const category = item.category || item.attributes?.['group-title'];
+        index.set(item, normalizeGenre(category));
+    }
+    catalogueGenreIndexes.set(items, index);
+    return { index, built: true };
+}
+
+function findCatalogueItemById(items, id) {
+    if (!Array.isArray(items) || !id) return undefined;
+    let index = catalogueIdIndexes.get(items);
+    if (!index) {
+        index = new Map();
+        for (const item of items) {
+            if (item && item.id != null && !index.has(item.id)) index.set(item.id, item);
         }
-        const cached = this.seriesInfoCache.get(seriesId);
-        if (cached !== undefined) {
+        catalogueIdIndexes.set(items, index);
+    }
+    return index.get(id);
+}
+
+function matchesGenre(category, selectedGenre) {
+    const selected = normalizeGenre(selectedGenre);
+    return selected.length > 0 && normalizeGenre(category) === selected;
+}
+
+/**
+ * Normalise catalogue search text without changing the displayed title.
+ * Unicode punctuation/symbols become spaces, and repeated whitespace collapses,
+ * making hyphenated and unhyphenated title variants equivalent.
+ */
+function normalizeSearchText(value) {
+    return String(value ?? '')
+        .normalize('NFKD')
+        .replace(/\p{M}+/gu, '')
+        .toLowerCase()
+        .replace(/[\p{P}\p{S}]+/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Return true when every query word can be matched to a distinct title word.
+ * Exact phrase matching remains the fast path; token matching also supports
+ * reordered words, partial words while typing, and a single-character typo
+ * in words of at least five characters.
+ */
+// Search normalization is repeated for every catalogue item and every query.
+// Keep a bounded cache so large libraries avoid re-normalizing the same titles.
+const NORMALIZED_SEARCH_CACHE_MAX = parsePositiveInteger(
+    process.env.SEARCH_TEXT_CACHE_MAX, 20000, 1000, 100000
+);
+// Use a bounded FIFO Map here rather than the shared LRU implementation: that
+// cache prunes expired entries on every write, which is undesirable when a
+// large catalogue introduces thousands of new titles in one search pass.
+const normalizedSearchCache = new Map();
+
+function getNormalizedSearchText(value) {
+    const original = String(value ?? '');
+    const cached = normalizedSearchCache.get(original);
+    if (cached !== undefined) return cached;
+    const normalized = normalizeSearchText(original);
+    normalizedSearchCache.set(original, normalized);
+    if (normalizedSearchCache.size > NORMALIZED_SEARCH_CACHE_MAX) {
+        normalizedSearchCache.delete(normalizedSearchCache.keys().next().value);
+    }
+    return normalized;
+}
+
+// Cache normalized titles against each immutable catalogue array. The general
+// bounded text cache can churn when movie and series catalogues are both searched;
+// this per-catalogue index keeps normalized titles reusable across successive queries.
+const catalogueSearchIndexes = new WeakMap();
+
+// Cache filtered search results per immutable catalogue array. WeakMap keys allow
+// old indexes to be collected after a provider refresh replaces the catalogue.
+const CATALOGUE_QUERY_RESULT_CACHE_MAX = parsePositiveInteger(
+    process.env.CATALOGUE_QUERY_RESULT_CACHE_MAX, 100, 10, 1000
+);
+const catalogueQueryResultCaches = new WeakMap();
+
+function getCatalogueQueryResultCache(items) {
+    if (!Array.isArray(items)) return null;
+    let cache = catalogueQueryResultCaches.get(items);
+    if (!cache) {
+        cache = new Map();
+        catalogueQueryResultCaches.set(items, cache);
+    }
+    return cache;
+}
+
+function createCatalogueQueryCacheKey(normalizedSearchQuery, selectedGenre = '') {
+    return normalizedSearchQuery ? JSON.stringify([selectedGenre, normalizedSearchQuery]) : null;
+}
+
+function cacheCatalogueQueryResults(cache, key, filtered, maxEntries = CATALOGUE_QUERY_RESULT_CACHE_MAX) {
+    if (!cache || !key) return;
+    cache.delete(key);
+    cache.set(key, filtered);
+    while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+}
+
+
+function getCatalogueSearchIndex(items) {
+    let index = catalogueSearchIndexes.get(items);
+    if (index) return { index, built: false };
+
+    index = new Map();
+    for (const item of items) {
+        if (item && !index.has(item)) {
+            const text = getNormalizedSearchText(item.name);
+            // Tokenisation is title-dependent too, so prepare it once per
+            // catalogue item rather than splitting every title on every query.
+            index.set(item, { text, words: text.split(' ').filter(Boolean) });
+        }
+    }
+    catalogueSearchIndexes.set(items, index);
+    return { index, built: true };
+}
+
+function matchesSearchText(query, title) {
+    return matchesNormalizedSearchText(
+        getNormalizedSearchText(query),
+        getNormalizedSearchText(title)
+    );
+}
+
+function createNormalizedSearchMatcher(q) {
+    if (!q) return () => false;
+
+    // Query tokenization and ordering are independent of the title, so compile
+    // them once per search request rather than once per catalogue item.
+    const words = q.split(' ').filter(Boolean).sort((a, b) => b.length - a.length);
+    return function matchNormalizedTitle(text, preparedTitleWords) {
+        if (!text) return false;
+        if (text.includes(q)) return true;
+
+        const titleWords = preparedTitleWords || text.split(' ').filter(Boolean);
+        if (!words.length || words.length > titleWords.length) return false;
+        const used = new Set();
+
+        function matchesWord(queryWord, titleWord) {
+            if (titleWord.startsWith(queryWord)) return true;
+            if (queryWord.length < 5 || titleWord.length < 5) return false;
+            return editDistanceAtMostOne(queryWord, titleWord);
+        }
+
+        function assign(index) {
+            if (index >= words.length) return true;
+            const word = words[index];
+            for (let i = 0; i < titleWords.length; i++) {
+                if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
+                used.add(i);
+                if (assign(index + 1)) return true;
+                used.delete(i);
+            }
+            return false;
+        }
+
+        return assign(0);
+    };
+}
+
+function matchesNormalizedSearchText(q, text) {
+    return createNormalizedSearchMatcher(q)(text);
+}
+
+function editDistanceAtMostOne(a, b) {
+    if (Math.abs(a.length - b.length) > 1) return false;
+    let i = 0;
+    let j = 0;
+    let edits = 0;
+    while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) {
+            i++;
+            j++;
+            continue;
+        }
+        if (++edits > 1) return false;
+        if (a.length > b.length) i++;
+        else if (b.length > a.length) j++;
+        else {
+            i++;
+            j++;
+        }
+    }
+    if (i < a.length || j < b.length) edits++;
+    return edits <= 1;
+}
+
+const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
+function makeLogger(cfgDebug) {
+    const enabled = !!cfgDebug || DEBUG_ENV;
+    return {
+        debug: (...a) => { if (enabled) console.log('[DEBUG]', ...a); },
+        info:  (...a) => console.log('[INFO]', ...a),
+        warn:  (...a) => console.warn('[WARN]', ...a),
+        error: (...a) => console.error('[ERROR]', ...a)
+    };
+}
+
+function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isSafeInteger(parsed) && parsed >= min
+        ? Math.min(parsed, max)
+        : fallback;
+}
+const CACHE_TTL_MS = parsePositiveInteger(process.env.CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000);
+const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500);
+
+const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
+const buildPromiseCache = new Map();
+
+// Multiple configuration tokens can create separate addon instances for the same
+// provider account. Keep refresh timestamps and scheduled jobs shared by provider
+// cache key so those instances do not repeatedly refresh from stale local clocks.
+const providerRefreshState = new Map();
+const providerRefreshInFlight = new Map();
+
+async function redisGetJSON(key) {
+    if (!redisClient) return null;
+    try {
+        const raw = await redisClient.get(key);
+        if (!raw) return null;
+        return JSON.parse(raw);
+    } catch { return null; }
+}
+async function redisSetJSON(key, value, ttl) {
+    if (!redisClient) return;
+    try {
+        await redisClient.set(key, JSON.stringify(value), 'PX', ttl);
+    } catch { /* ignore */ }
+}
+
+function stableStringify(obj) {
+    // This cache-key input is deliberately a flat object with a fixed property order.
+    return JSON.stringify(obj);
+}
+
+function safeStreamTarget(value) {
+    try {
+        const parsed = new URL(value);
+        return parsed.protocol + '//' + parsed.host;
+    } catch {
+        return '[invalid URL]';
+    }
+}
+
+function createCacheKey(config) {
+    const minimal = {
+        provider: config.provider,
+        m3uUrl: config.m3uUrl,
+        epgUrl: config.epgUrl,
+        epgUrls: Array.isArray(config.epgUrls) ? config.epgUrls : [],
+        enableEpg: !!config.enableEpg,
+        xtreamUrl: config.xtreamUrl,
+        xtreamUsername: config.xtreamUsername,
+        // Keep accounts with different credentials in separate cache namespaces.
+        xtreamPassword: config.xtreamPassword,
+        xtreamUseM3U: !!config.xtreamUseM3U,
+        xtreamOutput: config.xtreamOutput,
+        epgOffsetHours: config.epgOffsetHours,
+        includeSeries: config.includeSeries !== false // default true
+    };
+    return crypto.createHash('sha256').update(stableStringify(minimal)).digest('hex');
+}
+
+class M3UEPGAddon {
+    constructor(config = {}, manifestRef) {
+        if (!config.provider) {
+            config.provider = config.useXtream ? 'xtream' : 'direct';
+        }
+        this.providerName = config.provider === 'xtream' ? 'xtream' : 'direct';
+        this.config = config;
+        this.manifestRef = manifestRef;
+        this.cacheKey = createCacheKey(config);
+        this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
+        this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
+        this.channels = []; // live TV
+        this.movies = [];   // VOD movies
+        this.series = [];   // Series (shows)
+        // Bound lazily loaded episode metadata so browsing many series cannot grow
+        // this addon instance's memory without limit.
+        this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Coalesce overlapping Xtream ID and series-info lookups started by parallel
+        // Discover workers, avoiding duplicate provider API round-trips.
+        this.providerInfoInFlight = new Map();
+        // Cached catalogue enrichment lets later home/search requests return
+        // rich cards without waiting on TMDb/Xtream for every item.
+        this.catalogMetaCache = new LRUCache({
+            max: parsePositiveInteger(process.env.CATALOG_META_CACHE_MAX, 1000, 50, 5000),
+            ttl: parsePositiveInteger(process.env.CATALOG_META_MEMORY_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000)
+        });
+        this.catalogMetaPending = new Map();
+        this.persistentCatalogMetaCache = new PersistentCatalogMetaCache(this.cacheKey);
+        this.catalogMetaStaleFallbacks = new Set();
+        // At most one full-catalogue warm-up per media type. Search requests must not
+        // spawn independent background walks over different filtered result sets.
+        this.catalogPrefetchJobs = new Map();
+        this.catalogPrefetchLastCompleted = new Map();
+        // Remember which ordered catalogue the in-memory completion applies to, so
+        // provider catalogue changes can trigger a new warm-up before the daily interval.
+        this.catalogPrefetchLastFingerprint = new Map();
+        // Avoid immediately rescanning thousands of provider items after a partial
+        // warm-up or transient metadata outage. A later request can retry after backoff.
+        this.catalogPrefetchRetryAfter = new Map();
+        // Share concurrent foreground/background metadata work for the same item.
+        // Without this, a category request and a queued warm-up can race and issue
+        // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
+        this.catalogMetaInFlight = new Map();
+        // Track asynchronous disk writes so a completed pre-warm can flush every
+        // metadata preview before its durable completion marker is written.
+        this.catalogMetaPersistWrites = new Set();
+        this.catalogMetaQueue = [];
+        this.catalogMetaQueueHead = 0;
+        this.catalogMetaWorkers = 0;
+        this.epgData = {};
+        // XMLTV programme timestamps are immutable after parsing; cache their parsed
+        // Date values per addon instance to avoid reparsing large guides on each request.
+        this.epgTimeCache = new WeakMap();
+        // Reuse chronological programme indexes for repeated guide date requests.
+        this.epgProgramIndexes = new WeakMap();
+        // Index each immutable per-channel programme array once. Prefix maximum
+        // end-times let guide requests skip programmes that cannot overlap the
+        // requested window, including programmes that started much earlier.
+        this.lastUpdate = 0;
+        this.log = makeLogger(config.debug);
+
+        // Direct provider may populate this (seriesId -> episodes array)
+        this.directSeriesEpisodeIndex = new Map();
+        // Direct-provider episode IDs are stable for a loaded playlist; index them
+        // so stream resolution does not scan every series and episode.
+        this.directSeriesEpisodeById = new Map();
+
+        if (typeof this.config.epgOffsetHours === 'string') {
+            const n = parseFloat(this.config.epgOffsetHours);
+            if (!isNaN(n)) this.config.epgOffsetHours = n;
+        }
+        if (typeof this.config.epgOffsetHours !== 'number' || !isFinite(this.config.epgOffsetHours))
+            this.config.epgOffsetHours = 0;
+        if (Math.abs(this.config.epgOffsetHours) > 48)
+            this.config.epgOffsetHours = 0;
+        if (typeof this.config.includeSeries === 'undefined')
+            this.config.includeSeries = true;
+
+        this.log.debug('Addon instance created', {
+            provider: this.providerName,
+            epgOffsetHours: this.config.epgOffsetHours,
+            includeSeries: this.config.includeSeries
+        });
+    }
+
+    async loadFromCache() {
+        const cacheKey = 'addon:data:' + this.cacheKey;
+        // CACHE_ENABLED controls the in-memory/Redis layers only. A configured
+        // persistent snapshot must still be loaded when those layers are disabled,
+        // otherwise a saved last-good catalogue would be ignored on every restart.
+        let cached = CACHE_ENABLED ? dataCache.get(cacheKey) : null;
+        if (CACHE_ENABLED && !cached && redisClient) {
+            cached = await redisGetJSON(cacheKey);
+            if (cached) dataCache.set(cacheKey, cached);
+        }
+        if (!cached) {
+            cached = await this.persistentAddonDataCache.load();
+            if (cached) {
+                if (CACHE_ENABLED) dataCache.set(cacheKey, cached);
+                this.log.info('Loaded provider catalogue and EPG from persistent storage');
+            }
+        }
+        if (cached) {
+            this.channels = cached.channels || [];
+            this.movies = cached.movies || [];
+            this.series = cached.series || [];
+            this.epgData = cached.epgData || {};
+            this.lastUpdate = cached.lastUpdate || 0;
+            const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
+            providerRefreshState.set(this.cacheKey, Math.max(sharedLastUpdate, Number(this.lastUpdate) || 0));
+            this.log.debug('Cache hit for data', {
+                channels: this.channels.length,
+                movies: this.movies.length,
+                series: this.series.length,
+                epgChannels: Object.keys(this.epgData).length,
+                lastUpdate: this.lastUpdate ? new Date(this.lastUpdate).toISOString() : null
+            });
+        }
+    }
+
+    async saveToCache() {
+        if (!CACHE_ENABLED) return;
+        const cacheKey = 'addon:data:' + this.cacheKey;
+        const entry = {
+            channels: this.channels,
+            movies: this.movies,
+            series: this.series,
+            epgData: this.epgData,
+            lastUpdate: this.lastUpdate
+        };
+        dataCache.set(cacheKey, entry);
+        await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
+        try {
+            const persisted = await this.persistentAddonDataCache.save(entry);
+            if (persisted) this.log.info('Persisted provider catalogue and EPG snapshot');
+        } catch (error) {
+            // The in-memory/Redis copy remains usable; a disk write failure must not
+            // interrupt a successful provider refresh or replace the last-good file.
+            this.log.warn('Persistent provider data save failed', {
+                name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
+                syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
+            });
+        }
+        this.log.debug('Saved data to cache');
+    }
+
+    buildGenresInManifest() {
+        if (!this.manifestRef) return;
+        const tvCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_channels');
+        const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
+        const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
+
+        // Helper: set catalog.genres (options are added post-build to avoid SDK linter size limits).
+        // Keep first-seen order so groups follow the provider's channel/category ordering.
+        function setGenresOnCatalog(catalog, groups) {
+            if (!catalog) return;
+            catalog.genres = groups;
+        }
+
+        if (tvCatalog) {
+            const groups = [
+                ...new Set(
+                    this.channels
+                        .map(c => c.category || c.attributes?.['group-title'])
+                        .filter(Boolean)
+                        .map(s => s.trim())
+                )
+            ];
+            if (!groups.includes('All Channels')) groups.unshift('All Channels');
+            setGenresOnCatalog(tvCatalog, groups);
+        }
+
+        if (movieCatalog) {
+            const movieGroups = [
+                ...new Set(
+                    this.movies
+                        .map(c => c.category || c.attributes?.['group-title'])
+                        .filter(Boolean)
+                        .map(s => s.trim())
+                )
+            ];
+            setGenresOnCatalog(movieCatalog, movieGroups);
+        }
+
+        if (seriesCatalog) {
+            const seriesGroups = [
+                ...new Set(
+                    this.series
+                        .map(c => c.category || c.attributes?.['group-title'])
+                        .filter(Boolean)
+                        .map(s => s.trim())
+                )
+            ];
+            setGenresOnCatalog(seriesCatalog, seriesGroups);
+        }
+
+        this.log.debug('Catalog genres built', {
+            tvGenres: tvCatalog?.genres?.length || 0,
+            movieGenres: movieCatalog?.genres?.length || 0,
+            seriesGenres: seriesCatalog?.genres?.length || 0
+        });
+    }
+
+    parseM3U(content) {
+        const startTs = Date.now();
+        const lines = content.split('\n');
+        const items = [];
+        let currentItem = null;
+        for (const raw of lines) {
+            const line = raw.trim();
+            if (line.startsWith('#EXTINF:')) {
+                const matches = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
+                if (matches) {
+                    currentItem = {
+                        duration: parseInt(matches[1]),
+                        attributes: this.parseAttributes(matches[2] || ''),
+                        name: (matches[3] || '').trim()
+                    };
+                }
+            } else if (line && !line.startsWith('#') && currentItem) {
+                currentItem.url = line;
+                currentItem.logo = currentItem.attributes['tvg-logo'];
+                currentItem.epg_channel_id = currentItem.attributes['tvg-id'] || currentItem.attributes['tvg-name'];
+                currentItem.category = currentItem.attributes['group-title'];
+
+                const group = (currentItem.attributes['group-title'] || '').toLowerCase();
+                const lower = currentItem.name.toLowerCase();
+
+                const isMovie =
+                    group.includes('movie') ||
+                    lower.includes('movie') ||
+                    this.isMovieFormat(currentItem.name);
+
+                const isSeries =
+                    !isMovie && (
+                        group.includes('series') ||
+                        group.includes('show') ||
+                        /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) ||
+                        /\bSeason\s?\d+/i.test(currentItem.name)
+                    );
+
+                currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
+                currentItem.id = `iptv_${crypto.createHash('md5').update(currentItem.name + currentItem.url).digest('hex').substring(0, 16)}`;
+                items.push(currentItem);
+                currentItem = null;
+            }
+        }
+        const ms = Date.now() - startTs;
+        this.log.debug('M3U parsed', { lines: lines.length, items: items.length, ms });
+        return items;
+    }
+
+    parseAttributes(str) {
+        const attrs = {};
+        const regex = /(\w+(?:-\w+)*)="([^"]*)"/g;
+        let m;
+        while ((m = regex.exec(str)) !== null) attrs[m[1]] = m[2];
+        return attrs;
+    }
+
+    isMovieFormat(name) {
+        return [/\(\d{4}\)/, /\d{4}\./, /HD$|FHD$|4K$/i].some(p => p.test(name));
+    }
+
+    async parseEPG(content) {
+        const start = Date.now();
+        try {
+            const xml2js = require('xml2js');
+            const parser = new xml2js.Parser();
+            const result = await parser.parseStringPromise(content);
+            const epgData = {};
+            if (result.tv && result.tv.programme) {
+                for (const prog of result.tv.programme) {
+                    const ch = prog.$.channel;
+                    if (!epgData[ch]) epgData[ch] = [];
+                    epgData[ch].push({
+                        start: prog.$.start,
+                        stop: prog.$.stop,
+                        title: prog.title ? prog.title[0]._ || prog.title[0] : 'Unknown',
+                        desc: prog.desc ? prog.desc[0]._ || prog.desc[0] : ''
+                    });
+                }
+            }
+            this.log.debug('EPG parsed', {
+                channels: Object.keys(epgData).length,
+                programmes: Object.values(epgData).reduce((a, b) => a + b.length, 0),
+                ms: Date.now() - start
+            });
+            return epgData;
+        } catch (e) {
+            this.log.warn('EPG parse failed', e.message);
+            return {};
+        }
+    }
+
+    parseEPGTime(s) {
+        if (!s) return new Date();
+        const m = s.match(/^(\d{14})(?:\s*([+\-]\d{4}))?/);
+        if (m) {
+            const base = m[1];
+            const tz = m[2] || null;
+            const year = parseInt(base.slice(0, 4), 10);
+            const month = parseInt(base.slice(4, 6), 10) - 1;
+            const day = parseInt(base.slice(6, 8), 10);
+            const hour = parseInt(base.slice(8, 10), 10);
+            const min = parseInt(base.slice(10, 12), 10);
+            const sec = parseInt(base.slice(12, 14), 10);
+            let date;
+            if (tz) {
+                const iso = `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}T${hour.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}${tz}`;
+                const parsed = new Date(iso);
+                if (!isNaN(parsed.getTime())) date = parsed;
+            }
+            if (!date) date = new Date(year, month, day, hour, min, sec);
+            if (this.config.epgOffsetHours) {
+                date = new Date(date.getTime() + this.config.epgOffsetHours * 3600000);
+            }
+            return date;
+        }
+        const d = new Date(s);
+        if (this.config.epgOffsetHours && !isNaN(d.getTime()))
+            return new Date(d.getTime() + this.config.epgOffsetHours * 3600000);
+        return d;
+    }
+
+    /**
+     * Return XMLTV programmes overlapping a time window.
+     * The guide passes UTC-day boundaries; parseEPGTime applies the addon's
+     * configured EPG offset consistently with its existing programme methods.
+     */
+    getScheduledPrograms(channel, windowStartMs, windowEndMs) {
+        if (!channel || channel.type !== 'tv' || !Number.isFinite(windowStartMs) ||
+            !Number.isFinite(windowEndMs) || windowEndMs <= windowStartMs) return [];
+
+        const epgId = channel.attributes?.['tvg-id'] || channel.attributes?.['tvg-name'];
+        const sourcePrograms = epgId && this.epgData[epgId];
+        if (!Array.isArray(sourcePrograms)) return [];
+
+        // Build once per immutable channel programme array. Prefix maximum end
+        // times preserve long programmes that overlap the window despite starting
+        // well before its first programme.
+        let index = this.epgProgramIndexes.get(sourcePrograms);
+        if (!index) {
+            index = [];
+            for (const program of sourcePrograms) {
+                if (!program || !program.start || !program.stop) continue;
+                let times = this.epgTimeCache.get(program);
+                if (!times) {
+                    const start = this.parseEPGTime(program.start);
+                    const end = this.parseEPGTime(program.stop);
+                    times = { start, end, startMs: start instanceof Date ? start.getTime() : NaN, endMs: end instanceof Date ? end.getTime() : NaN };
+                    this.epgTimeCache.set(program, times);
+                }
+                if (!Number.isFinite(times.startMs) || !Number.isFinite(times.endMs) || times.endMs <= times.startMs) continue;
+                index.push({ program, times });
+            }
+            index.sort((a, b) => a.times.startMs - b.times.startMs);
+            let maxEnd = -Infinity;
+            for (const entry of index) {
+                maxEnd = Math.max(maxEnd, entry.times.endMs);
+                entry.prefixMaxEndMs = maxEnd;
+            }
+            this.epgProgramIndexes.set(sourcePrograms, index);
+        }
+
+        // Binary-search the first possible overlap and the first programme
+        // starting outside the requested window.
+        let low = 0, high = index.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (index[mid].prefixMaxEndMs <= windowStartMs) low = mid + 1;
+            else high = mid;
+        }
+        const first = low;
+        low = first; high = index.length;
+        while (low < high) {
+            const mid = (low + high) >>> 1;
+            if (index[mid].times.startMs < windowEndMs) low = mid + 1;
+            else high = mid;
+        }
+
+        const videos = [];
+        for (let i = first; i < low; i++) {
+            const { program, times } = index[i];
+            const { start, end, startMs, endMs } = times;
+            if (endMs <= windowStartMs || startMs >= windowEndMs) continue;
+            const video = {
+                id: `${channel.id}:epg:${start.toISOString()}`,
+                title: String(program.title || 'Untitled programme'),
+                released: start.toISOString(),
+                startTime: start.toISOString(),
+                endTime: end.toISOString()
+            };
+            if (program.desc) video.overview = String(program.desc);
+            const runtimeMinutes = Math.round((endMs - startMs) / 60000);
+            if (runtimeMinutes > 0) video.runtime = `${runtimeMinutes} min`;
+            videos.push(video);
+        }
+        return videos;
+    }
+    async ensureSeriesTmdbId(seriesId) {
+        if (!seriesId) return null;
+        const cacheKey = 'series-tmdb-id:' + String(seriesId);
+        const cached = this.seriesInfoCache.get(cacheKey);
+        if (cached !== undefined) return cached;
+
+        const pendingKey = 'series-tmdb-id:' + String(seriesId);
+        const pending = this.providerInfoInFlight.get(pendingKey);
+        if (pending) return pending;
+
+        const task = (async () => {
+            try {
+                const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
+                if (typeof providerModule.fetchSeriesTmdbId === 'function') {
+                    const tmdbId = await providerModule.fetchSeriesTmdbId(this, seriesId);
+                    this.seriesInfoCache.set(cacheKey, tmdbId || null);
+                    return tmdbId || null;
+                }
+                const info = await this.ensureSeriesInfo(seriesId);
+                return info?.tmdbId || null;
+            } catch (e) {
+                this.log.warn('Series TMDb ID lookup failed', seriesId, e && e.name ? e.name : 'Error');
+                this.seriesInfoCache.set(cacheKey, null);
+                return null;
+            }
+        })();
+
+        this.providerInfoInFlight.set(pendingKey, task);
+        try {
+            return await task;
+        } finally {
+            if (this.providerInfoInFlight.get(pendingKey) === task) {
+                this.providerInfoInFlight.delete(pendingKey);
+            }
+        }
+    }
+
+    async ensureSeriesInfo(seriesId) {
+        if (!seriesId) {
             return cached;
         }
 
         const pendingKey = 'series-info:' + String(seriesId);
         const pending = this.providerInfoInFlight.get(pendingKey);
         if (pending) {
-            return pending;
-        }
-
         const task = (async () => {
             try {
                 const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
