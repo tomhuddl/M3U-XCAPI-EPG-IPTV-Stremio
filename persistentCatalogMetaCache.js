@@ -31,8 +31,10 @@ class PersistentCatalogMetaCache {
         this.filePath = this.enabled
             ? path.join(this.directory, "catalog-meta-" + String(cacheKey).slice(0, 24) + ".json")
             : null;
+        // Persistent metadata has its own freshness window, separate from the
+        // short-lived in-memory LRU. Keep the legacy variable as a migration fallback.
         this.ttlMs = parsePositiveInteger(
-            options.ttlMs ?? process.env.CATALOG_META_CACHE_TTL_MS,
+            options.ttlMs ?? process.env.CATALOG_META_PERSISTENT_TTL_MS ?? process.env.CATALOG_META_CACHE_TTL_MS,
             14 * DAY_MS, 1000, 30 * DAY_MS
         );
         this.staleRetentionMs = parsePositiveInteger(
