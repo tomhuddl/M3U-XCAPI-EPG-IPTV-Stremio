@@ -20,7 +20,14 @@ const OMDB_MISSING_DATA_RETRY_MS = parsePositiveInteger(
 function omdbMetadataNeedsRefresh(value) {
     if (!value || !value.imdbId) return false;
     if (value.imdbRating && value.runtime) return false;
-    const checkedAt = Number(value.omdbCheckedAt) || 0;
+    // Coordinate OMDb and general catalogue retries. If a recent catalogue
+    // attempt already tried available sources, don't let an older OMDb timestamp
+    // bypass the shared 12-hour backoff on the next card request.
+    const checkedAt = Math.max(
+        Number(value.omdbCheckedAt) || 0,
+        Number(value.missingMetadataCheckedAt) || 0,
+        Number(value.metadataCheckedAt) || 0
+    );
     return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
 }
 
