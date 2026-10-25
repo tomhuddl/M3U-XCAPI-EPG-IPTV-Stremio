@@ -178,10 +178,6 @@ class PersistentCatalogMetaCache {
             try {
                 await fs.writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
                 await fs.rename(tempPath, this.filePath);
-                console.log("[CATALOG-CACHE] Saved persistent metadata cache", {
-                    entries: this.entries.size,
-                    bytes: Buffer.byteLength(snapshot, "utf8")
-                });
             } finally {
                 await fs.unlink(tempPath).catch(() => {});
             }
