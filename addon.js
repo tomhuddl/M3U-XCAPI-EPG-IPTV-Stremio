@@ -891,28 +891,60 @@ class M3UEPGAddon {
     }
 
     async ensureSeriesInfo(seriesId) {
-        if (!seriesId) return null;
+        if (!seriesId) {
+            console.log('[SERIES-DIAG] ensureSeriesInfo called without a series ID');
+            return null;
+        }
         const cached = this.seriesInfoCache.get(seriesId);
-        if (cached !== undefined) return cached;
+        if (cached !== undefined) {
+            console.log('[SERIES-DIAG] series-info cache hit', {
+                seriesId: String(seriesId),
+                videos: Array.isArray(cached?.videos) ? cached.videos.length : null,
+                fetchedAt: cached?.fetchedAt || null
+            });
+            return cached;
+        }
 
         const pendingKey = 'series-info:' + String(seriesId);
         const pending = this.providerInfoInFlight.get(pendingKey);
-        if (pending) return pending;
+        if (pending) {
+            console.log('[SERIES-DIAG] joining in-flight series-info request', { seriesId: String(seriesId) });
+            return pending;
+        }
 
+        console.log('[SERIES-DIAG] series-info cache miss; fetching provider episodes', {
+            seriesId: String(seriesId), provider: this.providerName
+        });
         const task = (async () => {
             try {
                 const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
                 if (typeof providerModule.fetchSeriesInfo === 'function') {
                     const info = await providerModule.fetchSeriesInfo(this, seriesId);
+                    console.log('[SERIES-DIAG] provider episode lookup finished', {
+                        seriesId: String(seriesId),
+                        videos: Array.isArray(info?.videos) ? info.videos.length : null,
+                        tmdbIdFound: !!info?.tmdbId,
+                        fetchedAt: info?.fetchedAt || null
+                    });
                     this.seriesInfoCache.set(seriesId, info);
                     return info;
                 }
+                console.warn('[SERIES-DIAG] provider has no fetchSeriesInfo function', {
+                    seriesId: String(seriesId), provider: this.providerName
+                });
             } catch (e) {
-                this.log.warn('Series info fetch failed', seriesId, e && e.name ? e.name : 'Error');
+                console.error('[SERIES-DIAG] series-info fetch threw', {
+                    seriesId: String(seriesId),
+                    error: e?.message || String(e),
+                    name: e?.name || 'Error'
+                });
             }
             // Fallback empty structure
             const empty = { videos: [] };
             this.seriesInfoCache.set(seriesId, empty);
+            console.warn('[SERIES-DIAG] caching empty series info after provider lookup failure', {
+                seriesId: String(seriesId)
+            });
             return empty;
         })();
 
@@ -1194,7 +1226,19 @@ class M3UEPGAddon {
 
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
+        console.log('[SERIES-DIAG] series detail opened', {
+            id: seriesItem.id,
+            name: seriesItem.name,
+            provider: this.providerName,
+            seriesId: String(seriesIdRaw)
+        });
         const info = await this.ensureSeriesInfo(seriesIdRaw);
+        console.log('[SERIES-DIAG] series detail episode data ready', {
+            id: seriesItem.id,
+            seriesId: String(seriesIdRaw),
+            videos: Array.isArray(info?.videos) ? info.videos.length : null,
+            tmdbIdFound: !!(seriesItem.tmdbId || info?.tmdbId)
+        });
         const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
         const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
         // The detailed series view also exposes IMDb rating/runtime fallbacks.
