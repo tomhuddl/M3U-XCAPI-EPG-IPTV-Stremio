@@ -945,7 +945,7 @@ class M3UEPGAddon {
         }
         return videos;
     }
-    async ensureSeriesTmdbId(seriesId, lookupDiagnostics = null) {
+    async ensureSeriesTmdbId(seriesId, lookupDiagnostics = null, forceRefresh = false) {
         const setLookup = details => {
             if (lookupDiagnostics && details && typeof details === 'object') {
                 Object.assign(lookupDiagnostics, details);
@@ -965,7 +965,7 @@ class M3UEPGAddon {
             }
         };
         const cached = this.seriesInfoCache.get(cacheKey);
-        if (cached !== undefined) {
+        if (!forceRefresh && cached !== undefined) {
             setLookup(this.seriesTmdbLookupDiagnostics.get(normalizedSeriesId) || {
                 reason: cached ? 'provider_tmdb_id_cached' : 'provider_tmdb_id_cached_unknown',
                 source: 'memory_cache'
@@ -973,7 +973,7 @@ class M3UEPGAddon {
             return cached;
         }
 
-        if (this.providerName === 'xtream') {
+        if (!forceRefresh && this.providerName === 'xtream') {
             const persisted = await this.persistentSeriesInfoCache.get(normalizedSeriesId, this.lastUpdate);
             if (persisted?.fresh) {
                 const tmdbId = persisted.value.tmdbId || null;
@@ -1799,6 +1799,7 @@ class M3UEPGAddon {
 
             let processed = 0;
             let missingMetadata = 0;
+            let providerFallbacks = 0;
             const incompleteSeriesDetails = [];
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
@@ -1813,6 +1814,8 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
+                    const lookupDiagnostic = this.catalogMetaLookupDiagnostics.get(String(item.id));
+                    if (type === 'series' && lookupDiagnostic?.providerFallback) providerFallbacks++;
                     const metadataNameMissing = !String(cached?.name || '').trim();
                     const metadataVersionOld = Boolean(cached) && cached.metadataVersion < 3;
                     const imdbIdLookupPending = Boolean(
@@ -1932,7 +1935,7 @@ class M3UEPGAddon {
                 this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
                 this.log.info('Persistent catalogue metadata warm-up complete', {
-                    type, processed, total: items.length, ms: Date.now() - startedAt
+                    type, processed, total: items.length, providerFallbacks, ms: Date.now() - startedAt
                 });
             } else {
                 const retryDelay = parsePositiveInteger(
@@ -1941,7 +1944,7 @@ class M3UEPGAddon {
                 );
                 this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
                 this.log.warn('Catalogue metadata warm-up incomplete; will retry after backoff', {
-                    type, processed, total: items.length, missingMetadata, retryDelay
+                    type, processed, total: items.length, missingMetadata, providerFallbacks, retryDelay
                 });
             }
         })();
@@ -2141,36 +2144,21 @@ class M3UEPGAddon {
             const seriesId = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
             const providerLookup = {};
             let tmdbId = seriesItem.tmdbId || null;
-            const idSource = tmdbId ? 'catalogue' : 'provider_lookup';
+            let idSource = tmdbId ? 'catalogue' : 'provider_lookup';
             const providerLookupStartedAt = Date.now();
             if (!tmdbId) {
                 tmdbId = await this.ensureSeriesTmdbId(seriesId, providerLookup);
             }
             const providerLookupMs = Date.now() - providerLookupStartedAt;
             const tmdbLookupStartedAt = Date.now();
-            const tmdbLookup = {};
-            const tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
+            let tmdbLookup = {};
+            let tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
                 refresh: refreshIncompleteMetadata,
                 diagnostics: tmdbLookup
             });
-            // Some provider series have no TMDb ID. Do not title-search as a fallback;
-            // keep a durable provider-backed card so these legitimate no-match items
-            // do not make the full-catalogue warm-up retry forever.
-            if (!tmdb && !tmdbId) {
-                const providerFailure = [
-                    'provider_http_error', 'provider_request_error', 'provider_invalid_json',
-                    'provider_invalid_response', 'provider_credentials_missing',
-                    'provider_tmdb_id_lookup_error', 'provider_series_info_request_error'
-                ].includes(providerLookup.reason);
+            const makeProviderFallback = details => {
                 if (lookupDiagnostics) {
-                    Object.assign(lookupDiagnostics, {
-                        reason: providerFailure
-                            ? 'provider_tmdb_id_lookup_failed'
-                            : providerLookup.reason === 'provider_tmdb_id_invalid'
-                                ? 'provider_tmdb_id_invalid'
-                                : 'provider_tmdb_id_missing',
-                        providerLookup
-                    });
+                    Object.assign(lookupDiagnostics, details, { providerFallback: true });
                 }
                 const fallback = this.generateMetaPreview(seriesItem);
                 return {
@@ -2181,19 +2169,87 @@ class M3UEPGAddon {
                     omdbChecked: true,
                     omdbPending: false
                 };
-            }
-            if (!tmdb) {
-                if (lookupDiagnostics) {
-                    Object.assign(lookupDiagnostics, {
-                        reason: tmdbLookup.reason || 'tmdb_lookup_failed',
+            };
+            const providerLookupFailed = details => [
+                'provider_http_error', 'provider_request_error', 'provider_invalid_json',
+                'provider_invalid_response', 'provider_credentials_missing',
+                'provider_tmdb_id_lookup_error', 'provider_series_info_request_error'
+            ].includes(details?.reason);
+            const compactTmdbFailure = details => ({
+                reason: details?.reason || 'tmdb_lookup_failed',
+                ...(details?.httpStatus ? { httpStatus: details.httpStatus } : {}),
+                ...(details?.errorName ? { errorName: details.errorName } : {}),
+                ...(details?.errorCode ? { errorCode: details.errorCode } : {})
+            });
+
+            // If the catalogue's supplied TMDb ID is confirmed missing, check
+            // Xtream's detailed record once for a possibly corrected ID.
+            if (!tmdb && tmdbId && idSource === 'catalogue' && tmdbLookup.reason === 'tmdb_not_found') {
+                const detailedProviderLookup = {};
+                const detailedTmdbId = await this.ensureSeriesTmdbId(seriesId, detailedProviderLookup, true);
+                if (detailedTmdbId && String(detailedTmdbId) !== String(tmdbId)) {
+                    const detailedTmdbLookup = {};
+                    const detailedTmdb = await tmdbMetadata.getSeriesCatalogMetadata(detailedTmdbId, {
+                        refresh: refreshIncompleteMetadata,
+                        diagnostics: detailedTmdbLookup
+                    });
+                    Object.assign(providerLookup, detailedProviderLookup);
+                    if (detailedTmdb) {
+                        tmdbId = detailedTmdbId;
+                        idSource = 'provider_details';
+                        tmdbLookup = detailedTmdbLookup;
+                        tmdb = detailedTmdb;
+                    } else {
+                        tmdbLookup = {
+                            ...compactTmdbFailure(detailedTmdbLookup),
+                            catalogueLookup: compactTmdbFailure({
+                                ...tmdbLookup,
+                                reason: 'tmdb_not_found'
+                            }),
+                            catalogueTmdbId: String(tmdbId)
+                        };
+                        tmdbId = detailedTmdbId;
+                        idSource = 'provider_details';
+                        Object.assign(providerLookup, detailedProviderLookup);
+                    }
+                } else {
+                    Object.assign(providerLookup, detailedProviderLookup);
+                    const reason = providerLookupFailed(detailedProviderLookup)
+                        ? 'provider_tmdb_id_lookup_failed'
+                        : detailedTmdbId
+                            ? 'provider_tmdb_id_same_as_catalogue'
+                            : detailedProviderLookup.reason === 'provider_tmdb_id_invalid'
+                                ? 'provider_tmdb_id_invalid'
+                                : 'provider_tmdb_id_missing';
+                    return makeProviderFallback({
+                        reason,
                         tmdbId: String(tmdbId),
-                        idSource,
-                        ...(tmdbLookup.httpStatus ? { httpStatus: tmdbLookup.httpStatus } : {}),
-                        ...(tmdbLookup.errorName ? { errorName: tmdbLookup.errorName } : {}),
-                        ...(tmdbLookup.errorCode ? { errorCode: tmdbLookup.errorCode } : {})
+                        idSource: 'catalogue',
+                        catalogueLookup: compactTmdbFailure(tmdbLookup),
+                        providerLookup: detailedProviderLookup
                     });
                 }
-                return null;
+            }
+
+            // If neither source supplied a usable TMDb ID, keep a provider-backed
+            // card for this warm-up and let the normal metadata retry clock try again.
+            if (!tmdb && !tmdbId) {
+                const reason = providerLookupFailed(providerLookup)
+                    ? 'provider_tmdb_id_lookup_failed'
+                    : providerLookup.reason === 'provider_tmdb_id_invalid'
+                        ? 'provider_tmdb_id_invalid'
+                        : 'provider_tmdb_id_missing';
+                return makeProviderFallback({ reason, providerLookup });
+            }
+            if (!tmdb) {
+                return makeProviderFallback({
+                    ...compactTmdbFailure(tmdbLookup),
+                    tmdbId: String(tmdbId),
+                    idSource,
+                    ...(tmdbLookup.catalogueLookup ? { catalogueLookup: tmdbLookup.catalogueLookup } : {}),
+                    ...(tmdbLookup.catalogueTmdbId ? { catalogueTmdbId: tmdbLookup.catalogueTmdbId } : {}),
+                    ...(Object.keys(providerLookup).length ? { providerLookup } : {})
+                });
             }
             if (lookupDiagnostics) {
                 Object.assign(lookupDiagnostics, {
