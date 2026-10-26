@@ -1,7 +1,5 @@
 const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
-const { isDebugEnabled, logAt } = require("../../logger");
-
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
@@ -62,41 +60,58 @@ function tmdbConfigured() {
   return TMDB_API_KEY.length > 0;
 }
 
-const TMDB_DEBUG = isDebugEnabled();
+const lookupStats = {
+  calls: 0,
+  apiRequests: 0,
+  cacheHits: 0,
+  negativeCacheHits: 0,
+  inFlightJoins: 0,
+  notConfigured: 0,
+  notFound404: 0,
+  httpErrors: 0,
+  invalidJson: 0,
+  invalidResponses: 0,
+  requestErrors: 0,
+  successfulResponses: 0
+};
+
+function getDiagnostics() {
+  return {
+    apiKeyConfigured: tmdbConfigured(),
+    ...lookupStats
+  };
+}
 
 function recordLookupDiagnostic(target, details) {
   if (target && typeof target === "object" && details && typeof details === "object") {
     Object.assign(target, details);
   }
 }
-
-function logRequestDebug(event, details) {
-  if (TMDB_DEBUG) logAt("debug", "[DEBUG] TMDb request", { event, ...details });
-}
-
 async function request(path, { refresh = false, diagnostics = null } = {}) {
+  lookupStats.calls++;
   if (!tmdbConfigured()) {
+    lookupStats.notConfigured++;
     recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured" });
     return null;
   }
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
   if (!refresh && cached !== undefined) {
+    lookupStats.cacheHits++;
     recordLookupDiagnostic(diagnostics, { reason: "tmdb_cached_response", source: "memory_cache" });
-    logRequestDebug("cache-hit", { path, ms: 0 });
     return cached;
   }
   if (!refresh && negativeCache.has(cacheKey)) {
+    lookupStats.negativeCacheHits++;
     recordLookupDiagnostic(diagnostics, {
       reason: "tmdb_not_found",
       source: "negative_cache",
       httpStatus: 404
     });
-    logRequestDebug("negative-cache-hit", { path, ms: 0 });
     return null;
   }
   if (pending.has(cacheKey)) {
-    logRequestDebug("in-flight-join", { path });
+    lookupStats.inFlightJoins++;
     const result = await pending.get(cacheKey);
     recordLookupDiagnostic(diagnostics, {
       reason: result ? "tmdb_response_received" : "tmdb_lookup_failed",
@@ -106,18 +121,16 @@ async function request(path, { refresh = false, diagnostics = null } = {}) {
   }
 
   const task = (async () => {
-    const startedAt = Date.now();
     let status = null;
     try {
       const separator = path.includes("?") ? "&" : "?";
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
-      const requestDiagnostics = {};
+      lookupStats.apiRequests++;
       const response = await safeFetch(url, {
         timeout: 12000,
         // Opt in only for TMDb requests. safeFetch still resolves and validates
         // DNS for every request before selecting an agent pinned to those addresses.
         reuseConnection: true,
-        diagnostics: requestDiagnostics,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
       status = response.status;
@@ -128,54 +141,45 @@ async function request(path, { refresh = false, diagnostics = null } = {}) {
         if (response.body && typeof response.body.destroy === "function") {
           response.body.destroy();
         }
-        if (response.status === 404) negativeCache.set(cacheKey, true);
+        if (response.status === 404) {
+          negativeCache.set(cacheKey, true);
+          lookupStats.notFound404++;
+        } else {
+          lookupStats.httpErrors++;
+        }
         recordLookupDiagnostic(diagnostics, {
           reason: response.status === 404 ? "tmdb_not_found" : "tmdb_http_error",
           httpStatus: response.status
         });
-        logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
       }
-      // Separate response-body consumption from JSON parsing so large or slow
-      // responses can be distinguished from CPU time spent decoding metadata.
-      const bodyStartedAt = Date.now();
-      const responseText = await response.text();
-      const bodyMs = Date.now() - bodyStartedAt;
-      const parseStartedAt = Date.now();
       let data;
       try {
-        data = JSON.parse(responseText);
+        data = JSON.parse(await response.text());
       } catch (error) {
+        lookupStats.invalidJson++;
         recordLookupDiagnostic(diagnostics, {
           reason: "tmdb_invalid_json",
           httpStatus: status,
           errorName: error && error.name ? error.name : "SyntaxError"
         });
-        logRequestDebug("invalid-json", { path, status, ms: Date.now() - startedAt });
         return null;
       }
-      const parseMs = Date.now() - parseStartedAt;
       if (!data || typeof data !== "object" || Array.isArray(data)) {
+        lookupStats.invalidResponses++;
         recordLookupDiagnostic(diagnostics, { reason: "tmdb_invalid_response", httpStatus: status });
-        logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
         return null;
       }
       cache.set(cacheKey, data);
+      lookupStats.successfulResponses++;
       recordLookupDiagnostic(diagnostics, {
         reason: "tmdb_response_received",
         source: "api",
         httpStatus: status
       });
-      logRequestDebug("fetched", {
-        path, status, ms: Date.now() - startedAt,
-        dnsMs: requestDiagnostics.dnsMs ?? null,
-        headersMs: requestDiagnostics.headersMs ?? null,
-        bodyMs,
-        parseMs,
-        freeSocketsBeforeRequest: requestDiagnostics.freeSocketsBeforeRequest ?? null,
-      });
       return data;
     } catch (error) {
+      lookupStats.requestErrors++;
       const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
         ? error.code
         : undefined;
@@ -184,12 +188,6 @@ async function request(path, { refresh = false, diagnostics = null } = {}) {
         ...(status ? { httpStatus: status } : {}),
         errorName: error && error.name ? error.name : "Error",
         ...(errorCode ? { errorCode } : {})
-      });
-      logRequestDebug("request-error", {
-        path,
-        status,
-        ms: Date.now() - startedAt,
-        error: error && error.name ? error.name : "Error",
       });
       return null;
     } finally {
@@ -447,6 +445,7 @@ module.exports = {
   getMovieCatalogMetadata,
   getSeriesCatalogMetadata,
   getSeasonEpisodes,
+  getDiagnostics,
   mapMovieMetadata,
   mapSeriesMetadata,
   mapSeasonEpisodes,

@@ -6,7 +6,6 @@ const https = require("https");
 const net = require("net");
 const ipaddr = require("ipaddr.js");
 const fetch = require("node-fetch");
-const { isDebugEnabled, logAt } = require("./logger");
 
 const REUSABLE_AGENT_MAX_ENTRIES = 8;
 const reusableAgents = new Map();
@@ -233,15 +232,6 @@ async function safeFetch(input, options = {}) {
 
       if (diagnostics) {
         diagnostics.headersMs = Date.now() - headersStartedAt;
-        if (isDebugEnabled() && currentUrl.hostname.toLowerCase() === "api.themoviedb.org") {
-          logAt("debug", "[DEBUG] TMDb transport timing", {
-            path: currentUrl.pathname,
-            status: response.status,
-            dnsMs: diagnostics.dnsMs ?? null,
-            headersMs: diagnostics.headersMs,
-            freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
-          });
-        }
       }
 
       if (![301, 302, 303, 307, 308].includes(response.status)) {

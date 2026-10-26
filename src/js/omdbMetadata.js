@@ -2,8 +2,6 @@ const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
 const fs = require("fs");
 const path = require("path");
-const { logAt } = require("../../logger");
-
 const API_KEY = (process.env.OMDB_API_KEY || "").trim();
 const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MAX_ENTRIES, 2000, 50, 10000), ttl: CACHE_TTL_MS });
@@ -25,37 +23,17 @@ const diagnostics = {
   skippedInvalidImdbId: 0,
   lastOutcome: "not-started"
 };
-let diagnosticLogCount = 0;
-
-function recordOutcome(outcome, details = {}) {
+function recordOutcome(outcome) {
   diagnostics.lastOutcome = outcome;
   if (outcome === "success-with-rating") diagnostics.successWithRating++;
   else if (outcome === "success-without-rating") diagnostics.successWithoutRating++;
   else if (outcome === "retryable-failure") diagnostics.retryableFailures++;
   else if (outcome === "definitive-no-match") diagnostics.definitiveNoMatch++;
-  // Emit a small, bounded sample plus periodic counters. Never log the API key or full URL.
-  diagnosticLogCount++;
-  if (diagnosticLogCount <= 5 || diagnosticLogCount % 100 === 0) {
-    logAt("debug", "[OMDB] Lookup diagnostic", {
-      outcome,
-      attempts: diagnostics.attempts,
-      successWithRating: diagnostics.successWithRating,
-      successWithoutRating: diagnostics.successWithoutRating,
-      retryableFailures: diagnostics.retryableFailures,
-      definitiveNoMatch: diagnostics.definitiveNoMatch,
-      ...details
-    });
-  }
 }
 
 function getDiagnostics() {
   return { ...diagnostics };
 }
-
-logAt("debug", "[OMDB] Runtime configuration", {
-  apiKeyConfigured: diagnostics.apiKeyConfigured,
-  dailyRequestLimit: DAILY_REQUEST_LIMIT
-});
 
 async function loadUsageState() {
   if (usageState) return usageState;
@@ -96,9 +74,8 @@ async function reserveDailyRequest() {
     const temp = USAGE_FILE + ".tmp";
     await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
     await fs.promises.rename(temp, USAGE_FILE);
-  }).catch(error => {
+  }).catch(() => {
     persisted = false;
-    logAt("debug", "[DEBUG] Could not persist OMDb usage counter", error?.name || "Error");
   });
   await usageWriteQueue;
   return persisted;
@@ -139,7 +116,6 @@ async function getByImdbId(value, options = {}) {
   if (!API_KEY) {
     retryableFailures.set(imdbId, true);
     recordOutcome("retryable-failure", { reason: "api-key-unavailable" });
-    logAt("debug", "[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
     return retryableResult(imdbId, cache.get(imdbId) || null);
   }
   let staleCached = null;
@@ -162,7 +138,6 @@ async function getByImdbId(value, options = {}) {
     try {
       if (!(await reserveDailyRequest())) {
         retryableFailures.set(imdbId, true);
-        logAt("debug", "[DEBUG] OMDb daily request budget reached");
         return retryableResult(imdbId, staleCached);
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
@@ -226,7 +201,6 @@ async function getByImdbId(value, options = {}) {
       retryableFailures.set(imdbId, true);
       recordOutcome("retryable-failure", { error: error?.name || "Error" });
       // OMDb is optional: a transient outage must never break card delivery.
-      logAt("debug", "[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
       return retryableResult(imdbId, staleCached);
     }
   })();

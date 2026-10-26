@@ -1,6 +1,6 @@
 // IPTV Stremio Addon Core (with debug logging + series (shows) support for BOTH Xtream & Direct M3U)
 // Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const { createLogger, isDebugEnabled, logAt } = require('./logger');
 
@@ -24,9 +24,6 @@ const CATALOG_METADATA_FAILURE_RETRY_MS = parsePositiveInteger(
     process.env.CATALOG_METADATA_FAILURE_RETRY_MS, 12 * 60 * 60 * 1000,
     60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
 );
-
-const CATALOG_PREFETCH_LOG_MISSING_SERIES =
-    (process.env.CATALOG_PREFETCH_LOG_MISSING_SERIES || '').toLowerCase() === 'true';
 
 function omdbMetadataNeedsRefresh(value) {
     if (!value || !value.imdbId) return false;
@@ -556,8 +553,7 @@ class M3UEPGAddon {
         // Without this, a category request and a queued warm-up can race and issue
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
         this.catalogMetaInFlight = new Map();
-        // Keep failure details only for catalogue items whose metadata lookup did
-        // not resolve. These are included in the opt-in incomplete-series report.
+        // Retain compact lookup-failure reasons for the warm-up summary.
         this.catalogMetaLookupDiagnostics = new Map();
         // Track asynchronous disk writes so a completed pre-warm can flush every
         // metadata preview before its durable completion marker is written.
@@ -1184,11 +1180,9 @@ class M3UEPGAddon {
         const now = Date.now();
         if (!force && CACHE_ENABLED) {
             if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) {
-                this.log.debug('Skip update (global interval)');
                 return;
             }
             if ((this.channels.length || this.movies.length || this.series.length) && now - this.lastUpdate < 900000) {
-                this.log.debug('Skip update (recent minor interval)');
                 return;
             }
         }
@@ -1623,14 +1617,6 @@ class M3UEPGAddon {
         };
         const workerCount = Math.min(Math.max(1, concurrency), candidates.length);
         await Promise.all(Array.from({ length: workerCount }, () => worker()));
-        if (this.config.debug) {
-            this.log.debug('Catalogue metadata enrichment complete', {
-                requestedItems: items.length,
-                uncachedItems: candidates.length,
-                workers: workerCount,
-                ms: Date.now() - startedAt
-            });
-        }
     }
 
     queueCatalogMetaEnrichment(item) {
@@ -1800,7 +1786,8 @@ class M3UEPGAddon {
             let processed = 0;
             let missingMetadata = 0;
             let providerFallbacks = 0;
-            const incompleteSeriesDetails = [];
+            let nextProgressPercent = 25;
+            const providerFallbackReasons = {};
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
@@ -1815,7 +1802,11 @@ class M3UEPGAddon {
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
                     const lookupDiagnostic = this.catalogMetaLookupDiagnostics.get(String(item.id));
-                    if (type === 'series' && lookupDiagnostic?.providerFallback) providerFallbacks++;
+                    if (type === 'series' && lookupDiagnostic?.providerFallback) {
+                        providerFallbacks++;
+                        const reason = lookupDiagnostic.reason || 'unknown';
+                        providerFallbackReasons[reason] = (providerFallbackReasons[reason] || 0) + 1;
+                    }
                     const metadataNameMissing = !String(cached?.name || '').trim();
                     const metadataVersionOld = Boolean(cached) && cached.metadataVersion < 3;
                     const imdbIdLookupPending = Boolean(
@@ -1825,53 +1816,22 @@ class M3UEPGAddon {
                     const catalogRetryDue = catalogMetadataNeedsRefresh(cached);
                     const incomplete = !cached || metadataNameMissing || metadataVersionOld ||
                         imdbIdLookupPending || omdbRetryDue || catalogRetryDue;
-                    if (incomplete) {
-                        missingMetadata++;
-                        if (type === 'series' && incompleteSeriesDetails.length < 100) {
-                            const missingFields = [];
-                            if (!cached) missingFields.push('metadata preview');
-                            else {
-                                if (metadataNameMissing) missingFields.push('name');
-                                if (metadataVersionOld) missingFields.push('metadata schema v3');
-                                if (imdbIdLookupPending) missingFields.push('IMDb ID lookup');
-                                if (omdbRetryDue) {
-                                    if (!cached.imdbRating) missingFields.push('IMDb rating (OMDb retry due)');
-                                    if (!cached.runtime) missingFields.push('runtime (OMDb retry due)');
-                                }
-                                if (catalogRetryDue) {
-                                    missingFields.push(...missingCatalogMetadataFields(cached));
-                                }
-                            }
-                            incompleteSeriesDetails.push({
-                                id: String(item.id),
-                                name: String(item.name || cached?.name || '').slice(0, 160),
-                                missing: [...new Set(missingFields.length ? missingFields : ['metadata incomplete'])],
-                                lookup: this.catalogMetaLookupDiagnostics.get(String(item.id)) || undefined
-                            });
-                        }
-                    }
+                    if (incomplete) missingMetadata++;
                 }
-                if (this.config.debug) {
-                    this.log.debug('Background catalogue prefetch progress', {
-                        type, processed, total: items.length, missingMetadata,
-                    });
-                }
-            }
 
-            if (type === 'series' && missingMetadata > 0) {
-                this.log.debug('Series metadata still incomplete after warm-up', {
-                    total: missingMetadata,
-                    logged: incompleteSeriesDetails.length,
-                    truncated: missingMetadata > incompleteSeriesDetails.length
-                });
-                if (CATALOG_PREFETCH_LOG_MISSING_SERIES) {
-                    for (const detail of incompleteSeriesDetails) {
-                        this.log.info('Series metadata incomplete', {
-                            id: detail.id,
-                            name: detail.name,
-                            missing: detail.missing.join(', '),
-                            lookup: detail.lookup
+                const progressPercent = Math.floor((processed * 100) / items.length);
+                if (progressPercent >= nextProgressPercent) {
+                    const milestone = Math.min(75, Math.floor(progressPercent / 25) * 25);
+                    if (milestone >= nextProgressPercent) {
+                        this.log.debug('Catalogue metadata warm-up progress', {
+                            type,
+                            percent: milestone,
+                            processed,
+                            total: items.length,
+                            missingMetadata,
+                            providerFallbacks
                         });
+                        nextProgressPercent = milestone + 25;
                     }
                 }
             }
@@ -1911,6 +1871,7 @@ class M3UEPGAddon {
             this.log.debug('Catalogue metadata diagnostics', {
                 type,
                 ...omdbCatalogueSummary,
+                tmdb: typeof tmdbMetadata.getDiagnostics === 'function' ? tmdbMetadata.getDiagnostics() : undefined,
                 omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
             });
 
@@ -1935,7 +1896,7 @@ class M3UEPGAddon {
                 this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
                 this.log.info('Persistent catalogue metadata warm-up complete', {
-                    type, processed, total: items.length, providerFallbacks, ms: Date.now() - startedAt
+                    type, processed, total: items.length, providerFallbacks, providerFallbackReasons, ms: Date.now() - startedAt
                 });
             } else {
                 const retryDelay = parsePositiveInteger(
@@ -1944,7 +1905,7 @@ class M3UEPGAddon {
                 );
                 this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
                 this.log.warn('Catalogue metadata warm-up incomplete; will retry after backoff', {
-                    type, processed, total: items.length, missingMetadata, providerFallbacks, retryDelay
+                    type, processed, total: items.length, missingMetadata, providerFallbacks, providerFallbackReasons, retryDelay
                 });
             }
         })();
@@ -2145,12 +2106,9 @@ class M3UEPGAddon {
             const providerLookup = {};
             let tmdbId = seriesItem.tmdbId || null;
             let idSource = tmdbId ? 'catalogue' : 'provider_lookup';
-            const providerLookupStartedAt = Date.now();
             if (!tmdbId) {
                 tmdbId = await this.ensureSeriesTmdbId(seriesId, providerLookup);
             }
-            const providerLookupMs = Date.now() - providerLookupStartedAt;
-            const tmdbLookupStartedAt = Date.now();
             let tmdbLookup = {};
             let tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
                 refresh: refreshIncompleteMetadata,
@@ -2259,15 +2217,6 @@ class M3UEPGAddon {
                 });
             }
             const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteMetadata }) : null;
-            this.log.debug('Catalogue metadata stages', {
-                type: 'series',
-                id: seriesItem.id,
-                hasListingTmdbId: !!seriesItem.tmdbId,
-                hasResolvedTmdbId: !!tmdbId,
-                providerLookupMs,
-                tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
-                totalMs: Date.now() - providerLookupStartedAt
-            });
             if (!tmdb) return this.getDetailedMeta(id);
             return {
                 id: seriesItem.id,
@@ -2305,23 +2254,11 @@ class M3UEPGAddon {
         const providerModule = require('./src/js/providers/xtreamProvider.js');
         const idCacheKey = 'movie-tmdb:' + id;
         let tmdbId = item.tmdbId || this.seriesInfoCache.get(idCacheKey);
-        const providerLookupStartedAt = Date.now();
         if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
             tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
         }
-        const providerLookupMs = Date.now() - providerLookupStartedAt;
-        const tmdbLookupStartedAt = Date.now();
         const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId, { refresh: refreshIncompleteMetadata });
         const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteMetadata }) : null;
-        this.log.debug('Catalogue metadata stages', {
-            type: 'movie',
-            id: item.id,
-            hasListingTmdbId: !!item.tmdbId,
-            hasResolvedTmdbId: !!tmdbId,
-            providerLookupMs,
-            tmdbLookupMs: Date.now() - tmdbLookupStartedAt,
-            totalMs: Date.now() - providerLookupStartedAt
-        });
         if (!tmdb) return this.getDetailedMeta(id);
         return {
             id: item.id,
@@ -2550,13 +2487,6 @@ async function createAddon(config) {
 
                 const extra = args.extra || {}; // Stremio passes filter/genre here
                 let filtered = items;
-                let genreFilterMs = 0;
-                let genreIndexMs = 0;
-                let genreIndexBuilt = false;
-                let searchIndexMs = 0;
-                let searchFilterMs = 0;
-                let searchIndexBuilt = false;
-
                 const normalizedSearchQuery = extra.search ? getNormalizedSearchText(extra.search) : '';
                 const selectedGenre = extra.genre && normalizeGenre(extra.genre) !== 'all channels'
                     ? normalizeGenre(extra.genre)
@@ -2582,13 +2512,9 @@ async function createAddon(config) {
 
                 // If specific genre selected, reuse normalised item categories across
                 // requests. Matching remains exact and preserves catalogue order.
-                const genreFilterStartedAt = Date.now();
                 if (!queryCacheHit && selectedGenre) {
-                    const genreIndexStartedAt = Date.now();
                     const genreIndexResult = getCatalogueGenreIndex(items);
                     const genreIndex = genreIndexResult.index;
-                    genreIndexBuilt = genreIndexResult.built;
-                    genreIndexMs = Date.now() - genreIndexStartedAt;
                     filtered = filtered.filter(i => {
                         const indexedGenre = genreIndex.get(i);
                         if (indexedGenre !== undefined) return indexedGenre === selectedGenre;
@@ -2596,27 +2522,19 @@ async function createAddon(config) {
                         return matchesGenre(cat, selectedGenre);
                     });
                 }
-                genreFilterMs = Date.now() - genreFilterStartedAt;
-
                 // Keep normalized titles indexed per immutable catalogue array. This
                 // avoids repeatedly normalizing thousands of titles on every search,
                 // without changing matching rules, result order, or displayed titles.
                 if (!queryCacheHit && normalizedSearchQuery) {
-                    const indexStartedAt = Date.now();
                     const searchIndexResult = getCatalogueSearchIndex(items);
                     const searchIndex = searchIndexResult.index;
-                    searchIndexBuilt = searchIndexResult.built;
                     const matcher = createNormalizedSearchMatcher(normalizedSearchQuery);
-                    searchIndexMs = Date.now() - indexStartedAt;
-
-                    const searchFilterStartedAt = Date.now();
                     filtered = filtered.filter(i => {
                         const indexedTitle = searchIndex.get(i);
                         return indexedTitle
                             ? matcher(indexedTitle.text, indexedTitle.words)
                             : matcher(getNormalizedSearchText(i.name));
                     });
-                    searchFilterMs = Date.now() - searchFilterStartedAt;
                 }
 
                 if (queryResultCache && !queryCacheHit) {
@@ -2633,10 +2551,8 @@ async function createAddon(config) {
 
                 // Pagination / Skip. Stremio's next-page skip is based on the number
                 // of items already returned, so smaller non-search pages remain pageable.
-                const paginationStartedAt = Date.now();
                 const skip = extra.skip ? parseInt(extra.skip) : 0;
                 const page = filtered.slice(skip, skip + catalogPageSize);
-                const paginationMs = Date.now() - paginationStartedAt;
 
                 // Native EPG requests specify a UTC date and expect metasDetailed.
                 if (args.type === 'tv' && args.id === 'iptv_channels' && extra.date) {
@@ -2661,13 +2577,11 @@ async function createAddon(config) {
                         };
                     });
 
-                    if (addonInstance.config.debug) {
-                        logAt('debug', '[DEBUG] EPG guide catalog', {
-                            date: extra.date,
+                    const epgHandlerMs = Date.now() - start;
+                    if (epgHandlerMs >= 10_000) {
+                        logAt('debug', '[DEBUG] Slow EPG guide request', {
                             channels: metasDetailed.length,
-                            scheduledChannels: metasDetailed.filter(m => m.videos.length > 0).length,
-                            skip,
-                            ms: Date.now() - start
+                            ms: epgHandlerMs
                         });
                     }
                     return { metasDetailed, cacheMaxAge: 300, staleRevalidate: 1800, staleError: 604800 };
@@ -2681,11 +2595,9 @@ async function createAddon(config) {
                 const genreMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_GENRE_META_CONCURRENCY, 16, 1, 16
                 );
-                const enrichmentStartedAt = Date.now();
                 if (page.length && (args.type === 'movie' || args.type === 'series')) {
                     await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
                 }
-                const enrichmentMs = Date.now() - enrichmentStartedAt;
 
                 // One background job per media type warms the complete, unfiltered
                 // catalogue. Search requests join the same job instead of creating
@@ -2703,7 +2615,6 @@ async function createAddon(config) {
                     );
                 }
 
-                const responseBuildStartedAt = Date.now();
                 const metas = page.map((i, pageIndex) => {
                     const meta = addonInstance.generateMetaPreview(i);
                     if (i.type === 'tv') {
@@ -2735,27 +2646,12 @@ async function createAddon(config) {
                 
                 metas.forEach(stripTmdbRatings);
 
-                const responseBuildMs = Date.now() - responseBuildStartedAt;
-                if (addonInstance.config.debug) {
-                    logAt('debug', '[DEBUG] Catalog handler', {
+                const catalogHandlerMs = Date.now() - start;
+                if (catalogHandlerMs >= 10_000) {
+                    logAt('debug', '[DEBUG] Slow catalogue request', {
                         type: args.type,
-                        id: args.id,
-                        genre: extra.genre,
-                        totalItems: items.length,
-                        filtered: filtered.length,
                         returned: metas.length,
-                        skip,
-                        genreFilterMs,
-                        genreIndexMs,
-                        genreIndexBuilt,
-                        searchIndexMs,
-                        searchIndexBuilt,
-                        searchFilterMs,
-                        queryCacheHit,
-                        paginationMs,
-                        enrichmentMs,
-                        responseBuildMs,
-                        ms: Date.now() - start
+                        ms: catalogHandlerMs
                     });
                 }
                 return { metas };
@@ -2850,16 +2746,10 @@ async function createAddon(config) {
                     return meta;
                 };
 
-                if (addonInstance.config.debug) {
-                    logAt('debug', '[DEBUG] Meta handler called', { type, id, seriesCount: addonInstance.series.length });
-                }
                 if (type === 'series' || id.startsWith('iptv_series_')) {
                     const meta = exposeNativeImdbRating(
                         await addonInstance.getDetailedMetaAsync(id, 'series')
                     );
-                    if (addonInstance.config.debug) {
-                        logAt('debug', '[DEBUG] Series meta result', { id, found: !!meta, videos: meta?.videos?.length });
-                    }
                     if (!meta) {
                         // Fallback: Try to find in series list and return basic meta without episodes
                         const seriesItem = addonInstance.series.find(s => s.id === id);
@@ -2870,9 +2760,6 @@ async function createAddon(config) {
                                 name: 'Metadata unavailable',
                                 videos: []
                             };
-                            if (addonInstance.config.debug) {
-                                logAt('debug', '[DEBUG] Series meta fallback used', { id, name: seriesItem.name });
-                            }
                             return { meta: fallbackMeta };
                         }
                     }
@@ -2907,9 +2794,6 @@ async function createAddon(config) {
                             meta.imdbRating = numericRating.toFixed(1);
                         }
                     }
-                }
-                if (addonInstance.config.debug) {
-                    logAt('debug', '[DEBUG] Meta request', { id, type, found: !!meta });
                 }
                 return { meta };
             } catch (e) {
