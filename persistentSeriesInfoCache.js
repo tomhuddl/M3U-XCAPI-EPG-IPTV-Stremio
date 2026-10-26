@@ -1,8 +1,8 @@
 "use strict";
 
-const fs = require("fs/promises");
 const path = require("path");
 const { logAt } = require("./logger");
+const PersistentMapJournal = require("./persistentMapJournal");
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -27,6 +27,11 @@ class PersistentSeriesInfoCache {
         this.enabled = typeof this.directory === "string" && this.directory.trim().length > 0;
         this.filePath = this.enabled
             ? path.join(this.directory, "series-info-" + String(cacheKey).slice(0, 24) + ".json")
+            : null;
+        this.journal = this.enabled
+            ? new PersistentMapJournal(this.filePath, MAX_FILE_BYTES, (source, error) => {
+                logAt("warn", "[SERIES-CACHE] Could not read persistent series details " + source + ":", error?.name || "Error");
+            })
             : null;
 
         const providerRefresh = positiveInt(process.env.DATA_REFRESH_INTERVAL_MS, 12 * HOUR_MS, HOUR_MS, 7 * DAY_MS);
@@ -56,17 +61,12 @@ class PersistentSeriesInfoCache {
         if (!this.loadPromise) {
             this.loadPromise = (async () => {
                 try {
-                    const stat = await fs.stat(this.filePath);
-                    if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return;
-                    const parsed = JSON.parse(await fs.readFile(this.filePath, "utf8"));
-                    if (!parsed || parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== "object") return;
+                    const loaded = await this.journal.load();
                     const now = Date.now();
-                    for (const [key, entry] of Object.entries(parsed.entries)) {
+                    for (const [key, entry] of loaded.entries) {
                         if (!entry || !Number.isFinite(entry.savedAt) || !Number.isFinite(entry.providerLastUpdate) ||
                             !entry.value || !Array.isArray(entry.value.videos) ||
-                            now - entry.savedAt > this.staleRetentionMs || now < entry.savedAt) {
-                            continue;
-                        }
+                            now - entry.savedAt > this.staleRetentionMs || now < entry.savedAt) continue;
                         this.entries.set(String(key), {
                             savedAt: entry.savedAt,
                             providerLastUpdate: entry.providerLastUpdate,
@@ -76,8 +76,9 @@ class PersistentSeriesInfoCache {
                     this.prune();
                     logAt("info", "[SERIES-CACHE] Loaded persistent series details", {
                         entries: this.entries.size,
-                        bytes: stat.size
+                        bytes: loaded.snapshotBytes + loaded.journalBytes
                     });
+                    if (this.dirty || this.journal.forceCompact) this.scheduleWrite();
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
                         logAt("warn", "[SERIES-CACHE] Could not load persistent series details:", error?.name || "Error");
@@ -91,7 +92,11 @@ class PersistentSeriesInfoCache {
     prune() {
         const cutoff = Date.now() - this.staleRetentionMs;
         for (const [key, entry] of this.entries) {
-            if (!entry || entry.savedAt < cutoff) this.entries.delete(key);
+            if (!entry || entry.savedAt < cutoff) {
+                this.entries.delete(key);
+                this.journal?.mark(key, null);
+                this.dirty = true;
+            }
         }
         while (this.entries.size > this.maxEntries) {
             let oldestKey;
@@ -104,6 +109,8 @@ class PersistentSeriesInfoCache {
             }
             if (oldestKey === undefined) break;
             this.entries.delete(oldestKey);
+            this.journal?.mark(oldestKey, null);
+            this.dirty = true;
         }
     }
 
@@ -115,6 +122,7 @@ class PersistentSeriesInfoCache {
         const age = Date.now() - entry.savedAt;
         if (age < 0 || age > this.staleRetentionMs) {
             this.entries.delete(String(seriesId));
+            this.journal.mark(String(seriesId), null);
             this.dirty = true;
             this.scheduleWrite();
             return null;
@@ -131,17 +139,18 @@ class PersistentSeriesInfoCache {
         if (!this.enabled || !value || typeof value !== "object" || !Array.isArray(value.videos)) return;
         await this.init();
         const key = String(seriesId);
-        this.entries.delete(key);
-        this.entries.set(key, {
+        const entry = {
             savedAt: Date.now(),
             providerLastUpdate: Number(providerLastUpdate) || 0,
             value
-        });
+        };
+        this.entries.set(key, entry);
+        this.journal.mark(key, entry);
         this.prune();
         this.dirty = true;
-        // Await the atomic disk write so a freshly fetched episode list is saved
-        // before the request completes.
-        await this.flush();
+        // Journal asynchronously instead of rewriting the full series cache before
+        // returning the detailed page.
+        this.scheduleWrite();
     }
 
     async retainSeries(seriesIds) {
@@ -152,11 +161,13 @@ class PersistentSeriesInfoCache {
         for (const key of this.entries.keys()) {
             if (!keep.has(key)) {
                 this.entries.delete(key);
+                this.journal.mark(key, null);
                 changed = true;
             }
         }
         if (changed) {
             this.dirty = true;
+            this.journal.forceCompact = true;
             this.scheduleWrite();
         }
     }
@@ -185,36 +196,18 @@ class PersistentSeriesInfoCache {
         await this.init();
         if (this.writePromise) {
             await this.writePromise;
-            if (this.dirty) return this.flush();
+            if (this.dirty || this.journal.forceCompact) return this.flush();
             return;
         }
-        if (!this.dirty) return;
+        if (!this.dirty && !this.journal.forceCompact) return;
 
         this.dirty = false;
-        const snapshot = JSON.stringify({
-            version: 1,
-            entries: Object.fromEntries(this.entries)
-        });
-        if (Buffer.byteLength(snapshot, "utf8") > MAX_FILE_BYTES) {
-            this.dirty = true;
-            throw new Error("persistent series detail cache exceeds the 128 MiB safety limit");
-        }
-
-        this.writePromise = (async () => {
-            await fs.mkdir(this.directory, { recursive: true });
-            const tempPath = this.filePath + "." + process.pid + ".tmp";
-            try {
-                await fs.writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
-                await fs.rename(tempPath, this.filePath);
-            } finally {
-                await fs.unlink(tempPath).catch(() => {});
-            }
-        })();
-
+        this.writePromise = this.journal.flush(this.entries);
         let writeFailed = false;
         try {
             await this.writePromise;
             this.writeRetryDelayMs = 1000;
+            this.dirty = this.journal.hasPending || this.journal.forceCompact;
         } catch (error) {
             this.dirty = true;
             writeFailed = true;

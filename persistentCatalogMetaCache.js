@@ -1,8 +1,8 @@
 "use strict";
 
-const fs = require("fs/promises");
 const path = require("path");
 const { logAt } = require("./logger");
+const PersistentMapJournal = require("./persistentMapJournal");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // A full movie + series catalogue can exceed 64 MiB once metadata is enriched.
@@ -32,6 +32,11 @@ class PersistentCatalogMetaCache {
         this.filePath = this.enabled
             ? path.join(this.directory, "catalog-meta-" + String(cacheKey).slice(0, 24) + ".json")
             : null;
+        this.journal = this.enabled
+            ? new PersistentMapJournal(this.filePath, MAX_FILE_BYTES, (source, error) => {
+                logAt("warn", "[CATALOG-CACHE] Could not read persistent metadata " + source + ":", error?.name || "Error");
+            })
+            : null;
         // Persistent metadata has its own freshness window, separate from the
         // short-lived in-memory LRU. Keep the legacy variable as a migration fallback.
         this.ttlMs = parsePositiveInteger(
@@ -59,29 +64,21 @@ class PersistentCatalogMetaCache {
         if (!this.loadPromise) {
             this.loadPromise = (async () => {
                 try {
-                    const stat = await fs.stat(this.filePath);
-                    if (!stat.isFile() || stat.size > MAX_FILE_BYTES) {
-                        return;
-                    }
-                    const parsed = JSON.parse(await fs.readFile(this.filePath, "utf8"));
-                    if (!parsed || parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== "object") {
-                        return;
-                    }
+                    const loaded = await this.journal.load();
                     const now = Date.now();
-                    for (const [key, entry] of Object.entries(parsed.entries)) {
+                    for (const [key, entry] of loaded.entries) {
                         if (!entry || !Number.isFinite(entry.savedAt) || !entry.value ||
-                            now - entry.savedAt > this.staleRetentionMs || now < entry.savedAt) {
-                            continue;
-                        }
+                            now - entry.savedAt > this.staleRetentionMs || now < entry.savedAt) continue;
                         this.entries.set(key, { savedAt: entry.savedAt, value: entry.value });
                     }
                     this.prune();
                     logAt("info", "[CATALOG-CACHE] Loaded persistent metadata cache", {
                         entries: this.entries.size,
-                        bytes: stat.size,
+                        bytes: loaded.snapshotBytes + loaded.journalBytes,
                         freshEntries: [...this.entries.values()].filter(entry => now - entry.savedAt < this.ttlMs).length,
                         staleFallbackEntries: [...this.entries.values()].filter(entry => now - entry.savedAt >= this.ttlMs).length
                     });
+                    if (this.dirty || this.journal.forceCompact) this.scheduleWrite();
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
                         logAt("warn", "[CATALOG-CACHE] Could not load persistent metadata cache:", error?.name || "Error");
@@ -95,7 +92,11 @@ class PersistentCatalogMetaCache {
     prune() {
         const cutoff = Date.now() - this.staleRetentionMs;
         for (const [key, entry] of this.entries) {
-            if (!entry || entry.savedAt < cutoff) this.entries.delete(key);
+            if (!entry || entry.savedAt < cutoff) {
+                this.entries.delete(key);
+                this.journal?.mark(key, null);
+                this.dirty = true;
+            }
         }
         while (this.entries.size > this.maxEntries) {
             let oldestKey;
@@ -108,6 +109,8 @@ class PersistentCatalogMetaCache {
             }
             if (oldestKey === undefined) break;
             this.entries.delete(oldestKey);
+            this.journal?.mark(oldestKey, null);
+            this.dirty = true;
         }
     }
 
@@ -119,6 +122,7 @@ class PersistentCatalogMetaCache {
         const age = Date.now() - entry.savedAt;
         if (age < 0 || age > this.staleRetentionMs) {
             this.entries.delete(String(key));
+            this.journal.mark(String(key), null);
             this.dirty = true;
             this.scheduleWrite();
             return null;
@@ -133,8 +137,10 @@ class PersistentCatalogMetaCache {
     async set(key, value) {
         if (!this.enabled || !value || typeof value !== "object") return;
         await this.init();
-        this.entries.delete(String(key));
-        this.entries.set(String(key), { savedAt: Date.now(), value });
+        const normalizedKey = String(key);
+        const entry = { savedAt: Date.now(), value };
+        this.entries.set(normalizedKey, entry);
+        this.journal.mark(normalizedKey, entry);
         this.prune();
         this.dirty = true;
         this.scheduleWrite();
@@ -144,6 +150,7 @@ class PersistentCatalogMetaCache {
         if (!this.enabled) return;
         await this.init();
         if (this.entries.delete(String(key))) {
+            this.journal.mark(String(key), null);
             this.dirty = true;
             this.scheduleWrite();
         }
@@ -159,11 +166,13 @@ class PersistentCatalogMetaCache {
             if (key.startsWith("__catalog_prefetch_status__:")) continue;
             if (!keep.has(key)) {
                 this.entries.delete(key);
+                this.journal.mark(key, null);
                 changed = true;
             }
         }
         if (changed) {
             this.dirty = true;
+            this.journal.forceCompact = true;
             this.scheduleWrite();
         }
     }
@@ -184,43 +193,26 @@ class PersistentCatalogMetaCache {
 
     async flush() {
         if (!this.enabled) return;
+        if (this.writeTimer) {
+            clearTimeout(this.writeTimer);
+            this.writeTimer = null;
+        }
         await this.init();
         if (this.writePromise) {
             await this.writePromise;
-            if (this.dirty) return this.flush();
+            if (this.dirty || this.journal.forceCompact) return this.flush();
             return;
         }
-        if (!this.dirty) return;
+        if (!this.dirty && !this.journal.forceCompact) return;
 
         this.dirty = false;
-        const snapshot = JSON.stringify({
-            version: 1,
-            entries: Object.fromEntries(this.entries),
-        });
-        if (Buffer.byteLength(snapshot, "utf8") > MAX_FILE_BYTES) {
-            this.dirty = true;
-            throw new Error("persistent catalogue metadata cache exceeds the 256 MiB safety limit");
-        }
-        this.writePromise = (async () => {
-            await fs.mkdir(this.directory, { recursive: true });
-            const tempPath = this.filePath + "." + process.pid + ".tmp";
-            try {
-                await fs.writeFile(tempPath, snapshot, { encoding: "utf8", mode: 0o600 });
-                await fs.rename(tempPath, this.filePath);
-            } finally {
-                await fs.unlink(tempPath).catch(() => {});
-            }
-        })();
-
+        this.writePromise = this.journal.flush(this.entries);
         let writeFailed = false;
         try {
             await this.writePromise;
-            // A successful write resets the backoff for any future failure.
             this.writeRetryDelayMs = 1000;
+            this.dirty = this.journal.hasPending || this.journal.forceCompact;
         } catch (error) {
-            // Keep the snapshot dirty when disk persistence fails. Otherwise the
-            // next flush would see dirty=false and silently discard this update.
-            // Back off retries so an unavailable volume cannot create a hot loop.
             this.dirty = true;
             writeFailed = true;
             throw error;

@@ -249,6 +249,9 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `SERIES_INFO_PERSISTENT_TTL_MS` | same as DATA_REFRESH_INTERVAL_MS | Freshness window for persisted Xtream episode details (bounded to 1h–30d) |
 | `SERIES_INFO_STALE_RETENTION_MS` | 2592000000 (30d) | Maximum stale Xtream episode-detail fallback age |
 | `SERIES_INFO_PERSISTENT_MAX_ENTRIES` | 20000 | Maximum persistent Xtream series-detail entries |
+| `EPG_FETCH_CONCURRENCY` | 2 | Concurrent EPG sources fetched and parsed per provider (capped at 4) |
+| `SERIES_EPISODE_METADATA_CONCURRENCY` | 6 | Concurrent TMDb season episode requests on a series detail page (capped at 12) |
+| `SERIES_EPISODE_CACHE_MAX` | 50000 | Maximum in-memory episode ID lookup entries (bounded to 1,000–200,000) |
 | `CATALOG_META_MEMORY_TTL_MS` | `21600000` (6h) | In-memory LRU lifetime for enriched movie/series metadata |
 | `CATALOG_META_PERSISTENT_TTL_MS` | `1209600000` (14d) | Freshness window for persisted enhanced movie/series metadata; legacy fallback: `CATALOG_META_CACHE_TTL_MS` |
 | `CATALOG_METADATA_REFRESH_MS` | 1209600000 (14d) | Normal per-item refresh interval for enriched catalogue metadata |

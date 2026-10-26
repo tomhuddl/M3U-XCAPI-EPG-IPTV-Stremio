@@ -760,44 +760,44 @@ app.use("/:token", (req, res, next) => {
     const originalEnd = res.end.bind(res);
     res.end = function (chunk, encoding, callback) {
       const contentType = String(res.getHeader("content-type") || "").toLowerCase();
-      if (chunk != null && contentType.includes("application/json")) {
+      // Catalogue responses are already normalized by the addon. Only detailed
+      // metadata occasionally needs a client-specific link filter at this boundary.
+      if (pathIsMeta && chunk != null && contentType.includes("application/json")) {
         try {
           const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-          const body = JSON.parse(jsonText);
-          const normalizeRating = (meta) => {
-            if (!meta || typeof meta !== "object") return;
-            let rating = meta.imdbRating;
-            const valid = (value) => value != null && value !== "" &&
-              Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
-            if (!valid(rating) && Array.isArray(meta.links)) {
-              const link = meta.links.find(item =>
-                item && typeof item.name === "string" &&
-                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim())
-              );
-              const match = link?.name?.trim().match(
-                /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
-              );
-              if (match) rating = match[1];
-            }
-            if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
-          };
+          const removableCategory = isIosStremioClient
+            ? /"category"\s*:\s*"Rating"/
+            : /"category"\s*:\s*"Writers"/;
+          if (removableCategory.test(jsonText)) {
+            const body = JSON.parse(jsonText);
+            if (body?.meta && typeof body.meta === "object") {
+              const meta = body.meta;
+              let rating = meta.imdbRating;
+              const valid = value => value != null && value !== "" &&
+                Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
+              if (!valid(rating) && Array.isArray(meta.links)) {
+                const link = meta.links.find(item =>
+                  item && typeof item.name === "string" &&
+                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim())
+                );
+                const match = link?.name?.trim().match(
+                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+                );
+                if (match) rating = match[1];
+              }
+              if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
 
-          if (pathIsMeta && body?.meta && typeof body.meta === "object") {
-            normalizeRating(body.meta);
-            const meta = body.meta;
-            const links = Array.isArray(meta.links) ? meta.links : [];
-            if (isIosStremioClient) {
-              meta.links = links.filter(link => link?.category !== "Rating");
-              delete meta.tmdbRating;
-            } else {
-              meta.links = links.filter(link => link?.category !== "Writers");
+              const links = Array.isArray(meta.links) ? meta.links : [];
+              if (isIosStremioClient) {
+                meta.links = links.filter(link => link?.category !== "Rating");
+                delete meta.tmdbRating;
+              } else {
+                meta.links = links.filter(link => link?.category !== "Writers");
+              }
             }
-          } else if (pathIsCatalog && Array.isArray(body?.metas)) {
-            body.metas.forEach(normalizeRating);
+            const output = JSON.stringify(body);
+            chunk = Buffer.isBuffer(chunk) ? Buffer.from(output, "utf8") : output;
           }
-
-          const output = JSON.stringify(body);
-          chunk = Buffer.isBuffer(chunk) ? Buffer.from(output, "utf8") : output;
         } catch {
           // Leave non-JSON or unexpected SDK responses untouched.
         }
@@ -807,7 +807,6 @@ app.use("/:token", (req, res, next) => {
   }
   next();
 });
-
 // Stremio router (handles catalog, stream, meta)
 app.use("/:token", (req, res) => {
   const iface = req.addonInterface;

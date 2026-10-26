@@ -6,6 +6,24 @@
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
 
+function getEpgFetchConcurrency() {
+    const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? Math.min(parsed, 4) : 2;
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(items.length, concurrency);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+            const index = nextIndex++;
+            results[index] = await mapper(items[index], index);
+        }
+    }));
+    return results;
+}
+
 async function fetchData(addonInstance) {
   const { config } = addonInstance;
   const {
@@ -235,35 +253,39 @@ async function fetchData(addonInstance) {
   if (config.enableEpg) {
     const customEpgUrl = config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
       ? config.epgUrl.trim() : null;
-    const primaryEpgUrl = customEpgUrl || `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
+    const primaryEpgUrl = customEpgUrl || xtreamUrl + "/xmltv.php?username=" +
+      encodeURIComponent(xtreamUsername) + "&password=" + encodeURIComponent(xtreamPassword);
     const epgSources = [...new Set([primaryEpgUrl, ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
-    const merged = {};
+    const allowedIds = new Set(addonInstance.channels
+      .map(channel => channel.attributes?.["tvg-id"] || channel.attributes?.["tvg-name"])
+      .filter(Boolean)
+      .map(String));
     const retentionBudget = { programmes: 0, textChars: 0 };
-    for (const sourceUrl of epgSources) {
+    const parsedSources = await mapWithConcurrency(epgSources, getEpgFetchConcurrency(), async sourceUrl => {
       try {
         const epgResp = await fetch(sourceUrl, { timeout: 120000 });
         if (!epgResp.ok || !epgResp.body) {
           if (epgResp.body) epgResp.body.destroy();
-          continue;
+          return null;
         }
-        const allowedIds = new Set(addonInstance.channels
-          .map(channel => channel.attributes?.["tvg-id"] || channel.attributes?.["tvg-name"])
-          .filter(Boolean)
-          .map(String));
-        const parsed = await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
-        for (const [channelId, programmes] of Object.entries(parsed)) {
-          if (!merged[channelId]) merged[channelId] = [];
-          merged[channelId].push(...programmes);
-        }
+        return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
       } catch {
-        // Keep data from other feeds if this source is unavailable.
+        return null;
+      }
+    });
+    const merged = {};
+    for (const parsed of parsedSources) {
+      if (!parsed) continue;
+      for (const [channelId, programmes] of Object.entries(parsed)) {
+        if (!merged[channelId]) merged[channelId] = [];
+        merged[channelId].push(...programmes);
       }
     }
     for (const channelId of Object.keys(merged)) {
       const seen = new Set();
       merged[channelId] = merged[channelId]
         .filter(programme => {
-          const key = [programme.start, programme.stop, programme.title].join('|');
+          const key = [programme.start, programme.stop, programme.title].join("|");
           if (seen.has(key)) return false;
           seen.add(key);
           return true;
@@ -272,6 +294,7 @@ async function fetchData(addonInstance) {
     }
     addonInstance.epgData = merged;
   }
+
 }
 
 function normalizeTmdbId(value) {

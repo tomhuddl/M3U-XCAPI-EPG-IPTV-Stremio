@@ -81,6 +81,17 @@ function stripTmdbRatings(meta) {
                 return { ...normalizedLink, name: match[1], category: 'imdb' };
             });
 
+        const isValidImdbRating = value => value != null && value !== '' &&
+            Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
+        if (!isValidImdbRating(meta.imdbRating)) {
+            const imdbRatingLink = meta.links.find(link =>
+                String(link?.category || '').toLowerCase() === 'imdb' &&
+                /^(?:10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/.test(String(link?.name || '').trim())
+            );
+            if (imdbRatingLink) meta.imdbRating = imdbRatingLink.name;
+        }
+        if (isValidImdbRating(meta.imdbRating)) meta.imdbRating = Number(meta.imdbRating).toFixed(1);
+
         // Catalogue previews also need the canonical IMDb link. The numeric
         // imdbRating field is supported by the Meta Preview schema, but some
         // Stremio clients render the native IMDb badge from an IMDb-category link.
@@ -441,6 +452,19 @@ function getProviderSeriesKey(item) {
     return String(item?.series_id || item?.id?.replace(/^iptv_series_/, '') || '');
 }
 
+async function mapWithConcurrency(items, concurrency, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(items.length, Math.max(1, concurrency));
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+            const index = nextIndex++;
+            results[index] = await mapper(items[index], index);
+        }
+    }));
+    return results;
+}
+
 const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
 const buildPromiseCache = new Map();
 
@@ -516,6 +540,11 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Episode IDs resolve through a bounded cache instead of scanning opened series.
+        this.seriesEpisodeCache = new Map();
+        this.seriesEpisodeCacheMax = parsePositiveInteger(
+            process.env.SERIES_EPISODE_CACHE_MAX, 50000, 1000, 200000
+        );
         // Keep a small parallel diagnostic cache without consuming slots from the
         // bounded series-info LRU.
         this.seriesTmdbLookupDiagnostics = new Map();
@@ -969,7 +998,7 @@ class M3UEPGAddon {
                     reason: tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_missing',
                     source: 'persistent_provider_cache'
                 };
-                this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
                 this.seriesInfoCache.set(cacheKey, tmdbId);
                 cacheLookup(details);
                 setLookup(details);
@@ -1038,6 +1067,24 @@ class M3UEPGAddon {
         }
     }
 
+    cacheSeriesInfo(seriesId, info) {
+        this.seriesInfoCache.set(seriesId, info);
+        if (Array.isArray(info?.videos)) {
+            for (const video of info.videos) {
+                if (!video?.id || !video.url) continue;
+                const id = String(video.id);
+                this.seriesEpisodeCache.delete(id);
+                this.seriesEpisodeCache.set(id, {
+                    video,
+                    expires: Date.now() + CACHE_TTL_MS
+                });
+                while (this.seriesEpisodeCache.size > this.seriesEpisodeCacheMax) {
+                    this.seriesEpisodeCache.delete(this.seriesEpisodeCache.keys().next().value);
+                }
+            }
+        }
+    }
+
     async ensureSeriesInfo(seriesId) {
         if (!seriesId) {
             return null;
@@ -1059,7 +1106,7 @@ class M3UEPGAddon {
                 ? await this.persistentSeriesInfoCache.get(normalizedSeriesId, this.lastUpdate)
                 : null;
             if (persisted?.fresh) {
-                this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
                 return persisted.value;
             }
 
@@ -1075,12 +1122,12 @@ class M3UEPGAddon {
                             error: String(info.fetchError)
                         });
                         if (persisted?.value) {
-                            this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                            this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
                             return persisted.value;
                         }
                         return info;
                     }
-                    this.seriesInfoCache.set(normalizedSeriesId, info);
+                    this.cacheSeriesInfo(normalizedSeriesId, info);
                     if (this.providerName === 'xtream') {
                         await this.persistentSeriesInfoCache
                             .set(normalizedSeriesId, info, this.lastUpdate)
@@ -1090,13 +1137,13 @@ class M3UEPGAddon {
                 }
             } catch (error) {
                 if (persisted?.value) {
-                    this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                    this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
                     return persisted.value;
                 }
             }
             // Fallback empty structure
             const empty = { videos: [] };
-            this.seriesInfoCache.set(normalizedSeriesId, empty);
+            this.cacheSeriesInfo(normalizedSeriesId, empty);
             return empty;
         })();
 
@@ -1151,6 +1198,8 @@ class M3UEPGAddon {
 
         // Provider refreshes may add or remove episodes for an existing series.
         // Drop process-local episode details so the next open uses the new listing.
+        // Cached stream URLs belong to the provider snapshot that just expired.
+        this.seriesEpisodeCache.clear();
         const seriesKeysToInvalidate = new Set([
             ...(Array.isArray(previous.series) ? previous.series : []).map(getProviderSeriesKey),
             ...this.series.map(getProviderSeriesKey)
@@ -1169,6 +1218,29 @@ class M3UEPGAddon {
     }
 
     async updateData(force = false) {
+        const inFlight = providerRefreshInFlight.get(this.cacheKey);
+        if (inFlight) {
+            await inFlight;
+            const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
+            if (sharedLastUpdate > this.lastUpdate) await this.loadFromCache();
+            return;
+        }
+
+        const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
+        if (sharedLastUpdate > this.lastUpdate) await this.loadFromCache();
+
+        const refreshPromise = this._updateData(force);
+        providerRefreshInFlight.set(this.cacheKey, refreshPromise);
+        try {
+            await refreshPromise;
+        } finally {
+            if (providerRefreshInFlight.get(this.cacheKey) === refreshPromise) {
+                providerRefreshInFlight.delete(this.cacheKey);
+            }
+        }
+    }
+
+    async _updateData(force = false) {
         const now = Date.now();
         if (!force && CACHE_ENABLED) {
             if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) {
@@ -1286,9 +1358,10 @@ class M3UEPGAddon {
 
     startScheduledRefresh() {
         if (this.refreshTimer) return;
-        const refreshCheckInterval = parsePositiveInteger(process.env.DATA_REFRESH_CHECK_INTERVAL_MS, 60 * 60 * 1000, 5 * 60 * 1000, 6 * 60 * 60 * 1000);
-        // Check hourly against the persisted last-success timestamp, so process restarts
-        // cannot keep postponing the next refresh.
+        const refreshCheckInterval = parsePositiveInteger(
+            process.env.DATA_REFRESH_CHECK_INTERVAL_MS, 60 * 60 * 1000,
+            5 * 60 * 1000, 6 * 60 * 60 * 1000
+        );
         this.refreshTimer = setInterval(() => {
             if (this.scheduledRefreshInFlight || providerRefreshInFlight.has(this.cacheKey)) return;
             const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
@@ -1301,16 +1374,11 @@ class M3UEPGAddon {
                 lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
                 intervalHours: this.updateInterval / (60 * 60 * 1000)
             });
-            const refreshPromise = this.updateData(true)
+            this.scheduledRefreshInFlight = this.updateData(true)
                 .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
                 .finally(() => {
-                    if (providerRefreshInFlight.get(this.cacheKey) === refreshPromise) {
-                        providerRefreshInFlight.delete(this.cacheKey);
-                    }
                     this.scheduledRefreshInFlight = null;
                 });
-            this.scheduledRefreshInFlight = refreshPromise;
-            providerRefreshInFlight.set(this.cacheKey, refreshPromise);
         }, refreshCheckInterval);
         if (typeof this.refreshTimer.unref === 'function') this.refreshTimer.unref();
     }
@@ -1378,14 +1446,13 @@ class M3UEPGAddon {
     }
 
     lookupEpisodeById(epId) {
-        // Check cached series info
-        for (const [, info] of this.seriesInfoCache.entries()) {
-            if (info && Array.isArray(info.videos)) {
-                const found = info.videos.find(v => v.id === epId);
-                if (found) return found;
-            }
+        // Direct-M3U episodes use the playlist index; Xtream episode details are
+        // indexed as series information enters the bounded detail cache.
+        const cached = this.seriesEpisodeCache.get(epId);
+        if (cached) {
+            if (cached.expires > Date.now()) return cached.video;
+            this.seriesEpisodeCache.delete(epId);
         }
-        // Direct-provider episodes are indexed when the playlist is loaded.
         return this.directSeriesEpisodeById.get(epId) || null;
     }
 
@@ -1451,18 +1518,38 @@ class M3UEPGAddon {
 
     async buildSeriesMeta(seriesItem) {
         const seriesIdRaw = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
-        const info = await this.ensureSeriesInfo(seriesIdRaw);
-        const tmdbId = seriesItem.tmdbId || info?.tmdbId || null;
-        const tmdb = await tmdbMetadata.getSeriesMetadata(tmdbId);
-        // The detailed series view also exposes IMDb rating/runtime fallbacks.
-        // Keep this lookup local to the function rather than referencing an
-        // undefined catalogue-preview variable.
-        const omdb = tmdb?.imdbId ? await this.getDetailOmdbMetadata(tmdb.imdbId, seriesItem.id) : null;
+        const knownTmdbId = seriesItem.tmdbId || null;
+
+        // The provider episode list and known TMDb metadata are independent.
+        // Start them together to avoid serial network wait on detail pages.
+        const infoPromise = this.ensureSeriesInfo(seriesIdRaw);
+        const knownTmdbPromise = knownTmdbId
+            ? tmdbMetadata.getSeriesMetadata(knownTmdbId)
+            : Promise.resolve(null);
+        const [info, initialTmdb] = await Promise.all([infoPromise, knownTmdbPromise]);
+        const tmdbId = knownTmdbId || info?.tmdbId || null;
+        const tmdb = initialTmdb || (tmdbId ? await tmdbMetadata.getSeriesMetadata(tmdbId) : null);
+
+        const omdbPromise = tmdb?.imdbId
+            ? this.getDetailOmdbMetadata(tmdb.imdbId, seriesItem.id)
+            : Promise.resolve(null);
         const tmdbSeasons = new Map();
+        let seasonResultsPromise = Promise.resolve([]);
         if (tmdb && tmdbMetadata.validTmdbId(tmdbId)) {
-            const seasonNumbers = [...new Set((info?.videos || []).map(video => Number(video.season)).filter(n => Number.isSafeInteger(n) && n >= 0))];
-            const seasonResults = await Promise.all(seasonNumbers.map(async season => [season, await tmdbMetadata.getSeasonEpisodes(tmdbId, season)]));
-            for (const [season, episodes] of seasonResults) if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
+            const seasonNumbers = [...new Set((info?.videos || [])
+                .map(video => Number(video.season))
+                .filter(n => Number.isSafeInteger(n) && n >= 0))];
+            const seasonConcurrency = parsePositiveInteger(
+                process.env.SERIES_EPISODE_METADATA_CONCURRENCY, 6, 1, 12
+            );
+            seasonResultsPromise = mapWithConcurrency(seasonNumbers, seasonConcurrency, async season => [
+                season,
+                await tmdbMetadata.getSeasonEpisodes(tmdbId, season)
+            ]);
+        }
+        const [omdb, seasonResults] = await Promise.all([omdbPromise, seasonResultsPromise]);
+        for (const [season, episodes] of seasonResults) {
+            if (Array.isArray(episodes)) tmdbSeasons.set(season, episodes);
         }
         // Index each season's episodes once. A repeated Array.find for every
         // provider episode scales poorly for long-running series with many episodes.
