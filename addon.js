@@ -2,6 +2,8 @@
 // Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
 require('dotenv').config();
 
+const { createLogger, isDebugEnabled, logAt } = require('./logger');
+
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const LRUCache = require("./lruCache");
@@ -156,11 +158,11 @@ if (process.env.REDIS_URL && CACHE_ENABLED) {
             lazyConnect: true,
             maxRetriesPerRequest: 2
         });
-        redisClient.on('error', e => console.error('[REDIS] Error:', e && e.name ? e.name : 'Error'));
-        redisClient.connect().catch(err => console.error('[REDIS] Connect failed:', err && err.name ? err.name : 'Error'));
-        console.log('[REDIS] Enabled');
+        redisClient.on('error', e => logAt('error', '[REDIS] Error:', e && e.name ? e.name : 'Error'));
+        redisClient.connect().catch(err => logAt('error', '[REDIS] Connect failed:', err && err.name ? err.name : 'Error'));
+        logAt('info', '[REDIS] Enabled');
     } catch (e) {
-        console.warn('[REDIS] ioredis not installed or failed, falling back to in-memory LRU');
+        logAt('warn', '[REDIS] ioredis not installed or failed, falling back to in-memory LRU');
         redisClient = null;
     }
 }
@@ -387,15 +389,9 @@ function editDistanceAtMostOne(a, b) {
     return edits <= 1;
 }
 
-const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
+const DEBUG_ENV = isDebugEnabled();
 function makeLogger(cfgDebug) {
-    const enabled = !!cfgDebug || DEBUG_ENV;
-    return {
-        debug: (...a) => { if (enabled) console.log('[DEBUG]', ...a); },
-        info:  (...a) => console.log('[INFO]', ...a),
-        warn:  (...a) => console.warn('[WARN]', ...a),
-        error: (...a) => console.error('[ERROR]', ...a)
-    };
+    return createLogger(!!cfgDebug);
 }
 
 function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
@@ -636,7 +632,7 @@ class M3UEPGAddon {
                 ).length;
                 if (this.series.length && missingSeriesIndexes > 0) {
                     this.lastUpdate = 0;
-                    this.log.info('Direct-M3U episode index is incomplete; rebuilding it', {
+                    this.log.debug('Direct-M3U episode index is incomplete; rebuilding it', {
                         missingSeriesIndexes,
                         totalSeries: this.series.length
                     });
@@ -670,7 +666,7 @@ class M3UEPGAddon {
         await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
         try {
             const persisted = await this.persistentAddonDataCache.save(entry);
-            if (persisted) this.log.info('Persisted provider catalogue and EPG snapshot');
+            if (persisted) this.log.debug('Persisted provider catalogue and EPG snapshot');
         } catch (error) {
             // The in-memory/Redis copy remains usable; a disk write failure must not
             // interrupt a successful provider refresh or replace the last-good file.
@@ -1245,7 +1241,7 @@ class M3UEPGAddon {
                 this.lastUpdate = lastSuccessfulRefresh;
                 return;
             }
-            this.log.info('Scheduled provider refresh is due', {
+            this.log.debug('Scheduled provider refresh is due', {
                 lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
                 intervalHours: this.updateInterval / (60 * 60 * 1000)
             });
@@ -1685,7 +1681,7 @@ class M3UEPGAddon {
         if (Date.now() - lastCompleted < refreshInterval &&
             this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
 
-        this.log.info('Starting catalogue metadata warm-up check', {
+        this.log.debug('Starting catalogue metadata warm-up check', {
             type, total: items.length, pageSize, concurrency
         });
         const job = (async () => {
@@ -1721,12 +1717,12 @@ class M3UEPGAddon {
                     this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                     this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                     this.catalogPrefetchRetryAfter.delete(type);
-                    this.log.info('Persistent catalogue metadata is already warm', {
+                    this.log.debug('Persistent catalogue metadata is already warm', {
                         type, total: items.length, completedAt: new Date(persistedCompletedAt).toISOString()
                     });
                     return;
                 }
-                this.log.info('Persistent catalogue metadata requires refresh despite completion marker', {
+                this.log.debug('Persistent catalogue metadata requires refresh despite completion marker', {
                     type, total: items.length
                 });
             }
@@ -1787,7 +1783,7 @@ class M3UEPGAddon {
                 }
                 if (value.omdbPending === true) omdbCatalogueSummary.omdbPending++;
             }
-            this.log.info('Catalogue metadata diagnostics', {
+            this.log.debug('Catalogue metadata diagnostics', {
                 type,
                 ...omdbCatalogueSummary,
                 omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
@@ -2260,7 +2256,7 @@ async function createAddon(config) {
     if (debugFlag) {
         console.log('[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
     } else {
-        console.log(`[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+        logAt('debug', `[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
     }
 
     if (CACHE_ENABLED && buildPromiseCache.has(cacheKey)) {

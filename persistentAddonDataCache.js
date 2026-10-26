@@ -2,6 +2,7 @@
 
 const fs = require("fs/promises");
 const path = require("path");
+const { logAt } = require("./logger");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_FILE_BYTES = 128 * 1024 * 1024;
@@ -33,7 +34,7 @@ class PersistentAddonDataCache {
         try {
             const stat = await fs.stat(this.filePath);
             if (!stat.isFile() || stat.size > this.maxFileBytes) {
-                console.warn("[DATA-CACHE] Persistent data file is not a valid size; ignoring it");
+                logAt("warn", "[DATA-CACHE] Persistent data file is not a valid size; ignoring it");
                 return null;
             }
             const parsed = JSON.parse(await fs.readFile(this.filePath, "utf8"));
@@ -46,13 +47,13 @@ class PersistentAddonDataCache {
                 (parsed.data.directSeriesEpisodes !== undefined &&
                     (!parsed.data.directSeriesEpisodes || typeof parsed.data.directSeriesEpisodes !== "object" ||
                         Array.isArray(parsed.data.directSeriesEpisodes)))) {
-                console.warn("[DATA-CACHE] Persistent data file failed validation; ignoring it");
+                logAt("warn", "[DATA-CACHE] Persistent data file failed validation; ignoring it");
                 return null;
             }
             return parsed.data;
         } catch (error) {
             if (error?.code !== "ENOENT") {
-                console.warn("[DATA-CACHE] Could not load persistent data:", error?.name || "Error");
+                logAt("warn", "[DATA-CACHE] Could not load persistent data:", error?.name || "Error");
             }
             return null;
         }

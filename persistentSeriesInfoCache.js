@@ -2,6 +2,7 @@
 
 const fs = require("fs/promises");
 const path = require("path");
+const { logAt } = require("./logger");
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -73,13 +74,13 @@ class PersistentSeriesInfoCache {
                         });
                     }
                     this.prune();
-                    console.log("[SERIES-CACHE] Loaded persistent series details", {
+                    logAt("info", "[SERIES-CACHE] Loaded persistent series details", {
                         entries: this.entries.size,
                         bytes: stat.size
                     });
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
-                        console.warn("[SERIES-CACHE] Could not load persistent series details:", error?.name || "Error");
+                        logAt("warn", "[SERIES-CACHE] Could not load persistent series details:", error?.name || "Error");
                     }
                 }
             })();
@@ -165,7 +166,7 @@ class PersistentSeriesInfoCache {
         this.writeTimer = setTimeout(() => {
             this.writeTimer = null;
             this.flush().catch(error => {
-                console.warn("[SERIES-CACHE] Could not save persistent series details:", {
+                logAt("warn", "[SERIES-CACHE] Could not save persistent series details:", {
                     name: error?.name || "Error",
                     code: error?.code || "UNKNOWN",
                     message: String(error?.message || "No error message").slice(0, 300)

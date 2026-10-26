@@ -260,7 +260,8 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `PROVIDER_REMOVAL_GUARD_PERCENT` | 25 | Percentage removed for the configurable large-drop safeguard |
 | `MAX_CACHE_ENTRIES` | 100 | Maximum entries in each in-memory cache; values are bounded by the server |
 | `CONFIG_SECRET` | unset | Required to create/decrypt encrypted tokens; use a unique random secret (prefer 32+ random bytes; minimum 16 characters) |
-| `DEBUG_MODE` | `false` | Enables verbose diagnostic logs |
+| `LOG_LEVEL` | `info` | Minimum deploy log detail: `debug`, `info`, `warn`, or `error` |
+| `DEBUG_MODE` | `false` | Forces verbose diagnostic logs regardless of `LOG_LEVEL` |
 | `PREFETCH_ENABLED` | `true` | Enable server-side prefetch CORS bypass |
 | `PREFETCH_MAX_BYTES` | `50000000` (50 MB) | Maximum bytes retained from one `/api/prefetch` response; hard cap 150 MB |
 | `PREFETCH_MAX_CONCURRENT` | `2` | Concurrent server-side prefetch limit (maximum 8) |
@@ -392,10 +393,13 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 
 | Mode | How |
 |------|-----|
-| Enable debug globally | `DEBUG_MODE=true` (only temporarily; avoid sharing logs) |
+| Normal deploy logs | `LOG_LEVEL=info` (default): startup, provider refresh summaries, cache-load status, warnings and errors |
+| Show diagnostic details | `LOG_LEVEL=debug` or `DEBUG_MODE=true` |
+| Warnings and errors only | `LOG_LEVEL=warn` |
+| Errors only | `LOG_LEVEL=error` |
 | Per-token debug | Check “Enable Debug Logging” in UI |
-| Inspect parsing | Console shows playlist size, entries, EPG programmes |
-| Timeout fallback | Buttons enable after build timeout to allow manual retry |
+
+Routine cache writes, metadata lookup diagnostics and warm-up progress are hidden at the default level. Raise `LOG_LEVEL` temporarily when troubleshooting; remove credentials and tokens before sharing logs.
 
 ---
 

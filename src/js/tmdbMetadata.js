@@ -1,5 +1,6 @@
 const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
+const { isDebugEnabled, logAt } = require("../../logger");
 
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
@@ -61,10 +62,10 @@ function tmdbConfigured() {
   return TMDB_API_KEY.length > 0;
 }
 
-const TMDB_DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
+const TMDB_DEBUG = isDebugEnabled();
 
 function logRequestDebug(event, details) {
-  if (TMDB_DEBUG) console.log("[DEBUG] TMDb request", { event, ...details });
+  if (TMDB_DEBUG) logAt("debug", "[DEBUG] TMDb request", { event, ...details });
 }
 
 async function request(path, { refresh = false } = {}) {

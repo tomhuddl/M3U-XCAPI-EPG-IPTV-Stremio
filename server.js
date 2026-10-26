@@ -8,13 +8,14 @@ const path = require("path");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
+const { isDebugEnabled, logAt } = require("./logger");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const { validateConfig } = require("./configValidation");
 const LRUCache = require("./lruCache");
 
-const DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
+const DEBUG = isDebugEnabled();
 function dlog(...args) {
-  if (DEBUG) console.log("[DEBUG]", ...args);
+  logAt("debug", "[DEBUG]", ...args);
 }
 
 const CACHE_ENABLED =
@@ -722,7 +723,5 @@ app.use((error, req, res, next) => {
 
 const port = process.env.PORT || 7000;
 app.listen(port, () => {
-  console.log(
-    `🚀 Server running on port ${port} (debug=${DEBUG}, prefetch=${PREFETCH_ENABLED})`,
-  );
+  logAt("info", `🚀 Server running on port ${port} (debug=${DEBUG}, prefetch=${PREFETCH_ENABLED})`);
 });

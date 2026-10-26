@@ -2,6 +2,7 @@
 
 const fs = require("fs/promises");
 const path = require("path");
+const { logAt } = require("./logger");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // A full movie + series catalogue can exceed 64 MiB once metadata is enriched.
@@ -75,7 +76,7 @@ class PersistentCatalogMetaCache {
                         this.entries.set(key, { savedAt: entry.savedAt, value: entry.value });
                     }
                     this.prune();
-                    console.log("[CATALOG-CACHE] Loaded persistent metadata cache", {
+                    logAt("info", "[CATALOG-CACHE] Loaded persistent metadata cache", {
                         entries: this.entries.size,
                         bytes: stat.size,
                         freshEntries: [...this.entries.values()].filter(entry => now - entry.savedAt < this.ttlMs).length,
@@ -83,7 +84,7 @@ class PersistentCatalogMetaCache {
                     });
                 } catch (error) {
                     if (error?.code !== "ENOENT") {
-                        console.warn("[CATALOG-CACHE] Could not load persistent metadata cache:", error?.name || "Error");
+                        logAt("warn", "[CATALOG-CACHE] Could not load persistent metadata cache:", error?.name || "Error");
                     }
                 }
             })();
@@ -172,7 +173,7 @@ class PersistentCatalogMetaCache {
         this.writeTimer = setTimeout(() => {
             this.writeTimer = null;
             this.flush().catch(error => {
-                console.warn("[CATALOG-CACHE] Could not save persistent metadata cache:", {
+                logAt("warn", "[CATALOG-CACHE] Could not save persistent metadata cache:", {
                     name: error?.name || "Error", code: error?.code || "UNKNOWN",
                     syscall: error?.syscall || null, message: String(error?.message || "No error message").slice(0, 300)
                 });

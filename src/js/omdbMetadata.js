@@ -2,6 +2,7 @@ const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
 const fs = require("fs");
 const path = require("path");
+const { logAt } = require("../../logger");
 
 const API_KEY = (process.env.OMDB_API_KEY || "").trim();
 const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
@@ -35,7 +36,7 @@ function recordOutcome(outcome, details = {}) {
   // Emit a small, bounded sample plus periodic counters. Never log the API key or full URL.
   diagnosticLogCount++;
   if (diagnosticLogCount <= 5 || diagnosticLogCount % 100 === 0) {
-    console.info("[OMDB] Lookup diagnostic", {
+    logAt("debug", "[OMDB] Lookup diagnostic", {
       outcome,
       attempts: diagnostics.attempts,
       successWithRating: diagnostics.successWithRating,
@@ -51,7 +52,7 @@ function getDiagnostics() {
   return { ...diagnostics };
 }
 
-console.info("[OMDB] Runtime configuration", {
+logAt("debug", "[OMDB] Runtime configuration", {
   apiKeyConfigured: diagnostics.apiKeyConfigured,
   dailyRequestLimit: DAILY_REQUEST_LIMIT
 });
@@ -97,9 +98,7 @@ async function reserveDailyRequest() {
     await fs.promises.rename(temp, USAGE_FILE);
   }).catch(error => {
     persisted = false;
-    if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
-      console.warn("[DEBUG] Could not persist OMDb usage counter", error?.name || "Error");
-    }
+    logAt("debug", "[DEBUG] Could not persist OMDb usage counter", error?.name || "Error");
   });
   await usageWriteQueue;
   return persisted;
@@ -140,7 +139,7 @@ async function getByImdbId(value, options = {}) {
   if (!API_KEY) {
     retryableFailures.set(imdbId, true);
     recordOutcome("retryable-failure", { reason: "api-key-unavailable" });
-    if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
+    logAt("debug", "[DEBUG] OMDb lookup skipped: OMDB_API_KEY is not available to this process");
     return retryableResult(imdbId, cache.get(imdbId) || null);
   }
   let staleCached = null;
@@ -163,7 +162,7 @@ async function getByImdbId(value, options = {}) {
     try {
       if (!(await reserveDailyRequest())) {
         retryableFailures.set(imdbId, true);
-        if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") console.warn("[DEBUG] OMDb daily request budget reached");
+        logAt("debug", "[DEBUG] OMDb daily request budget reached");
         return retryableResult(imdbId, staleCached);
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
@@ -227,9 +226,7 @@ async function getByImdbId(value, options = {}) {
       retryableFailures.set(imdbId, true);
       recordOutcome("retryable-failure", { error: error?.name || "Error" });
       // OMDb is optional: a transient outage must never break card delivery.
-      if ((process.env.DEBUG_MODE || "").toLowerCase() === "true") {
-        console.warn("[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
-      }
+      logAt("debug", "[DEBUG] OMDb lookup failed", { imdbId, name: error?.name || "Error" });
       return retryableResult(imdbId, staleCached);
     }
   })();
