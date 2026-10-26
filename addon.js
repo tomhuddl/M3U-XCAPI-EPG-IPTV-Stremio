@@ -121,21 +121,25 @@ function stripTmdbRatings(meta) {
     return meta;
 }
 
+function missingCatalogMetadataFields(value) {
+    if (!value || typeof value !== 'object') return [];
+    const missing = [];
+    if (!value.poster) missing.push('poster');
+    if (!value.background) missing.push('background');
+    if (!value.description || value.description === 'Series / Show') missing.push('description');
+    if (!Array.isArray(value.genres) || value.genres.length === 0) missing.push('genres');
+    if (!(value.year || value.releaseInfo)) missing.push('year/releaseInfo');
+    if (!value.runtime) missing.push('runtime');
+    if (!value.imdbRating) missing.push('imdbRating');
+    if (!Array.isArray(value.cast) || value.cast.length === 0) missing.push('cast');
+    if (value._tmdbId && !value.imdbId) missing.push('imdbId');
+    if (value.type === 'movie' && !value.director) missing.push('director');
+    return missing;
+}
+
 function catalogMetadataNeedsRefresh(value) {
-    if (!value || typeof value !== 'object') return false;
-    const missing = [
-        !value.poster,
-        !value.background,
-        !value.description || value.description === 'Series / Show',
-        !Array.isArray(value.genres) || value.genres.length === 0,
-        !(value.year || value.releaseInfo),
-        !value.runtime,
-        !value.imdbRating,
-        !Array.isArray(value.cast) || value.cast.length === 0,
-        Boolean(value._tmdbId && !value.imdbId),
-        value.type === 'movie' && !value.director
-    ].some(Boolean);
-    if (!missing) return false;
+    const missing = missingCatalogMetadataFields(value);
+    if (!missing.length) return false;
     // Keep missing-field retry timing separate from the normal metadata
     // refresh timestamp. Older persisted entries migrate via metadataCheckedAt.
     const checkedAt = Number(value.missingMetadataCheckedAt) ||
@@ -1729,6 +1733,7 @@ class M3UEPGAddon {
 
             let processed = 0;
             let missingMetadata = 0;
+            const incompleteSeriesDetails = [];
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
@@ -1742,13 +1747,54 @@ class M3UEPGAddon {
                 // than permanently recording a false-success completion marker.
                 for (const item of batch) {
                     const cached = this.catalogMetaCache.get(item.id);
-                    if (!cached || !String(cached.name || '').trim() || cached.metadataVersion < 3 || (cached._tmdbId && !cached.imdbId && cached.imdbIdChecked !== true) || (omdbMetadataNeedsRefresh(cached) || catalogMetadataNeedsRefresh(cached))) missingMetadata++;
+                    const metadataNameMissing = !String(cached?.name || '').trim();
+                    const metadataVersionOld = Boolean(cached) && cached.metadataVersion < 3;
+                    const imdbIdLookupPending = Boolean(
+                        cached?._tmdbId && !cached?.imdbId && cached?.imdbIdChecked !== true
+                    );
+                    const omdbRetryDue = omdbMetadataNeedsRefresh(cached);
+                    const catalogRetryDue = catalogMetadataNeedsRefresh(cached);
+                    const incomplete = !cached || metadataNameMissing || metadataVersionOld ||
+                        imdbIdLookupPending || omdbRetryDue || catalogRetryDue;
+                    if (incomplete) {
+                        missingMetadata++;
+                        if (type === 'series' && incompleteSeriesDetails.length < 100) {
+                            const missingFields = [];
+                            if (!cached) missingFields.push('metadata preview');
+                            else {
+                                if (metadataNameMissing) missingFields.push('name');
+                                if (metadataVersionOld) missingFields.push('metadata schema v3');
+                                if (imdbIdLookupPending) missingFields.push('IMDb ID lookup');
+                                if (omdbRetryDue) {
+                                    if (!cached.imdbRating) missingFields.push('IMDb rating (OMDb retry due)');
+                                    if (!cached.runtime) missingFields.push('runtime (OMDb retry due)');
+                                }
+                                if (catalogRetryDue) {
+                                    missingFields.push(...missingCatalogMetadataFields(cached));
+                                }
+                            }
+                            incompleteSeriesDetails.push({
+                                id: String(item.id),
+                                name: String(item.name || cached?.name || '').slice(0, 160),
+                                missing: [...new Set(missingFields.length ? missingFields : ['metadata incomplete'])]
+                            });
+                        }
+                    }
                 }
                 if (this.config.debug) {
                     this.log.debug('Background catalogue prefetch progress', {
                         type, processed, total: items.length, missingMetadata,
                     });
                 }
+            }
+
+            if (type === 'series' && missingMetadata > 0) {
+                this.log.debug('Series metadata still incomplete after warm-up', {
+                    total: missingMetadata,
+                    logged: incompleteSeriesDetails.length,
+                    truncated: missingMetadata > incompleteSeriesDetails.length,
+                    series: incompleteSeriesDetails
+                });
             }
 
             const omdbCatalogueSummary = {

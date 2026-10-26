@@ -399,7 +399,7 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 | Errors only | `LOG_LEVEL=error` |
 | Per-token debug | Check “Enable Debug Logging” in UI |
 
-Routine cache writes, metadata lookup diagnostics and warm-up progress are hidden at the default level. Raise `LOG_LEVEL` temporarily when troubleshooting; remove credentials and tokens before sharing logs.
+Routine cache writes, metadata lookup diagnostics and warm-up progress are hidden at the default level. Set `LOG_LEVEL=debug` to see unresolved series IDs, titles and missing metadata fields after a series warm-up. Raise it temporarily when troubleshooting; remove credentials and tokens before sharing logs.
 
 ---
 
