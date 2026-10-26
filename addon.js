@@ -527,6 +527,9 @@ class M3UEPGAddon {
         // Bound lazily loaded episode metadata so browsing many series cannot grow
         // this addon instance's memory without limit.
         this.seriesInfoCache = new LRUCache({ max: 100, ttl: CACHE_TTL_MS });
+        // Keep a small parallel diagnostic cache without consuming slots from the
+        // bounded series-info LRU.
+        this.seriesTmdbLookupDiagnostics = new Map();
         // Coalesce overlapping Xtream ID and series-info lookups started by parallel
         // Discover workers, avoiding duplicate provider API round-trips.
         this.providerInfoInFlight = new Map();
@@ -954,10 +957,16 @@ class M3UEPGAddon {
         }
         const normalizedSeriesId = String(seriesId);
         const cacheKey = 'series-tmdb-id:' + normalizedSeriesId;
-        const diagnosticKey = 'series-tmdb-lookup:' + normalizedSeriesId;
+        const cacheLookup = details => {
+            this.seriesTmdbLookupDiagnostics.delete(normalizedSeriesId);
+            this.seriesTmdbLookupDiagnostics.set(normalizedSeriesId, details);
+            while (this.seriesTmdbLookupDiagnostics.size > 100) {
+                this.seriesTmdbLookupDiagnostics.delete(this.seriesTmdbLookupDiagnostics.keys().next().value);
+            }
+        };
         const cached = this.seriesInfoCache.get(cacheKey);
         if (cached !== undefined) {
-            setLookup(this.seriesInfoCache.get(diagnosticKey) || {
+            setLookup(this.seriesTmdbLookupDiagnostics.get(normalizedSeriesId) || {
                 reason: cached ? 'provider_tmdb_id_cached' : 'provider_tmdb_id_cached_unknown',
                 source: 'memory_cache'
             });
@@ -974,7 +983,7 @@ class M3UEPGAddon {
                 };
                 this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
                 this.seriesInfoCache.set(cacheKey, tmdbId);
-                this.seriesInfoCache.set(diagnosticKey, details);
+                cacheLookup(details);
                 setLookup(details);
                 return tmdbId;
             }
@@ -984,7 +993,7 @@ class M3UEPGAddon {
         const pending = this.providerInfoInFlight.get(pendingKey);
         if (pending) {
             const tmdbId = await pending;
-            setLookup(this.seriesInfoCache.get(diagnosticKey) || {
+            setLookup(this.seriesTmdbLookupDiagnostics.get(normalizedSeriesId) || {
                 reason: tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_lookup_in_flight',
                 source: 'provider_lookup'
             });
@@ -1014,7 +1023,7 @@ class M3UEPGAddon {
                 }
                 tmdbId = tmdbId || null;
                 this.seriesInfoCache.set(cacheKey, tmdbId);
-                this.seriesInfoCache.set(diagnosticKey, details);
+                cacheLookup(details);
                 setLookup(details);
                 return tmdbId;
             } catch (e) {
@@ -1025,7 +1034,7 @@ class M3UEPGAddon {
                 };
                 this.log.warn('Series TMDb ID lookup failed', seriesId, details.errorName);
                 this.seriesInfoCache.set(cacheKey, null);
-                this.seriesInfoCache.set(diagnosticKey, details);
+                cacheLookup(details);
                 setLookup(details);
                 return null;
             }
