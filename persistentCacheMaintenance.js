@@ -5,7 +5,7 @@ const path = require("path");
 const { logAt } = require("./logger");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const activeHashes = new Set();
+const activeHashes = new Map();
 let lastRunAt = 0;
 let maintenancePromise = null;
 
@@ -76,7 +76,7 @@ async function cleanDirectory({ directory, prefix }, cutoff, active) {
                 if (error?.code !== "ENOENT") logAt("debug", "[DATA-CACHE] Could not inspect an old cache file:", error?.name || "Error");
             }
         }
-        if (!latestMtime || latestMtime >= cutoff) continue;
+        if (active.has(hash) || !latestMtime || latestMtime >= cutoff) continue;
         for (const filePath of paths) {
             try {
                 await fs.unlink(filePath);
@@ -90,8 +90,8 @@ async function cleanDirectory({ directory, prefix }, cutoff, active) {
 }
 
 async function cleanupPersistentCacheFiles(cacheKey) {
-    const activeHash = String(cacheKey || "").slice(0, 24);
-    if (activeHash) activeHashes.add(activeHash);
+    // Active hashes are registered for the lifetime of their addon interface.
+    // Cleanup itself must not retain historical keys indefinitely.
     if (!process.env.PERSISTENT_DATA_DIR && !process.env.CATALOG_META_CACHE_DIR && !process.env.SERIES_INFO_CACHE_DIR) return;
     if (Date.now() - lastRunAt < DAY_MS) return;
     if (!maintenancePromise) {
@@ -112,3 +112,16 @@ async function cleanupPersistentCacheFiles(cacheKey) {
 }
 
 module.exports = cleanupPersistentCacheFiles;
+module.exports.registerActiveCache = function registerActiveCache(cacheKey) {
+    const activeHash = String(cacheKey || "").slice(0, 24);
+    if (!/^[a-f0-9]{24}$/.test(activeHash)) return () => {};
+    activeHashes.set(activeHash, (activeHashes.get(activeHash) || 0) + 1);
+    let released = false;
+    return function releaseActiveCache() {
+        if (released) return;
+        released = true;
+        const references = activeHashes.get(activeHash) || 0;
+        if (references <= 1) activeHashes.delete(activeHash);
+        else activeHashes.set(activeHash, references - 1);
+    };
+};

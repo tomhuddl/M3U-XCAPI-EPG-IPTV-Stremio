@@ -469,7 +469,16 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
     return { videos, tmdbId, fetchedAt: Date.now() };
   } catch (error) {
-    return { videos: [], fetchError: error?.message || String(error), fetchedAt: Date.now() };
+    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+      ? error.code
+      : undefined;
+    return {
+      videos: [],
+      fetchError: "Provider request failed",
+      errorName: error?.name || "Error",
+      ...(errorCode ? { errorCode } : {}),
+      fetchedAt: Date.now()
+    };
   }
 }
 

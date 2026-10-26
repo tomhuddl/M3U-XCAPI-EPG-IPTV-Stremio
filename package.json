@@ -15,7 +15,6 @@
     "node-fetch": "^2.7.0",
     "sax": "^1.4.1",
     "stremio-addon-sdk": "^1.6.10",
-    "xml2js": "^0.6.2",
     "ipaddr.js": "^2.2.0"
   },
   "license": "MIT",

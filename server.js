@@ -5,8 +5,10 @@ require('dotenv').config({ quiet: true });
 const { getRouter } = require("stremio-addon-sdk");
 const express = require("express");
 const path = require("path");
+const net = require("net");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
+const { MAX_EPG_BYTES } = require("./src/js/epgStreamParser");
 const { isDebugEnabled, logAt } = require("./logger");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const { validateConfig } = require("./configValidation");
@@ -86,11 +88,49 @@ const PREFLIGHT_RATE_MAX = parsePositiveInteger(
   600,
 );
 const PREFLIGHT_RATE_MAX_CLIENTS = 5000;
+const ADDON_REQUEST_RATE_MAX = parsePositiveInteger(process.env.ADDON_REQUEST_RATE_MAX, 1200, 60, 6000);
+const addonRequestRateBuckets = new Map();
 const preflightRateBuckets = new Map();
 
+function getClientIp(req) {
+  // Railway documents X-Real-IP as the edge-provided client address. Trust it
+  // only on Railway and only when it parses as one IP; otherwise use Express
+  // (including Render's explicitly trusted single proxy hop) or the socket.
+  if (process.env.RAILWAY_SERVICE_ID) {
+    const railwayIp = String(req.headers["x-real-ip"] || "").trim();
+    if (net.isIP(railwayIp)) return railwayIp;
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function addonRequestRateLimit(req, res, next) {
+  const now = Date.now();
+  const key = getClientIp(req);
+  let bucket = addonRequestRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+    if (!bucket && addonRequestRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+      for (const [client, entry] of addonRequestRateBuckets) {
+        if (now - entry.startedAt >= PREFLIGHT_RATE_WINDOW_MS) addonRequestRateBuckets.delete(client);
+        if (addonRequestRateBuckets.size < PREFLIGHT_RATE_MAX_CLIENTS) break;
+      }
+      if (addonRequestRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+        return res.status(503).json({ error: "Request rate-limit capacity reached; retry shortly" });
+      }
+    }
+    bucket = { startedAt: now, count: 0 };
+    addonRequestRateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > ADDON_REQUEST_RATE_MAX) {
+    const retryAfter = Math.max(1, Math.ceil((PREFLIGHT_RATE_WINDOW_MS - (now - bucket.startedAt)) / 1000));
+    res.setHeader("Retry-After", String(retryAfter));
+    return res.status(429).json({ error: "Too many addon requests; retry shortly" });
+  }
+  return next();
+}
 function preflightRateLimit(req, res, next) {
   const now = Date.now();
-  const key = req.ip || req.socket?.remoteAddress || "unknown";
+  const key = getClientIp(req);
   let bucket = preflightRateBuckets.get(key);
   if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
     if (!bucket && preflightRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
@@ -134,7 +174,7 @@ app.use(express.static(staticDir));
 app.use(express.json({ limit: "128kb" }));
 
 // Encryption endpoint
-app.post("/encrypt", (req, res) => {
+app.post("/encrypt", preflightRateLimit, (req, res) => {
   if (!process.env.CONFIG_SECRET || process.env.CONFIG_SECRET.length < 16) {
     return res.status(503).json({
       error: "Secure token creation is unavailable. CONFIG_SECRET must be at least 16 characters.",
@@ -288,7 +328,6 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   let totalBytes = 0;
   let programmeCount = 0;
   let tail = "";
-  const MAX_EPG_SCAN_BYTES = 800 * 1024 * 1024;
   try {
     const response = await safeFetch(url, {
       method: "GET",
@@ -321,10 +360,12 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
       };
       body.on("data", (chunk) => {
         totalBytes += chunk.length;
-        if (totalBytes > MAX_EPG_SCAN_BYTES) {
+        if (totalBytes > MAX_EPG_BYTES) {
           controller.abort();
           body.destroy();
-          finish(new Error("EPG source exceeds the 800 MB preflight scan limit"));
+          const error = new Error(`EPG source exceeds the ${Math.floor(MAX_EPG_BYTES / 1000000)} MB preflight scan limit`);
+          error.code = "EPG_TOO_LARGE";
+          finish(error);
           return;
         }
         const combined = tail + chunk.toString("utf8");
@@ -344,11 +385,11 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
 
     res.json({ ok: true, bytes: totalBytes, programmes: programmeCount });
   } catch (error) {
-    const tooLarge = error && /800 MB/.test(error.message || "");
+    const tooLarge = error && error.code === "EPG_TOO_LARGE";
     const timedOut = error && error.name === "AbortError";
     if (!res.headersSent) {
       res.status(tooLarge ? 413 : timedOut ? 504 : 502).json({
-        error: tooLarge ? "EPG source exceeds the 800 MB preflight scan limit"
+        error: tooLarge ? `EPG source exceeds the ${Math.floor(MAX_EPG_BYTES / 1000000)} MB preflight scan limit`
           : timedOut ? "EPG preflight timed out after 120 seconds"
           : "EPG source could not be checked",
       });
@@ -634,7 +675,7 @@ app.get("/:token/configuration.json", (req, res) => {
 });
 
 // Token interface middleware
-app.use("/:token", async (req, res, next) => {
+app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
   const { token } = req.params;
   if (!isConfigToken(token)) return next("route");
   if (req.path.startsWith("/configure")) return next();
@@ -771,24 +812,17 @@ app.get("/:token/manifest.json", (req, res) => {
   res.end(JSON.stringify(manifest));
 });
 
-// Apply platform-specific metadata presentation at the HTTP boundary. The SDK's
-// metadata handler arguments do not expose request headers, so keep this logic
-// outside the shared metadata builder. The SDK router writes serialized JSON via
-// res.end(), so intercept that boundary rather than res.json().
+// Filter platform-specific metadata links at the HTTP boundary. The Stremio SDK does not expose request headers to metadata handlers.
+// Writer credits are retained only for iOS Stremio; rating links keep their client-specific behavior.
+
 app.use("/:token", (req, res, next) => {
   const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
   const pathIsCatalog = /^\/catalog\/(movie|series)\//.test(req.path);
   const pathIsMetadataResponse = pathIsMeta || pathIsCatalog;
   const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
-  const isIosStremioClient =
-    userAgent.includes("stremio") &&
-    /iphone|ipad|ipod|ios/.test(userAgent);
+  const isIosStremioClient = userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent);
 
   if (pathIsMetadataResponse) {
-    // Catalogue previews and detail responses both drive the rating shown in
-    // Stremio's native UI. Avoid serving stale previews/details after metadata
-    // enrichment, and make the top-level IMDb field authoritative even for
-    // older cache entries that only have the rating link.
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
@@ -796,38 +830,35 @@ app.use("/:token", (req, res, next) => {
     const originalEnd = res.end.bind(res);
     res.end = function (chunk, encoding, callback) {
       const contentType = String(res.getHeader("content-type") || "").toLowerCase();
-      // Catalogue responses are already normalized by the addon. Only detailed
-      // metadata occasionally needs a client-specific link filter at this boundary.
-      if (pathIsMeta && chunk != null && contentType.includes("application/json")) {
+      if (chunk != null && contentType.includes("application/json")) {
         try {
           const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-          const removableCategory = isIosStremioClient
-            ? /"category"\s*:\s*"Rating"/
-            : /"category"\s*:\s*"Writers"/;
-          if (removableCategory.test(jsonText)) {
-            const body = JSON.parse(jsonText);
-            if (body?.meta && typeof body.meta === "object") {
-              const meta = body.meta;
+          const body = JSON.parse(jsonText);
+          const metadataItems = Array.isArray(body?.metas)
+            ? body.metas
+            : (body?.meta && typeof body.meta === "object" ? [body.meta] : []);
+          const hasPlatformLinks = metadataItems.some(meta => Array.isArray(meta?.links) &&
+            meta.links.some(link => link?.category === "Rating" || link?.category === "Writers"));
+          if (hasPlatformLinks) {
+            const valid = value => value != null && value !== "" &&
+              Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
+            for (const meta of metadataItems) {
               let rating = meta.imdbRating;
-              const valid = value => value != null && value !== "" &&
-                Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
               if (!valid(rating) && Array.isArray(meta.links)) {
-                const link = meta.links.find(item =>
-                  item && typeof item.name === "string" &&
-                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim())
-                );
+                const link = meta.links.find(item => item && typeof item.name === "string" &&
+                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim()));
                 const match = link?.name?.trim().match(
                   /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
                 );
                 if (match) rating = match[1];
               }
               if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
-
               const links = Array.isArray(meta.links) ? meta.links : [];
               if (isIosStremioClient) {
                 meta.links = links.filter(link => link?.category !== "Rating");
                 delete meta.tmdbRating;
               } else {
+                // Writer credits are exposed only to iOS Stremio clients.
                 meta.links = links.filter(link => link?.category !== "Writers");
               }
             }

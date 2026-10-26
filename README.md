@@ -94,6 +94,8 @@ docker run -d \
 
 ### Docker Compose (with Redis for shared cache)
 
+The repository `docker-compose.yml` builds the checked-out source. Run `docker compose up --build` after pulling or changing the code so the container uses that checkout.
+
 ```yaml
 services:
   redis:
@@ -240,6 +242,7 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `TMDB_NEGATIVE_CACHE_TTL_MS` | 300000 (5m) | Cache lifetime for confirmed TMDb 404 responses; transient failures are not cached as 404s |
 | `OMDB_API_KEY` | unset | OMDb API key for IMDb rating/runtime lookups |
 | `OMDB_DAILY_RESERVATION_BLOCK_SIZE` | 25 | Persist OMDb daily quota in blocks to reduce volume writes; unused reserved requests count against the quota until the next UTC day |
+| `OMDB_RETRY_FAILURE_MAX_ENTRIES` | 10000 | Maximum retryable OMDb lookup failures retained in process memory |
 | `OMDB_CACHE_TTL_MS` | 1209600000 (14d) | Process-memory cache lifetime for OMDb API responses |
 | `CACHE_ENABLED` | `true` | Enables/disables the provider-data LRU and Redis layers; provider refresh scheduling, the bounded addon-interface cache, separate metadata/episode caches, and configured disk persistence still operate |
 | `CACHE_TTL_MS` | `21600000` (6h) | TTL for provider catalogue data in the in-memory LRU, Redis snapshot, and series-info LRU |
@@ -275,9 +278,12 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `LOG_LEVEL` | `info` | Minimum deploy log detail: `debug`, `info`, `warn`, or `error` |
 | `DEBUG_MODE` | `false` | Enables concise debug diagnostics regardless of `LOG_LEVEL` |
 | `PREFETCH_ENABLED` | `true` | Enable server-side prefetch CORS bypass |
+| `PREFLIGHT_RATE_MAX` | `120` per minute | Per-IP limit for public setup/preflight and `/encrypt` requests (process-local) |
+| `ADDON_REQUEST_RATE_MAX` | `1200` per minute | Per-IP limit for tokenized addon requests (process-local; bounded to 60–6,000) |
 | `PREFETCH_MAX_BYTES` | `50000000` (50 MB) | Maximum bytes retained from one `/api/prefetch` response; hard cap 150 MB |
 | `PREFETCH_MAX_CONCURRENT` | `2` | Concurrent server-side prefetch limit (maximum 8) |
 | `PROVIDER_MAX_BYTES` | `50000000` (50 MB) | Max bytes read from each playlist, API or EPG response; hard cap 150 MB |
+| `EPG_MAX_BYTES` | `150000000` (150 MB) | Maximum bytes accepted for each XMLTV guide, also used by `/api/epg-stats`; configurable from 1 MiB to the 150 MB hard cap |
 | `MAX_ACTIVE_INTERFACE_BUILDS` | `2` | Concurrent addon build limit (maximum 8) |
 | `ALLOW_LEGACY_CONFIG_TOKENS` | `false` | Temporary opt-in for old plaintext Base64 configuration links |
 | `NODE_ENV` | (user value) | Standard Node semantics |
@@ -349,8 +355,8 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 |------|------------------|----------------|
 | Server-side fetches | Reject private/reserved IPv4 and IPv6 destinations, pin DNS answers, revalidate redirects, cap response sizes and timeouts | Use public HTTP(S) provider and EPG URLs |
 | Token Leakage | Newly generated tokens encrypted with AES-256-GCM | Set a strong `CONFIG_SECRET`; keep links private; rotate provider credentials if a plain token was exposed |
-| EPG Size | Response-size caps and deadlines | Adjust `PREFETCH_MAX_BYTES` and `PROVIDER_MAX_BYTES` for large XMLTV feeds, up to the 150 MB hard cap |
-| DoS / Abuse | Prefetch and addon-build concurrency caps; bounded caches | Per-IP rate limiting is not currently implemented |
+| EPG Size | Streaming byte caps and deadlines | Adjust `EPG_MAX_BYTES` for XMLTV feeds, up to the 150 MB hard cap |
+| DoS / Abuse | Bounded caches, build/concurrency caps, per-IP fixed-window limits on `/encrypt`, public preflight, and tokenized addon requests | Limits are process-local; each replica maintains its own counters. Railway uses its validated `X-Real-IP` header, and Render trusts one configured proxy hop. |
 | Sensitive credentials | New links use authenticated encryption; plaintext legacy tokens are disabled by default | Keep `CONFIG_SECRET` private, keep manifest links private, and rotate credentials if a plaintext token was exposed |
 
 ---
@@ -524,9 +530,7 @@ Attribution appreciated but not required.
 
 ## 🧪 Serverless Note
 
-A `serverless.js` handler is included (experimental):
-- Cold starts rebuild addon interface
-- You must adapt dynamic token passing (currently static)
+The included `serverless.js` / `vercel.json` adapter is experimental and does not parse tokenized per-request configuration. It is not suitable for the normal Railway/Docker deployment path or for deployments that require durable volume-backed catalogue and metadata caches. Use `server.js` on a persistent Node service unless the adapter is completed for your platform.
 
 ---
 

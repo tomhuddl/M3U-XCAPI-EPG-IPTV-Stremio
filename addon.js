@@ -721,6 +721,10 @@ class M3UEPGAddon {
                 this.persistentSeriesInfoCache.flush()
             ]);
             providerRefreshState.delete(this.cacheKey);
+            if (typeof this.releasePersistentCacheRegistration === "function") {
+                this.releasePersistentCacheRegistration();
+                this.releasePersistentCacheRegistration = null;
+            }
         })();
         return this.disposePromise;
     }
@@ -802,7 +806,13 @@ class M3UEPGAddon {
             pendingRemovalCandidates: this.pendingRemovalCandidates
         };
         dataCache.set(cacheKey, entry);
-        await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
+        try {
+            await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
+        } catch (error) {
+            // Redis is an optional acceleration layer; a failed Redis write must
+            // not turn a valid provider refresh into an in-memory rollback.
+            this.log.warn('Redis provider snapshot save failed', error?.name || 'Error');
+        }
         try {
             const persisted = await this.persistentAddonDataCache.save(entry);
             if (persisted) this.log.debug('Persisted provider catalogue and EPG snapshot');
@@ -867,6 +877,12 @@ class M3UEPGAddon {
             setGenresOnCatalog(seriesCatalog, seriesGroups);
         }
 
+        this.manifestRef.behaviorHints = {
+            ...(this.manifestRef.behaviorHints || {}),
+            epgProvider: Object.values(this.epgData || {}).some(
+                programmes => Array.isArray(programmes) && programmes.length > 0
+            )
+        };
         this.log.debug('Catalog genres built', {
             tvGenres: tvCatalog?.genres?.length || 0,
             movieGenres: movieCatalog?.genres?.length || 0,
@@ -933,37 +949,6 @@ class M3UEPGAddon {
 
     isMovieFormat(name) {
         return [/\(\d{4}\)/, /\d{4}\./, /HD$|FHD$|4K$/i].some(p => p.test(name));
-    }
-
-    async parseEPG(content) {
-        const start = Date.now();
-        try {
-            const xml2js = require('xml2js');
-            const parser = new xml2js.Parser();
-            const result = await parser.parseStringPromise(content);
-            const epgData = {};
-            if (result.tv && result.tv.programme) {
-                for (const prog of result.tv.programme) {
-                    const ch = prog.$.channel;
-                    if (!epgData[ch]) epgData[ch] = [];
-                    epgData[ch].push({
-                        start: prog.$.start,
-                        stop: prog.$.stop,
-                        title: prog.title ? prog.title[0]._ || prog.title[0] : 'Unknown',
-                        desc: prog.desc ? prog.desc[0]._ || prog.desc[0] : ''
-                    });
-                }
-            }
-            this.log.debug('EPG parsed', {
-                channels: Object.keys(epgData).length,
-                programmes: Object.values(epgData).reduce((a, b) => a + b.length, 0),
-                ms: Date.now() - start
-            });
-            return epgData;
-        } catch (e) {
-            this.log.warn('EPG parse failed', e.message);
-            return {};
-        }
     }
 
     parseEPGTime(s) {
@@ -1228,7 +1213,9 @@ class M3UEPGAddon {
                     if (info?.fetchError) {
                         this.log.warn('Series info request failed; retaining saved details when available', {
                             seriesId: normalizedSeriesId,
-                            error: String(info.fetchError)
+                            status: /^HTTP \d{3}$/i.test(String(info.fetchError)) ? String(info.fetchError) : undefined,
+                            errorName: info.errorName || 'Error',
+                            errorCode: info.errorCode
                         });
                         if (persisted?.value) {
                             this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
@@ -1352,41 +1339,48 @@ class M3UEPGAddon {
     async _updateData(force = false) {
         const now = Date.now();
         if (!force) {
-            if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) {
-                return;
-            }
-            if ((this.channels.length || this.movies.length || this.series.length) && now - this.lastUpdate < 900000) {
-                return;
-            }
+            if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) return;
+            if ((this.channels.length || this.movies.length || this.series.length) && now - this.lastUpdate < 900000) return;
         }
+
         const previous = {
             channels: this.channels,
             movies: this.movies,
             series: this.series,
             epgData: this.epgData,
             lastUpdate: this.lastUpdate,
-            directSeriesEpisodeIndex: new Map(this.directSeriesEpisodeIndex),
-            directSeriesEpisodeById: new Map(this.directSeriesEpisodeById),
+            directSeriesEpisodeIndex: this.directSeriesEpisodeIndex,
+            directSeriesEpisodeById: this.directSeriesEpisodeById,
             pendingRemovalCandidates: this.pendingRemovalCandidates
         };
+        // Providers build into an isolated object so requests continue seeing the
+        // last complete snapshot while slow network fetches and parsers run.
+        const refreshed = Object.assign(Object.create(this), {
+            channels: [],
+            movies: [],
+            series: this.config.includeSeries === false ? previous.series : [],
+            epgData: {},
+            directSeriesEpisodeIndex: new Map(),
+            directSeriesEpisodeById: new Map()
+        });
+
         try {
             const start = Date.now();
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
-            await providerModule.fetchData(this);
+            await providerModule.fetchData(refreshed);
 
-            // Accept ordinary provider removals immediately. A major reduction or
-            // an emptied section must appear in two consecutive refreshes before it
-            // replaces the last-known-good catalogue.
+            // Accept ordinary removals immediately. Major or empty sections need
+            // matching observations before replacing the last-known-good catalogue.
             const removalCandidates = { ...(previous.pendingRemovalCandidates || {}) };
             const unconfirmedDrops = [];
             const providerConfirmations = parsePositiveInteger(
                 process.env.PROVIDER_REMOVAL_CONFIRMATIONS, 2, 2, 5
             );
             for (const section of ['channels', 'movies', 'series']) {
-                const stats = getSectionRemovalStats(previous[section], this[section]);
+                const stats = getSectionRemovalStats(previous[section], refreshed[section]);
                 const guardedDrop = stats.largeDrop || (stats.previousCount > 0 && stats.currentCount === 0);
                 if (guardedDrop) {
-                    const ids = (Array.isArray(this[section]) ? this[section] : [])
+                    const ids = (Array.isArray(refreshed[section]) ? refreshed[section] : [])
                         .filter(item => item && item.id != null)
                         .map(item => String(item.id))
                         .sort();
@@ -1409,14 +1403,8 @@ class M3UEPGAddon {
                     delete removalCandidates[section];
                 }
             }
+
             if (unconfirmedDrops.length) {
-                this.channels = previous.channels;
-                this.movies = previous.movies;
-                this.series = previous.series;
-                this.epgData = previous.epgData;
-                this.lastUpdate = previous.lastUpdate;
-                this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
-                this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
                 this.pendingRemovalCandidates = removalCandidates;
                 this.log.warn('Provider catalogue reduction needs one matching refresh before acceptance', {
                     sections: unconfirmedDrops,
@@ -1438,11 +1426,11 @@ class M3UEPGAddon {
                         this.log.warn('Persistent removal confirmation state save failed', error?.name || 'Error');
                     }
                 }
-                this.buildGenresInManifest();
                 return;
             }
+
             for (const section of ['channels', 'movies', 'series']) {
-                const stats = getSectionRemovalStats(previous[section], this[section]);
+                const stats = getSectionRemovalStats(previous[section], refreshed[section]);
                 if (stats.removedCount > 0) {
                     this.log.info('Provider catalogue items removed', {
                         section,
@@ -1453,31 +1441,37 @@ class M3UEPGAddon {
                 }
             }
 
-            // A catalogue refresh may succeed while an optional EPG source is down.
-            // Keep the last-known-good guide instead of replacing it with an empty one.
-            const hasNewEpg = Object.values(this.epgData || {}).some(
+            // Keep the last-known-good guide if an optional EPG refresh is empty.
+            const hasNewEpg = Object.values(refreshed.epgData || {}).some(
                 programmes => Array.isArray(programmes) && programmes.length > 0
             );
             const hadPreviousEpg = Object.values(previous.epgData || {}).some(
                 programmes => Array.isArray(programmes) && programmes.length > 0
             );
             if (this.config.enableEpg && !hasNewEpg && hadPreviousEpg) {
-                this.epgData = previous.epgData;
+                refreshed.epgData = previous.epgData;
                 this.log.warn('EPG refresh returned no programmes; retaining last-known-good guide');
             }
 
-            // Reject an obviously partial catalogue response rather than persisting
-            // an accidental empty snapshot over a previously working library.
             const previousHadCatalogue = previous.channels.length + previous.movies.length + previous.series.length > 0;
-            const currentHasCatalogue = this.channels.length + this.movies.length + this.series.length > 0;
+            const currentHasCatalogue = refreshed.channels.length + refreshed.movies.length + refreshed.series.length > 0;
             if (previousHadCatalogue && !currentHasCatalogue) {
                 this.log.warn('Provider refresh returned an empty catalogue; retaining the previous catalogue');
                 throw new Error('Provider refresh returned an empty catalogue; retaining previous data');
             }
 
+            // Commit the whole validated snapshot together. No request can observe
+            // the empty/partially populated arrays used during provider fetching.
+            this.channels = refreshed.channels;
+            this.movies = refreshed.movies;
+            this.series = refreshed.series;
+            this.epgData = refreshed.epgData;
+            this.directSeriesEpisodeIndex = refreshed.directSeriesEpisodeIndex;
+            this.directSeriesEpisodeById = refreshed.directSeriesEpisodeById;
             this.pendingRemovalCandidates = {};
             this.lastUpdate = Date.now();
             providerRefreshState.set(this.cacheKey, this.lastUpdate);
+
             await this.pruneRemovedCatalogState(previous);
             if (CACHE_ENABLED) await this.saveToCache();
             else {
@@ -1493,9 +1487,10 @@ class M3UEPGAddon {
                     });
                 } catch (error) {
                     this.log.warn('Persistent provider data save failed', {
-                    name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
-                    syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
-                });
+                        name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
+                        syscall: error?.syscall || null,
+                        message: String(error?.message || 'No error message').slice(0, 300)
+                    });
                 }
             }
             this.buildGenresInManifest();
@@ -1509,7 +1504,9 @@ class M3UEPGAddon {
                 ),
                 durationMs: Date.now() - start
             });
-        } catch (e) {
+        } catch (error) {
+            // Before the commit point, live data is untouched. If an unexpected
+            // post-commit failure occurs, restore the prior in-memory snapshot.
             this.channels = previous.channels;
             this.movies = previous.movies;
             this.series = previous.series;
@@ -1518,10 +1515,10 @@ class M3UEPGAddon {
             this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
             this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
             this.pendingRemovalCandidates = previous.pendingRemovalCandidates;
-            this.log.error('[UPDATE] Failed; retaining last-known-good data:', e && e.name ? e.name : 'Error');
+            providerRefreshState.set(this.cacheKey, previous.lastUpdate || 0);
+            this.log.error('[UPDATE] Failed; retaining last-known-good data:', error && error.name ? error.name : 'Error');
         }
     }
-
     startScheduledRefresh() {
         if (this.refreshTimer || this.disposed) return;
         const refreshCheckInterval = parsePositiveInteger(
@@ -1856,7 +1853,7 @@ class M3UEPGAddon {
                     }
                     this.cacheCatalogMetaPreview(item.id, preview, !loadedFromCache);
                 } catch (error) {
-                    this.log.warn('Foreground catalogue metadata enrichment failed for', item.id, error?.message || error);
+                    this.log.warn('Foreground catalogue metadata enrichment failed', { itemId: item.id, errorName: error?.name || 'Error' });
                 }
             }
         };
@@ -1897,7 +1894,7 @@ class M3UEPGAddon {
                             this.cacheCatalogMetaPreview(next.id, preview, !loadedFromCache);
                         }
                     } catch (error) {
-                        this.log.warn('Background catalogue metadata enrichment failed for', next.id, error?.message || error);
+                        this.log.warn('Background catalogue metadata enrichment failed', { itemId: next.id, errorName: error?.name || 'Error' });
                     } finally {
                         this.catalogMetaPending.delete(next.id);
                         this.catalogMetaWorkers--;
@@ -2677,11 +2674,18 @@ async function createAddon(config) {
         return buildPromiseCache.get(buildKey);
     }
 
+    let releasePersistentCacheRegistration = null;
+    let buildingAddonInstance = null;
+    let buildingInterface = null;
     const buildPromise = (async () => {
         const priorDisposal = addonDisposals.get(cacheKey);
         if (priorDisposal) await priorDisposal.catch(() => {});
+        releasePersistentCacheRegistration = cleanupPersistentCacheFiles.registerActiveCache(cacheKey);
         await cleanupPersistentCacheFiles(cacheKey);
         const addonInstance = new M3UEPGAddon(config, manifest);
+        buildingAddonInstance = addonInstance;
+        addonInstance.releasePersistentCacheRegistration = releasePersistentCacheRegistration;
+        releasePersistentCacheRegistration = null;
         await addonInstance.loadFromCache();
         try {
             // Force update on first load to populate genres
@@ -3052,12 +3056,13 @@ async function createAddon(config) {
                 }
                 return { meta };
             } catch (e) {
-                console.error('[META] Error', e && e.name ? e.name : 'Error', e && e.message ? e.message : 'No error message', e && e.stack ? e.stack : 'No stack trace');
+                this.log.warn('[META] Metadata response failed', e && e.name ? e.name : 'Error');
                 return { meta: null };
             }
         });
 
         const iface = builder.getInterface();
+        buildingInterface = iface;
         Object.defineProperty(iface, '__cacheWeight', {
             value: addonInstance.estimateMemoryBytes(),
             enumerable: false,
@@ -3082,7 +3087,12 @@ async function createAddon(config) {
         }
 
         return iface;
-    })();
+    })().catch(async (error) => {
+        if (buildingInterface) addonInterfaceInstances.delete(buildingInterface);
+        if (buildingAddonInstance) await buildingAddonInstance.dispose().catch(() => {});
+        if (releasePersistentCacheRegistration) releasePersistentCacheRegistration();
+        throw error;
+    });
 
     buildPromiseCache.set(buildKey, buildPromise);
     try {

@@ -7,6 +7,7 @@ const CACHE_TTL_MS = parsePositiveInteger(process.env.OMDB_CACHE_TTL_MS, 14 * 24
 const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MAX_ENTRIES, 2000, 50, 10000), ttl: CACHE_TTL_MS });
 const pending = new Map();
 const retryableFailures = new Map();
+const RETRY_FAILURE_MAX_ENTRIES = parsePositiveInteger(process.env.OMDB_RETRY_FAILURE_MAX_ENTRIES, 10000, 100, 100000);
 const DAILY_REQUEST_LIMIT = parsePositiveInteger(process.env.OMDB_DAILY_REQUEST_LIMIT, 100000, 1, 100000);
 const DAILY_RESERVATION_BLOCK_SIZE = parsePositiveInteger(
   process.env.OMDB_DAILY_RESERVATION_BLOCK_SIZE, 25, 1, 1000
@@ -36,6 +37,17 @@ function recordOutcome(outcome) {
   else if (outcome === "definitive-no-match") diagnostics.definitiveNoMatch++;
 }
 
+function markRetryableFailure(imdbId, retryable = true) {
+  if (!retryable) {
+    retryableFailures.delete(imdbId);
+    return;
+  }
+  retryableFailures.delete(imdbId);
+  if (retryableFailures.size >= RETRY_FAILURE_MAX_ENTRIES) {
+    retryableFailures.delete(retryableFailures.keys().next().value);
+  }
+  retryableFailures.set(imdbId, true);
+}
 function getDiagnostics() {
   return { ...diagnostics };
 }
@@ -142,7 +154,7 @@ async function getByImdbId(value, options = {}) {
     return null;
   }
   if (!API_KEY) {
-    retryableFailures.set(imdbId, true);
+    markRetryableFailure(imdbId, true);
     recordOutcome("retryable-failure", { reason: "api-key-unavailable" });
     return retryableResult(imdbId, cache.get(imdbId) || null);
   }
@@ -165,7 +177,7 @@ async function getByImdbId(value, options = {}) {
     retryableFailures.delete(imdbId);
     try {
       if (!(await reserveDailyRequest())) {
-        retryableFailures.set(imdbId, true);
+        markRetryableFailure(imdbId, true);
         return retryableResult(imdbId, staleCached);
       }
       const url = "https://www.omdbapi.com/?i=" + encodeURIComponent(imdbId) +
@@ -177,7 +189,7 @@ async function getByImdbId(value, options = {}) {
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" }
       });
       if (!response || !response.ok) {
-        retryableFailures.set(imdbId, true);
+        markRetryableFailure(imdbId, true);
         recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
         return retryableResult(imdbId, staleCached);
       }
@@ -187,7 +199,7 @@ async function getByImdbId(value, options = {}) {
         // every hour; quota and temporary service errors should be retried.
         const errorText = String(data?.Error || "").toLowerCase();
         const retryable = /request limit|too many requests|temporarily unavailable|timeout|server error|invalid api key|api key/.test(errorText);
-        retryableFailures.set(imdbId, retryable);
+        markRetryableFailure(imdbId, retryable);
         if (retryable) {
           recordOutcome("retryable-failure", { response: "not-true" });
           return retryableResult(imdbId, staleCached);
@@ -226,7 +238,7 @@ async function getByImdbId(value, options = {}) {
       recordOutcome(result.imdbRating ? "success-with-rating" : "success-without-rating");
       return result;
     } catch (error) {
-      retryableFailures.set(imdbId, true);
+      markRetryableFailure(imdbId, true);
       recordOutcome("retryable-failure", { error: error?.name || "Error" });
       // OMDb is optional: a transient outage must never break card delivery.
       return retryableResult(imdbId, staleCached);

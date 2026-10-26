@@ -202,7 +202,7 @@ function testMovieMetadataMapping() {
             genres: [{ id: 28, name: "Action" }, { id: 12, name: "Adventure" }]
         },
         {
-            crew: [{ id: 55, job: "Director", name: "Sample Director" }, { id: 56, job: "Director", name: "Co-Director" }, { job: "Writer", name: "Sample Writer" }],
+            crew: [{ id: 55, job: "Director", name: "Sample Director" }, { id: 56, job: "Director", name: "Co-Director" }, { id: 57, job: "Writer", name: "Sample Writer" }],
             cast: Array.from({ length: 8 }, (_, index) => ({ id: 101 + index, name: "Actor " + (index + 1) }))
         },
         { results: [{ site: "YouTube", type: "Trailer", key: "abc123", name: "Official Trailer" }] },
@@ -224,7 +224,8 @@ function testMovieMetadataMapping() {
         { name: "Actor 3", category: "Cast", url: "https://www.themoviedb.org/person/103" },
         { name: "Actor 4", category: "Cast", url: "https://www.themoviedb.org/person/104" },
         { name: "Sample Director", category: "Directors", url: "https://www.themoviedb.org/person/55" },
-        { name: "Co-Director", category: "Directors", url: "https://www.themoviedb.org/person/56" }
+        { name: "Co-Director", category: "Directors", url: "https://www.themoviedb.org/person/56" },
+        { name: "Sample Writer", category: "Writers", url: "https://www.themoviedb.org/person/57" }
     ]);
     assert.strictEqual(meta.poster, "https://image.tmdb.org/t/p/w500/poster.jpg");
     assert.strictEqual(meta.background, "https://image.tmdb.org/t/p/w1280/backdrop.jpg");
