@@ -15,11 +15,11 @@
     "node-fetch": "^2.7.0",
     "sax": "^1.4.1",
     "stremio-addon-sdk": "^1.6.10",
-    "xml2js": "^0.6.2",
     "ipaddr.js": "^2.2.0"
   },
   "license": "MIT",
   "overrides": {
+    "body-parser": "1.20.9",
     "path-to-regexp": "0.1.13",
     "tmp": "0.2.7"
   },

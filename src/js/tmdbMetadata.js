@@ -1,10 +1,9 @@
 const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
-
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
-const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
+const CACHE_TTL_MS = parsePositiveInteger(process.env.TMDB_CACHE_TTL_MS, 14 * 24 * 60 * 60 * 1000, 1000, 30 * 24 * 60 * 60 * 1000);
 const cache = new LRUCache({
   max: parsePositiveInteger(process.env.TMDB_CACHE_MAX_ENTRIES, 1000, 1, 5000),
   ttl: CACHE_TTL_MS,
@@ -61,42 +60,77 @@ function tmdbConfigured() {
   return TMDB_API_KEY.length > 0;
 }
 
-const TMDB_DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
+const lookupStats = {
+  calls: 0,
+  apiRequests: 0,
+  cacheHits: 0,
+  negativeCacheHits: 0,
+  inFlightJoins: 0,
+  notConfigured: 0,
+  notFound404: 0,
+  httpErrors: 0,
+  invalidJson: 0,
+  invalidResponses: 0,
+  requestErrors: 0,
+  successfulResponses: 0
+};
 
-function logRequestDebug(event, details) {
-  if (TMDB_DEBUG) console.log("[DEBUG] TMDb request", { event, ...details });
+function getDiagnostics() {
+  return {
+    apiKeyConfigured: tmdbConfigured(),
+    ...lookupStats
+  };
 }
 
-async function request(path) {
-  if (!tmdbConfigured()) return null;
+function recordLookupDiagnostic(target, details) {
+  if (target && typeof target === "object" && details && typeof details === "object") {
+    Object.assign(target, details);
+  }
+}
+async function request(path, { refresh = false, diagnostics = null } = {}) {
+  lookupStats.calls++;
+  if (!tmdbConfigured()) {
+    lookupStats.notConfigured++;
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured" });
+    return null;
+  }
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
-  if (cached !== undefined) {
-    logRequestDebug("cache-hit", { path, ms: 0 });
+  if (!refresh && cached !== undefined) {
+    lookupStats.cacheHits++;
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_cached_response", source: "memory_cache" });
     return cached;
   }
-  if (negativeCache.has(cacheKey)) {
-    logRequestDebug("negative-cache-hit", { path, ms: 0 });
+  if (!refresh && negativeCache.has(cacheKey)) {
+    lookupStats.negativeCacheHits++;
+    recordLookupDiagnostic(diagnostics, {
+      reason: "tmdb_not_found",
+      source: "negative_cache",
+      httpStatus: 404
+    });
     return null;
   }
   if (pending.has(cacheKey)) {
-    logRequestDebug("in-flight-join", { path });
-    return pending.get(cacheKey);
+    lookupStats.inFlightJoins++;
+    const result = await pending.get(cacheKey);
+    recordLookupDiagnostic(diagnostics, {
+      reason: result ? "tmdb_response_received" : "tmdb_lookup_failed",
+      source: "in_flight"
+    });
+    return result;
   }
 
   const task = (async () => {
-    const startedAt = Date.now();
     let status = null;
     try {
       const separator = path.includes("?") ? "&" : "?";
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
-      const diagnostics = {};
+      lookupStats.apiRequests++;
       const response = await safeFetch(url, {
         timeout: 12000,
         // Opt in only for TMDb requests. safeFetch still resolves and validates
         // DNS for every request before selecting an agent pinned to those addresses.
         reuseConnection: true,
-        diagnostics,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
       status = response.status;
@@ -107,38 +141,53 @@ async function request(path) {
         if (response.body && typeof response.body.destroy === "function") {
           response.body.destroy();
         }
-        if (response.status === 404) negativeCache.set(cacheKey, true);
-        logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
+        if (response.status === 404) {
+          negativeCache.set(cacheKey, true);
+          lookupStats.notFound404++;
+        } else {
+          lookupStats.httpErrors++;
+        }
+        recordLookupDiagnostic(diagnostics, {
+          reason: response.status === 404 ? "tmdb_not_found" : "tmdb_http_error",
+          httpStatus: response.status
+        });
         return null;
       }
-      // Separate response-body consumption from JSON parsing so large or slow
-      // responses can be distinguished from CPU time spent decoding metadata.
-      const bodyStartedAt = Date.now();
-      const responseText = await response.text();
-      const bodyMs = Date.now() - bodyStartedAt;
-      const parseStartedAt = Date.now();
-      const data = JSON.parse(responseText);
-      const parseMs = Date.now() - parseStartedAt;
+      let data;
+      try {
+        data = JSON.parse(await response.text());
+      } catch (error) {
+        lookupStats.invalidJson++;
+        recordLookupDiagnostic(diagnostics, {
+          reason: "tmdb_invalid_json",
+          httpStatus: status,
+          errorName: error && error.name ? error.name : "SyntaxError"
+        });
+        return null;
+      }
       if (!data || typeof data !== "object" || Array.isArray(data)) {
-        logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
+        lookupStats.invalidResponses++;
+        recordLookupDiagnostic(diagnostics, { reason: "tmdb_invalid_response", httpStatus: status });
         return null;
       }
       cache.set(cacheKey, data);
-      logRequestDebug("fetched", {
-        path, status, ms: Date.now() - startedAt,
-        dnsMs: diagnostics.dnsMs ?? null,
-        headersMs: diagnostics.headersMs ?? null,
-        bodyMs,
-        parseMs,
-        freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
+      lookupStats.successfulResponses++;
+      recordLookupDiagnostic(diagnostics, {
+        reason: "tmdb_response_received",
+        source: "api",
+        httpStatus: status
       });
       return data;
     } catch (error) {
-      logRequestDebug("request-error", {
-        path,
-        status,
-        ms: Date.now() - startedAt,
-        error: error && error.name ? error.name : "Error",
+      lookupStats.requestErrors++;
+      const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+        ? error.code
+        : undefined;
+      recordLookupDiagnostic(diagnostics, {
+        reason: "tmdb_request_error",
+        ...(status ? { httpStatus: status } : {}),
+        errorName: error && error.name ? error.name : "Error",
+        ...(errorCode ? { errorCode } : {})
       });
       return null;
     } finally {
@@ -240,6 +289,7 @@ function mapMovieMetadata(details, credits, videos, images) {
   const year = dateYear(details.release_date);
   return stripEmpty({
     name: details.title,
+    imdbId: nonEmpty(details.imdb_id) || nonEmpty(details.external_ids?.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
@@ -256,34 +306,59 @@ function mapMovieMetadata(details, credits, videos, images) {
   });
 }
 
-async function getMovieCatalogMetadata(tmdbId) {
+async function getMovieCatalogMetadata(tmdbId, options = {}) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
   // Include images in the appended response so Discover can use TMDb's
   // transparent title logo without adding a second network round-trip per movie.
-  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null");
+  const details = await request("/movie/" + id + "?language=en-GB&append_to_response=credits,images,external_ids&include_image_language=en,null", options);
   return mapMovieMetadata(details, details?.credits, null, details?.images);
 }
 
-async function getSeriesCatalogMetadata(tmdbId) {
+async function getSeriesCatalogMetadata(tmdbId, options = {}) {
+  const diagnostics = options?.diagnostics;
   const id = validTmdbId(tmdbId);
-  if (!id) return null;
+  if (!id) {
+    recordLookupDiagnostic(diagnostics, {
+      reason: tmdbId == null || String(tmdbId).trim() === ""
+        ? "tmdb_id_missing"
+        : "tmdb_id_invalid"
+    });
+    return null;
+  }
+  if (!tmdbConfigured()) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured", tmdbId: id });
+    return null;
+  }
   // Append images alongside aggregate credits so Discover receives the
   // transparent title logo without an extra request for each series.
-  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null");
-  return mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
+  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null", options);
+  const metadata = mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
+  if (metadata) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_match_found", tmdbId: id });
+  } else if (
+    diagnostics &&
+    ["tmdb_response_received", "tmdb_cached_response"].includes(diagnostics.reason)
+  ) {
+    recordLookupDiagnostic(diagnostics, {
+      reason: "tmdb_response_missing_series_name",
+      tmdbId: id
+    });
+  }
+  return metadata;
 }
 
 async function getMovieMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // Match the catalogue lookup so details + credits share one cached response.
-  const [details, videos, images] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB&append_to_response=credits"),
+  // Reuse the exact details/credits/images response already fetched for Discover.
+  // Only trailers need a separate request; the shared request cache deduplicates it
+  // when another detail request for the same movie is already in progress.
+  const [details, videos] = await Promise.all([
+    request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null"),
     request("/movie/" + id + "/videos?language=en-GB"),
-    request("/movie/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapMovieMetadata(details, details?.credits, videos, images);
+  return mapMovieMetadata(details, details?.credits, videos, details?.images);
 }
 
 function mapSeriesMetadata(details, credits, videos, images) {
@@ -303,6 +378,7 @@ function mapSeriesMetadata(details, credits, videos, images) {
     : undefined;
   return stripEmpty({
     name: details.name,
+    imdbId: nonEmpty(details.external_ids?.imdb_id) || nonEmpty(details.imdb_id),
     description: nonEmpty(details.overview),
     poster: imageUrl(details.poster_path),
     background: imageUrl(details.backdrop_path, "w1280"),
@@ -321,13 +397,14 @@ function mapSeriesMetadata(details, credits, videos, images) {
 async function getSeriesMetadata(tmdbId) {
   const id = validTmdbId(tmdbId);
   if (!id) return null;
-  // Match the catalogue lookup so details + aggregate credits share one cached response.
-  const [details, videos, images] = await Promise.all([
-    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits"),
+  // Reuse the exact details/credits/images response already fetched for Discover.
+  // Only trailers need a separate request; the shared request cache deduplicates it
+  // when another detail request for the same series is already in progress.
+  const [details, videos] = await Promise.all([
+    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null"),
     request("/tv/" + id + "/videos?language=en-GB"),
-    request("/tv/" + id + "/images?include_image_language=en,null"),
   ]);
-  return mapSeriesMetadata(details, details?.aggregate_credits, videos, images);
+  return mapSeriesMetadata(details, details?.aggregate_credits, videos, details?.images);
 }
 
 function mapSeasonEpisodes(data, season) {
@@ -368,6 +445,7 @@ module.exports = {
   getMovieCatalogMetadata,
   getSeriesCatalogMetadata,
   getSeasonEpisodes,
+  getDiagnostics,
   mapMovieMetadata,
   mapSeriesMetadata,
   mapSeasonEpisodes,

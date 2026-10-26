@@ -232,16 +232,6 @@ async function safeFetch(input, options = {}) {
 
       if (diagnostics) {
         diagnostics.headersMs = Date.now() - headersStartedAt;
-        if ((process.env.DEBUG_MODE || "").toLowerCase() === "true" &&
-            currentUrl.hostname.toLowerCase() === "api.themoviedb.org") {
-          console.log("[DEBUG] TMDb transport timing", {
-            path: currentUrl.pathname,
-            status: response.status,
-            dnsMs: diagnostics.dnsMs ?? null,
-            headersMs: diagnostics.headersMs,
-            freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
-          });
-        }
       }
 
       if (![301, 302, 303, 307, 308].includes(response.status)) {

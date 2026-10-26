@@ -1,12 +1,17 @@
 version: '3.8'
 services:
   stremio_addon:
-    image: inside4ndroid/stremio-m3u-epg-addon:latest  # Changed from build: .
+    build: .
+    image: stremio-m3u-epg-addon:local
     container_name: stremio_addon
     ports:
       - "7000:7000"
     env_file:
       - .env
+    environment:
+      PERSISTENT_DATA_DIR: /data
+    volumes:
+      - addon-data:/data
     restart: unless-stopped
     # Uncomment below if you want to use Redis
     # depends_on:
@@ -20,3 +25,6 @@ services:
   #   ports:
   #     - "127.0.0.1:6379:6379"
   #   restart: unless-stopped
+
+volumes:
+  addon-data:

@@ -3,7 +3,13 @@
 const sax = require('sax');
 
 const MAX_PROGRAMMES_PER_SOURCE = 150000;
-const MAX_EPG_BYTES = 800 * 1024 * 1024;
+const DEFAULT_MAX_EPG_BYTES = 150000000;
+const MAX_EPG_BYTES = (() => {
+    const configured = Number.parseInt(process.env.EPG_MAX_BYTES, 10);
+    return Number.isSafeInteger(configured) && configured >= 1024 * 1024
+        ? Math.min(configured, DEFAULT_MAX_EPG_BYTES)
+        : DEFAULT_MAX_EPG_BYTES;
+})();
 // Bound retained free text: one malformed programme must not consume the
 // process heap even when the overall XML feed is within its byte limit.
 const MAX_TITLE_CHARS = 512;
@@ -126,7 +132,9 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
         readable.on('data', (chunk) => {
             bytesRead += chunk.length;
             if (bytesRead > MAX_EPG_BYTES) {
-                finish(new Error('EPG source exceeds the 800 MB streaming limit'));
+                const error = new Error('EPG source exceeds the ' + Math.floor(MAX_EPG_BYTES / 1000000) + ' MB streaming limit');
+                error.code = 'EPG_TOO_LARGE';
+                finish(error);
                 readable.destroy();
             }
         });

@@ -166,7 +166,7 @@
     setProgress(5, "Starting");
     appendDetail("== PRE-FLIGHT (XTREAM) ==");
     appendDetail(`Base origin: ${safeDisplayOrigin(baseUrl)} (credentials and path hidden)`);
-    appendDetail(`Mode: 'JSON API'}`);
+    appendDetail(`Mode: ${xtreamUseM3UChk && xtreamUseM3UChk.checked ? 'M3U Plus (limited series grouping)' : 'JSON API'}`);
     appendDetail(
       `EPG Mode: ${enableEpgInitial ? (epgMode === "custom" ? "Custom URL" : "Panel XMLTV") : "Disabled"}`,
     );
@@ -205,6 +205,41 @@
       }
       vodCount = Array.isArray(vodList) ? vodList.length : 0;
       appendDetail(`✔ VOD streams: ${vodCount.toLocaleString()}`);
+
+      // Check the same series endpoint from Railway, not from the user's browser.
+      // The server returns only a count, so the full series list stays on Railway.
+      if (xtreamUseM3UChk && xtreamUseM3UChk.checked) {
+        appendDetail("⚠ Series pre-flight skipped: M3U Plus mode uses limited series grouping.");
+      } else {
+        setProgress(38, "Checking TV Series from Railway");
+        appendDetail("→ (Railway) Checking Xtream TV series (credentials hidden)");
+        try {
+          const response = await fetch("/api/xtream-series-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              xtreamUrl: baseUrl,
+              xtreamUsername: username,
+              xtreamPassword: password,
+            }),
+          });
+          let payload = {};
+          try { payload = await response.json(); } catch { /* reported below */ }
+          if (!response.ok || !payload.ok) {
+            const status = payload.status ? ` HTTP ${payload.status}` : "";
+            const code = payload.code ? ` (${payload.code})` : "";
+            appendDetail(`⚠ (Railway) Series check failed${status}: ${payload.error || "No diagnostic response"}${code}`);
+          } else {
+            const seriesCount = Number(payload.seriesCount) || 0;
+            appendDetail(`✔ (Railway) TV series: ${seriesCount.toLocaleString()} (${Number(payload.bytes || 0).toLocaleString()} bytes, ${Number(payload.durationMs || 0)} ms)`);
+            if (seriesCount === 0) {
+              appendDetail("⚠ Railway reached Xtream, but it returned an empty series list.");
+            }
+          }
+        } catch (error) {
+          appendDetail(`⚠ (Railway) Series check could not complete: ${error?.name || "request error"}`);
+        }
+      }
 
       // EPG feeds (each source fails independently; merge occurs on the server).
       const primaryEpgUrl = enableEpgInitial

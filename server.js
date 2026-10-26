@@ -1,24 +1,23 @@
 // Server for IPTV Stremio Addon (with debug + prefetch proxy to bypass browser CORS for pre-flight)
 // Updated: Fixed prefetch stream handling (node-fetch readable stream -> chunk accumulation, no getReader()).
-require("dotenv").config();
+require('dotenv').config({ quiet: true });
 
 const { getRouter } = require("stremio-addon-sdk");
 const express = require("express");
 const path = require("path");
-const crypto = require("crypto");
+const net = require("net");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
+const { MAX_EPG_BYTES } = require("./src/js/epgStreamParser");
+const { isDebugEnabled, logAt } = require("./logger");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const { validateConfig } = require("./configValidation");
 const LRUCache = require("./lruCache");
 
-const DEBUG = (process.env.DEBUG_MODE || "").toLowerCase() === "true";
+const DEBUG = isDebugEnabled();
 function dlog(...args) {
-  if (DEBUG) console.log("[DEBUG]", ...args);
+  logAt("debug", "[DEBUG]", ...args);
 }
-
-const CACHE_ENABLED =
-  (process.env.CACHE_ENABLED || "true").toLowerCase() !== "false";
 
 const parsePositiveInteger = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
   const parsed = Number.parseInt(value, 10);
@@ -27,15 +26,30 @@ const parsePositiveInteger = (value, fallback, min = 1, max = Number.MAX_SAFE_IN
     : fallback;
 };
 
+// Interfaces own scheduled refresh jobs; retain them until memory pressure evicts
+// them, while the provider-data cache continues to use CACHE_TTL_MS.
 const INTERFACE_TTL_MS = parsePositiveInteger(
-  process.env.CACHE_TTL_MS,
-  6 * 3600 * 1000,
-  1000,
+  process.env.INTERFACE_CACHE_TTL_MS,
+  0,
+  0,
   30 * 24 * 3600 * 1000,
 );
+const INTERFACE_CACHE_MAX_BYTES = parsePositiveInteger(
+  process.env.INTERFACE_CACHE_MAX_BYTES,
+  256 * 1024 * 1024,
+  16 * 1024 * 1024,
+  4 * 1024 * 1024 * 1024,
+);
 const interfaceCache = new LRUCache({
-  max: parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500),
+  max: parsePositiveInteger(process.env.MAX_INTERFACE_CACHE_ENTRIES, 3, 1, 100),
   ttl: INTERFACE_TTL_MS,
+  maxWeight: INTERFACE_CACHE_MAX_BYTES,
+  sizeOf: (iface) => iface && Number.isFinite(iface.__cacheWeight) ? iface.__cacheWeight : 1,
+  onEvict: (iface) => {
+    createAddon.disposeAddonInterface(iface).catch((error) => {
+      logAt("warn", "[CACHE] Could not dispose an evicted addon interface:", error?.name || "Error");
+    });
+  },
 });
 const MAX_ACTIVE_INTERFACE_BUILDS = parsePositiveInteger(
   process.env.MAX_ACTIVE_INTERFACE_BUILDS,
@@ -74,11 +88,49 @@ const PREFLIGHT_RATE_MAX = parsePositiveInteger(
   600,
 );
 const PREFLIGHT_RATE_MAX_CLIENTS = 5000;
+const ADDON_REQUEST_RATE_MAX = parsePositiveInteger(process.env.ADDON_REQUEST_RATE_MAX, 1200, 60, 6000);
+const addonRequestRateBuckets = new Map();
 const preflightRateBuckets = new Map();
 
+function getClientIp(req) {
+  // Railway documents X-Real-IP as the edge-provided client address. Trust it
+  // only on Railway and only when it parses as one IP; otherwise use Express
+  // (including Render's explicitly trusted single proxy hop) or the socket.
+  if (process.env.RAILWAY_SERVICE_ID) {
+    const railwayIp = String(req.headers["x-real-ip"] || "").trim();
+    if (net.isIP(railwayIp)) return railwayIp;
+  }
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function addonRequestRateLimit(req, res, next) {
+  const now = Date.now();
+  const key = getClientIp(req);
+  let bucket = addonRequestRateBuckets.get(key);
+  if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
+    if (!bucket && addonRequestRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+      for (const [client, entry] of addonRequestRateBuckets) {
+        if (now - entry.startedAt >= PREFLIGHT_RATE_WINDOW_MS) addonRequestRateBuckets.delete(client);
+        if (addonRequestRateBuckets.size < PREFLIGHT_RATE_MAX_CLIENTS) break;
+      }
+      if (addonRequestRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
+        return res.status(503).json({ error: "Request rate-limit capacity reached; retry shortly" });
+      }
+    }
+    bucket = { startedAt: now, count: 0 };
+    addonRequestRateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > ADDON_REQUEST_RATE_MAX) {
+    const retryAfter = Math.max(1, Math.ceil((PREFLIGHT_RATE_WINDOW_MS - (now - bucket.startedAt)) / 1000));
+    res.setHeader("Retry-After", String(retryAfter));
+    return res.status(429).json({ error: "Too many addon requests; retry shortly" });
+  }
+  return next();
+}
 function preflightRateLimit(req, res, next) {
   const now = Date.now();
-  const key = req.ip || req.socket?.remoteAddress || "unknown";
+  const key = getClientIp(req);
   let bucket = preflightRateBuckets.get(key);
   if (!bucket || now - bucket.startedAt >= PREFLIGHT_RATE_WINDOW_MS) {
     if (!bucket && preflightRateBuckets.size >= PREFLIGHT_RATE_MAX_CLIENTS) {
@@ -122,7 +174,7 @@ app.use(express.static(staticDir));
 app.use(express.json({ limit: "128kb" }));
 
 // Encryption endpoint
-app.post("/encrypt", (req, res) => {
+app.post("/encrypt", preflightRateLimit, (req, res) => {
   if (!process.env.CONFIG_SECRET || process.env.CONFIG_SECRET.length < 16) {
     return res.status(503).json({
       error: "Secure token creation is unavailable. CONFIG_SECRET must be at least 16 characters.",
@@ -144,6 +196,119 @@ app.post("/encrypt", (req, res) => {
 
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
 
+// Count Xtream series from Railway without returning the full catalogue to the browser.
+app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
+  if (!PREFETCH_ENABLED) {
+    return res.status(403).json({ ok: false, error: "Server preflight is disabled" });
+  }
+  if (activePrefetches >= MAX_ACTIVE_PREFETCHES) {
+    res.setHeader("Retry-After", "5");
+    return res.status(503).json({ ok: false, error: "Preflight capacity reached; retry shortly" });
+  }
+
+  let config;
+  try {
+    const input = req.body || {};
+    config = validateConfig({
+      provider: "xtream",
+      xtreamUrl: input.xtreamUrl,
+      xtreamUsername: input.xtreamUsername,
+      xtreamPassword: input.xtreamPassword,
+    });
+  } catch {
+    return res.status(400).json({ ok: false, error: "Invalid Xtream connection settings" });
+  }
+
+  activePrefetches += 1;
+  const startedAt = Date.now();
+  try {
+    const url = new URL(config.xtreamUrl.replace(/\/+$/, "") + "/player_api.php");
+    url.searchParams.set("username", config.xtreamUsername);
+    url.searchParams.set("password", config.xtreamPassword);
+    url.searchParams.set("action", "get_series");
+
+    const response = await safeFetch(url.toString(), {
+      timeout: 35000,
+      headers: { "User-Agent": "IPTV-Stremio-Addon series preflight/1.0" },
+    });
+    if (!response.ok) {
+      if (response.body) response.body.destroy();
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned an HTTP error",
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    if (!response.body) {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned an empty response",
+        durationMs: Date.now() - startedAt,
+      });
+    }
+
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of response.body) {
+      bytes += chunk.length;
+      if (bytes > PREFETCH_MAX_BYTES) {
+        response.body.destroy();
+        return res.status(413).json({
+          ok: false,
+          error: "Xtream series response exceeds the server preflight size limit",
+          bytes,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+      chunks.push(chunk);
+    }
+
+    let series;
+    try {
+      const body = Buffer.concat(chunks, bytes).toString("utf8").replace(/^\uFEFF/, "");
+      series = JSON.parse(body);
+    } catch {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned invalid JSON",
+        bytes,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    if (!Array.isArray(series)) {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API response was not a list",
+        bytes,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+
+    res.json({
+      ok: true,
+      seriesCount: series.length,
+      bytes,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    const timedOut = /abort|timeout/i.test(String(error?.name || "")) ||
+      /timed out/i.test(String(error?.message || ""));
+    const code = typeof error?.code === "string" ? error.code.slice(0, 40) : null;
+    res.status(502).json({
+      ok: false,
+      error: timedOut
+        ? "Railway timed out while fetching Xtream series"
+        : "Railway could not fetch Xtream series",
+      code,
+      durationMs: Date.now() - startedAt,
+    });
+  } finally {
+    activePrefetches = Math.max(0, activePrefetches - 1);
+  }
+});
+
+
 // Stream-count XMLTV programmes without retaining the feed in memory.
 app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   if (!PREFETCH_ENABLED) {
@@ -163,7 +328,6 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   let totalBytes = 0;
   let programmeCount = 0;
   let tail = "";
-  const MAX_EPG_SCAN_BYTES = 800 * 1024 * 1024;
   try {
     const response = await safeFetch(url, {
       method: "GET",
@@ -196,10 +360,12 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
       };
       body.on("data", (chunk) => {
         totalBytes += chunk.length;
-        if (totalBytes > MAX_EPG_SCAN_BYTES) {
+        if (totalBytes > MAX_EPG_BYTES) {
           controller.abort();
           body.destroy();
-          finish(new Error("EPG source exceeds the 800 MB preflight scan limit"));
+          const error = new Error(`EPG source exceeds the ${Math.floor(MAX_EPG_BYTES / 1000000)} MB preflight scan limit`);
+          error.code = "EPG_TOO_LARGE";
+          finish(error);
           return;
         }
         const combined = tail + chunk.toString("utf8");
@@ -219,11 +385,11 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
 
     res.json({ ok: true, bytes: totalBytes, programmes: programmeCount });
   } catch (error) {
-    const tooLarge = error && /800 MB/.test(error.message || "");
+    const tooLarge = error && error.code === "EPG_TOO_LARGE";
     const timedOut = error && error.name === "AbortError";
     if (!res.headersSent) {
       res.status(tooLarge ? 413 : timedOut ? 504 : 502).json({
-        error: tooLarge ? "EPG source exceeds the 800 MB preflight scan limit"
+        error: tooLarge ? `EPG source exceeds the ${Math.floor(MAX_EPG_BYTES / 1000000)} MB preflight scan limit`
           : timedOut ? "EPG preflight timed out after 120 seconds"
           : "EPG source could not be checked",
       });
@@ -509,7 +675,7 @@ app.get("/:token/configuration.json", (req, res) => {
 });
 
 // Token interface middleware
-app.use("/:token", async (req, res, next) => {
+app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
   const { token } = req.params;
   if (!isConfigToken(token)) return next("route");
   if (req.path.startsWith("/configure")) return next();
@@ -523,10 +689,10 @@ app.use("/:token", async (req, res, next) => {
   }
   if (DEBUG && config.debug !== false) config.debug = true;
 
-  const ifaceKey =
-    "iface:" + crypto.createHash("sha256").update(token).digest("hex");
+  const ifaceKey = createAddon.createInterfaceKey(config);
 
-  let iface = CACHE_ENABLED ? interfaceCache.get(ifaceKey) : null;
+  let iface = interfaceCache.get(ifaceKey);
+  let acquired = false;
   if (!iface) {
     if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
       res.setHeader("Retry-After", "5");
@@ -536,8 +702,20 @@ app.use("/:token", async (req, res, next) => {
     try {
       dlog("Building addon interface (cache miss)");
       iface = await createAddon(config);
-      if (CACHE_ENABLED) interfaceCache.set(ifaceKey, iface);
+      acquired = createAddon.acquireAddonInterface(iface);
+      // The same config may have been evicted while another request awaited this
+      // build. createAddon waits for its old instance to flush before rebuilding.
+      if (!acquired) {
+        iface = await createAddon(config);
+        acquired = createAddon.acquireAddonInterface(iface);
+      }
+      if (!acquired) {
+        res.setHeader("Retry-After", "1");
+        return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
+      }
+      interfaceCache.set(ifaceKey, iface);
     } catch (e) {
+      if (acquired) createAddon.releaseAddonInterface(iface);
       // Provider errors can include request URLs; don't log them with credentials.
       console.error("[SERVER] Addon build failed:", e && e.name ? e.name : "Error");
       return res.status(500).json({ error: "Addon build error" });
@@ -545,12 +723,23 @@ app.use("/:token", async (req, res, next) => {
       activeInterfaceBuilds = Math.max(0, activeInterfaceBuilds - 1);
     }
   } else {
-    dlog("Interface cache hit");
+    acquired = createAddon.acquireAddonInterface(iface);
   }
 
+  if (!acquired) {
+    res.setHeader("Retry-After", "1");
+    return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
+  }
+  let released = false;
+  const releaseInterface = () => {
+    if (released) return;
+    released = true;
+    createAddon.releaseAddonInterface(iface);
+  };
+  res.once("finish", releaseInterface);
+  res.once("close", releaseInterface);
   req.addonInterface = iface;
   req.configToken = token;
-  dlog("Addon request", req.method, req.path);
   next();
 });
 
@@ -623,18 +812,21 @@ app.get("/:token/manifest.json", (req, res) => {
   res.end(JSON.stringify(manifest));
 });
 
-// Apply platform-specific metadata presentation at the HTTP boundary. The SDK's
-// metadata handler arguments do not expose request headers, so keep this logic
-// outside the shared metadata builder. The SDK router writes serialized JSON via
-// res.end(), so intercept that boundary rather than res.json().
+// Filter platform-specific metadata links at the HTTP boundary. The Stremio SDK does not expose request headers to metadata handlers.
+// Writer credits are retained only for iOS Stremio; rating links keep their client-specific behavior.
+
 app.use("/:token", (req, res, next) => {
   const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
+  const pathIsCatalog = /^\/catalog\/(movie|series)\//.test(req.path);
+  const pathIsMetadataResponse = pathIsMeta || pathIsCatalog;
   const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
-  const isIosStremioClient =
-    userAgent.includes("stremio") &&
-    /iphone|ipad|ipod|ios/.test(userAgent);
+  const isIosStremioClient = userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent);
 
-  if (pathIsMeta) {
+  if (pathIsMetadataResponse) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
     const originalEnd = res.end.bind(res);
     res.end = function (chunk, encoding, callback) {
       const contentType = String(res.getHeader("content-type") || "").toLowerCase();
@@ -642,21 +834,36 @@ app.use("/:token", (req, res, next) => {
         try {
           const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
           const body = JSON.parse(jsonText);
-          if (body && body.meta && typeof body.meta === "object") {
-            const meta = body.meta;
-            const links = Array.isArray(meta.links) ? meta.links : [];
-            if (isIosStremioClient) {
-              meta.links = links.filter(link => link?.category !== "Rating");
-              delete meta.tmdbRating;
-            } else {
-              meta.links = links.filter(link => link?.category !== "Writers");
+          const metadataItems = Array.isArray(body?.metas)
+            ? body.metas
+            : (body?.meta && typeof body.meta === "object" ? [body.meta] : []);
+          const hasPlatformLinks = metadataItems.some(meta => Array.isArray(meta?.links) &&
+            meta.links.some(link => link?.category === "Rating" || link?.category === "Writers"));
+          if (hasPlatformLinks) {
+            const valid = value => value != null && value !== "" &&
+              Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
+            for (const meta of metadataItems) {
+              let rating = meta.imdbRating;
+              if (!valid(rating) && Array.isArray(meta.links)) {
+                const link = meta.links.find(item => item && typeof item.name === "string" &&
+                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim()));
+                const match = link?.name?.trim().match(
+                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
+                );
+                if (match) rating = match[1];
+              }
+              if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
+              const links = Array.isArray(meta.links) ? meta.links : [];
+              if (isIosStremioClient) {
+                meta.links = links.filter(link => link?.category !== "Rating");
+                delete meta.tmdbRating;
+              } else {
+                // Writer credits are exposed only to iOS Stremio clients.
+                meta.links = links.filter(link => link?.category !== "Writers");
+              }
             }
             const output = JSON.stringify(body);
-            if (Buffer.isBuffer(chunk)) {
-              chunk = Buffer.from(output, "utf8");
-            } else {
-              chunk = output;
-            }
+            chunk = Buffer.isBuffer(chunk) ? Buffer.from(output, "utf8") : output;
           }
         } catch {
           // Leave non-JSON or unexpected SDK responses untouched.
@@ -667,7 +874,6 @@ app.use("/:token", (req, res, next) => {
   }
   next();
 });
-
 // Stremio router (handles catalog, stream, meta)
 app.use("/:token", (req, res) => {
   const iface = req.addonInterface;
@@ -693,8 +899,35 @@ app.use((error, req, res, next) => {
 });
 
 const port = process.env.PORT || 7000;
-app.listen(port, () => {
-  console.log(
-    `🚀 Server running on port ${port} (debug=${DEBUG}, prefetch=${PREFETCH_ENABLED})`,
-  );
+const server = app.listen(port, () => {
+  logAt("info", `🚀 Server running on port ${port} (debug=${DEBUG}, prefetch=${PREFETCH_ENABLED})`);
 });
+
+let shutdownPromise = null;
+async function shutdown(signal) {
+  if (shutdownPromise) return shutdownPromise;
+  logAt("info", `[SHUTDOWN] ${signal} received; flushing persistent caches`);
+  const closePromise = new Promise((resolve) => server.close(resolve));
+  const forceCloseTimer = setTimeout(() => {
+    if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+  }, 15000);
+  if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+
+  shutdownPromise = (async () => {
+    await closePromise;
+    const interfaces = interfaceCache.entries().map(([, iface]) => iface);
+    await Promise.allSettled(interfaces.map((iface) => createAddon.disposeAddonInterface(iface)));
+    await createAddon.flushAddonDisposals();
+    interfaceCache.clear();
+    await createAddon.closeRedisClient();
+    await closePromise;
+    clearTimeout(forceCloseTimer);
+    logAt("info", "[SHUTDOWN] Persistent caches flushed");
+  })().catch((error) => {
+    logAt("error", "[SHUTDOWN] Could not finish graceful shutdown:", error?.name || "Error");
+  });
+  return shutdownPromise;
+}
+
+process.once("SIGTERM", () => { shutdown("SIGTERM"); });
+process.once("SIGINT", () => { shutdown("SIGINT"); });

@@ -57,8 +57,13 @@ Minimal `.env`:
 PORT=7000
 CACHE_ENABLED=true
 CACHE_TTL_MS=21600000
-MAX_CACHE_ENTRIES=300
+MAX_CACHE_ENTRIES=10
+CACHE_MEMORY_MAX_BYTES=268435456
 DEBUG_MODE=false
+# Optional: set this to the path of a mounted durable volume in your host.
+# PERSISTENT_DATA_DIR=/data
+# Provider + EPG refresh (default 12 hours)
+DATA_REFRESH_INTERVAL_MS=43200000
 # Optional:
 # REDIS_URL=redis://localhost:6379
 # CONFIG_SECRET=use-a-unique-long-random-secret (required for encrypted tokens)
@@ -80,12 +85,16 @@ docker run -d \
   -e PORT=7000 \
   -e DEBUG_MODE=false \
   -e CACHE_ENABLED=true \
+  -e PERSISTENT_DATA_DIR=/data \
+  -v stremio-data:/data \
   -p 7000:7000 \
   --name stremio-addon \
   stremio-iptv-addon
 ```
 
 ### Docker Compose (with Redis for shared cache)
+
+The repository `docker-compose.yml` builds the checked-out source. Run `docker compose up --build` after pulling or changing the code so the container uses that checkout.
 
 ```yaml
 services:
@@ -100,6 +109,7 @@ services:
       REDIS_URL: redis://redis:6379
       CACHE_ENABLED: "true"
       CACHE_TTL_MS: 21600000
+      PERSISTENT_DATA_DIR: /data
       MAX_CACHE_ENTRIES: 400
       PREFETCH_ENABLED: "true"
       PREFETCH_MAX_BYTES: 6000000
@@ -109,6 +119,10 @@ services:
       - redis
     ports:
       - "7000:7000"
+    volumes:
+      - addon-data:/data
+volumes:
+  addon-data:
 ```
 
 Then open: `http://localhost:7000/`
@@ -173,6 +187,49 @@ curl -X POST http://localhost:7000/api/prefetch \
 
 ---
 
+## 💾 Persistent Catalogue, Metadata and EPG
+
+Set **PERSISTENT_DATA_DIR** to the mount path of a persistent volume, such as **/data**. The same volume and path must be attached after every restart or redeploy. With the default paths, the volume contains configuration-namespaced files:
+
+| File | Contents |
+|------|----------|
+| addon-data-[24-char config hash].json | Last successful provider snapshot: live channels, movies, series, parsed EPG programmes, successful refresh timestamp, and the Direct-M3U episode index. It also stores pending large-removal confirmation fingerprints. The file has a format version and save timestamp. Each direct episode record includes its IPTV episode ID, title, season/episode numbers, thumbnail, release value, playable URL, and stream ID. |
+| catalog-meta/catalog-meta-[24-char config hash].json and its .wal companion | Enriched movie/series metadata previews: artwork, descriptions, genres, year/release, runtime, rating, cast/director, IMDb/TMDb IDs, and metadata check timestamps. The append-only journal is compacted into the snapshot periodically. |
+| series-info/series-info-[24-char config hash].json and its .wal companion | Xtream series details fetched on demand: episode IDs/titles, season and episode numbers, release values, thumbnails, playable URLs, stream IDs, series TMDb ID, fetch/save timestamps, and the provider-catalogue timestamp used to decide freshness. |
+| omdb-usage.json | Current UTC day and OMDb requests reserved that day, so restarts do not reset the daily request limit. |
+
+The provider snapshots and metadata files are namespaced by a hash of the provider configuration. They do not store the raw configuration token, but episode URLs may contain provider credentials or playlist access tokens. Keep the volume private. CATALOG_META_CACHE_DIR and SERIES_INFO_CACHE_DIR can move their respective cache files elsewhere. The OMDb counter uses PERSISTENT_DATA_DIR, or ./data if it is unset. Cache files older than PERSISTENT_CACHE_RETENTION_DAYS (90 days by default) are removed, except for the active configuration; abandoned .tmp files are removed after 24 hours. The metadata and episode journals are append-only write-ahead logs next to their .json snapshots. Keep one application process writing to a given persistent cache directory; the files do not use cross-process locks.
+
+Direct-M3U episode indexes are loaded from and saved in the provider snapshot, so episode lookup works immediately after a restart. Xtream does not download every season's episodes during catalogue refresh: the first series-detail request fetches them from get_series_info, stores the response in memory, and schedules a batched journal write (normally within 500 ms) without waiting for disk before returning the episode list. A graceful shutdown flushes pending journal writes. Later requests reuse the saved result. An entry is fresh for the provider refresh interval (12 hours by default) only while the provider catalogue timestamp is unchanged. After a successful catalogue refresh, the next series-detail request fetches a fresh episode list. If Xtream is unavailable, a saved list can be served as a fallback for up to 30 days.
+
+The provider catalogue and EPG are checked hourly and refreshed after 12 hours by default. A successful refresh stores the new timestamp. A failed refresh restores the previous catalogue, EPG and timestamp, leaving the refresh overdue for the next hourly check. A blank EPG result keeps the previous non-empty guide. A successful provider deletion removes the item from the saved catalogue; removed channels also lose orphaned EPG groups when no current channel uses that XMLTV ID, and removed movies/series lose their enriched metadata and series details. A few deletions are accepted immediately. By default, a large section drop is held on its first observation and accepted only after a second refresh returns the same remaining item IDs; an emptied non-empty section is also held for confirmation, including small sections. The first observation persists its fingerprint and leaves the last-good snapshot and refresh timestamp in place, so the hourly checker can confirm it on its next attempt. A failed provider request does not count as confirmation. Set PROVIDER_REMOVAL_GUARD_MIN_ITEMS, PROVIDER_REMOVAL_GUARD_PERCENT, and PROVIDER_REMOVAL_CONFIRMATIONS to tune the safeguard.
+
+Complete enriched catalogue metadata stays fresh for 14 days by default. If a normal refresh of a complete entry fails, the app waits 12 hours by default before retrying it (CATALOG_METADATA_FAILURE_RETRY_MS). Missing artwork, description, genres, year/release information, runtime, IMDb rating, cast, or movie director becomes eligible for another lookup after 12 hours (OMDB_MISSING_DATA_RETRY_MS). A known TMDb ID without an IMDb ID is also retried. The raw TMDb and OMDb API-response caches are process-memory only: their response TTLs do not make those raw responses survive a restart. TMDb's default response TTL is 14 days and confirmed 404 responses are cached for five minutes; OMDb's response TTL is 14 days. A persistent last-good catalogue preview can be used as a fallback for up to 30 days.
+
+### Metadata source priority
+
+TMDb is used when a provider item has a TMDb ID or the Xtream JSON lookup resolves one. It does not title-search as a general fallback. If no TMDb result is available, provider fields and the prior saved preview are used where present.
+
+| Metadata | Priority / behavior |
+|----------|---------------------|
+| Movie/series name | TMDb title/name, then provider title/name |
+| Poster | TMDb poster, then provider poster/cover/logo; previous saved non-empty value is retained if a refresh omits it |
+| Background and title logo | TMDb only; a previous saved value can be retained |
+| Description | TMDb overview, then provider plot/playlist plot; previous saved non-empty value can be retained |
+| Genres | TMDb genres, then provider category/group-title |
+| Year/release information | TMDb dates, then provider year or a year parsed from a movie title when using the provider fallback |
+| Runtime | TMDb, then provider runtime, then OMDb runtime |
+| IMDb ID | TMDb external IMDb ID; OMDb is queried using that known ID and does not perform a title search |
+| IMDb rating | OMDb only. A missing rating is retried after 12 hours when the record is revisited/warmed; without a resolvable IMDb ID or OMDb API key, the rating cannot be fetched |
+| Director and main cast | TMDb credits; cast is limited to the main cast returned by the TMDb mapper |
+| Episode title, description, artwork, release and episode credits | TMDb season/episode data when matched, then the provider episode record |
+| Playable episode ID and URL | Provider is authoritative; TMDb never supplies stream IDs or URLs |
+| Live-channel name, logo and category | Provider playlist/Xtream data; programme title, description and times come from XMLTV |
+
+TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb rating badge comes from OMDb.
+
+**Important:** setting PERSISTENT_DATA_DIR alone does not create durable storage; configure a mounted volume in the hosting service. Without it, catalogue snapshots and persistent metadata/episode files are disabled and those caches remain in memory/optional Redis. The OMDb usage counter still writes to local ./data, which may be ephemeral.
+
 ## ⛽ Environment Variables
 
 | Variable | Default | Purpose |
@@ -180,17 +237,53 @@ curl -X POST http://localhost:7000/api/prefetch \
 | `PORT` | `7000` | HTTP server port |
 | `REDIS_URL` | unset | Optional shared cache for provider data only |
 | `TMDB_API_KEY` | unset | Server-side TMDb API key used for movie, series and episode metadata; without it, TMDb metadata is unavailable |
-| `TMDB_CACHE_TTL_MS` | `86400000` (24h) | Cache lifetime for TMDb API responses |
-| `TMDB_CACHE_MAX_ENTRIES` | `1000` | Maximum number of cached TMDb responses (bounded by the server) |
-| `CACHE_ENABLED` | `true` | Master toggle for LRU + Redis |
-| `CACHE_TTL_MS` | `21600000` (6h) | TTL for cached data |
-| `MAX_CACHE_ENTRIES` | `100` | Maximum entries in each in-memory cache; values are bounded by the server | LRU entry cap; values are bounded by the server |
+| `TMDB_CACHE_TTL_MS` | 1209600000 (14d) | Process-memory cache lifetime for TMDb API responses |
+| `TMDB_CACHE_MAX_ENTRIES` | 1000 | Maximum number of cached TMDb responses (bounded by the server) |
+| `TMDB_NEGATIVE_CACHE_TTL_MS` | 300000 (5m) | Cache lifetime for confirmed TMDb 404 responses; transient failures are not cached as 404s |
+| `OMDB_API_KEY` | unset | OMDb API key for IMDb rating/runtime lookups |
+| `OMDB_DAILY_RESERVATION_BLOCK_SIZE` | 25 | Persist OMDb daily quota in blocks to reduce volume writes; unused reserved requests count against the quota until the next UTC day |
+| `OMDB_RETRY_FAILURE_MAX_ENTRIES` | 10000 | Maximum retryable OMDb lookup failures retained in process memory |
+| `OMDB_CACHE_TTL_MS` | 1209600000 (14d) | Process-memory cache lifetime for OMDb API responses |
+| `CACHE_ENABLED` | `true` | Enables/disables the provider-data LRU and Redis layers; provider refresh scheduling, the bounded addon-interface cache, separate metadata/episode caches, and configured disk persistence still operate |
+| `CACHE_TTL_MS` | `21600000` (6h) | TTL for provider catalogue data in the in-memory LRU, Redis snapshot, and series-info LRU |
+| `PERSISTENT_DATA_DIR` | unset | Mounted persistent directory for provider snapshots, direct episode indexes, enhanced metadata and Xtream episode details; set to the mount path (commonly /data) |
+| `PERSISTENT_DATA_MAX_BYTES` | 134217728 (128 MiB) | Maximum provider snapshot file size; bounded by 512 MiB |
+| `PERSISTENT_CACHE_RETENTION_DAYS` | 90 | Remove inactive config cache files after this many days (1–365) |
+| `CATALOG_META_CACHE_DIR` | unset | Optional override for the persistent movie/series metadata cache directory |
+| `SERIES_INFO_CACHE_DIR` | unset | Optional override for the persistent Xtream episode-detail cache directory |
+| `DATA_REFRESH_INTERVAL_MS` | 43200000 (12h) | Minimum interval between successful provider catalogue and EPG refreshes |
+| `DATA_REFRESH_CHECK_INTERVAL_MS` | 3600000 (1h) | How often the scheduler checks whether a provider refresh is due |
+| `SERIES_INFO_PERSISTENT_TTL_MS` | same as DATA_REFRESH_INTERVAL_MS | Freshness window for persisted Xtream episode details (bounded to 1h–30d) |
+| `SERIES_INFO_STALE_RETENTION_MS` | 2592000000 (30d) | Maximum stale Xtream episode-detail fallback age |
+| `SERIES_INFO_PERSISTENT_MAX_ENTRIES` | 20000 | Maximum persistent Xtream series-detail entries |
+| `EPG_FETCH_CONCURRENCY` | 2 | Concurrent EPG sources fetched and parsed per provider (capped at 4) |
+| `SERIES_EPISODE_METADATA_CONCURRENCY` | 6 | Concurrent TMDb season episode requests on a series detail page (capped at 12) |
+| `SERIES_EPISODE_CACHE_MAX` | 50000 | Maximum in-memory episode ID lookup entries (bounded to 1,000–200,000) |
+| `CATALOG_META_MEMORY_TTL_MS` | `21600000` (6h) | In-memory LRU lifetime for enriched movie/series metadata |
+| `CATALOG_META_PERSISTENT_TTL_MS` | `1209600000` (14d) | Freshness window for persisted enhanced movie/series metadata; legacy fallback: `CATALOG_META_CACHE_TTL_MS` |
+| `CATALOG_METADATA_REFRESH_MS` | 1209600000 (14d) | Normal per-item refresh interval for enriched catalogue metadata |
+| `CATALOG_METADATA_FAILURE_RETRY_MS` | 43200000 (12h) | Delay before retrying a failed normal refresh of complete metadata |
+| `CATALOG_META_STALE_RETENTION_MS` | `2592000000` (30d) | How long last-good enhanced metadata may be retained as a fallback |
+| `CATALOG_PREFETCH_REFRESH_MS` | `43200000` (12h) | How often the full catalogue warm-up rechecks metadata completeness; per-item metadata retains its own freshness window |
+| `OMDB_MISSING_DATA_RETRY_MS` | 43200000 (12h) | Retry interval for items with missing key metadata fields across provider/TMDb/OMDb |
+| `PROVIDER_REMOVAL_GUARD_MIN_ITEMS` | 10 | Minimum deleted items for the configurable large-drop safeguard |
+| `PROVIDER_REMOVAL_GUARD_PERCENT` | 25 | Percentage removed for the configurable large-drop safeguard |
+| `PROVIDER_REMOVAL_CONFIRMATIONS` | 2 | Matching refresh observations required before accepting a guarded section drop |
+| `MAX_CACHE_ENTRIES` | 10 | Maximum provider-data LRU entries (also bounded by its memory limit) |
+| `CACHE_MEMORY_MAX_BYTES` | 268435456 (256 MiB) | Approximate memory budget for the provider-data LRU |
+| `MAX_INTERFACE_CACHE_ENTRIES` | 3 | Maximum addon interfaces retained in process memory |
+| `INTERFACE_CACHE_MAX_BYTES` | 268435456 (256 MiB) | Approximate memory budget for addon interfaces; eviction stops refresh timers and flushes persistent caches |
+| `INTERFACE_CACHE_TTL_MS` | 0 (no expiry) | Optional interface expiry; memory limits still evict least-recently-used interfaces |
 | `CONFIG_SECRET` | unset | Required to create/decrypt encrypted tokens; use a unique random secret (prefer 32+ random bytes; minimum 16 characters) |
-| `DEBUG_MODE` | `false` | Enables verbose diagnostic logs |
+| `LOG_LEVEL` | `info` | Minimum deploy log detail: `debug`, `info`, `warn`, or `error` |
+| `DEBUG_MODE` | `false` | Enables concise debug diagnostics regardless of `LOG_LEVEL` |
 | `PREFETCH_ENABLED` | `true` | Enable server-side prefetch CORS bypass |
+| `PREFLIGHT_RATE_MAX` | `120` per minute | Per-IP limit for public setup/preflight and `/encrypt` requests (process-local) |
+| `ADDON_REQUEST_RATE_MAX` | `1200` per minute | Per-IP limit for tokenized addon requests (process-local; bounded to 60–6,000) |
 | `PREFETCH_MAX_BYTES` | `50000000` (50 MB) | Maximum bytes retained from one `/api/prefetch` response; hard cap 150 MB |
 | `PREFETCH_MAX_CONCURRENT` | `2` | Concurrent server-side prefetch limit (maximum 8) |
 | `PROVIDER_MAX_BYTES` | `50000000` (50 MB) | Max bytes read from each playlist, API or EPG response; hard cap 150 MB |
+| `EPG_MAX_BYTES` | `150000000` (150 MB) | Maximum bytes accepted for each XMLTV guide, also used by `/api/epg-stats`; configurable from 1 MiB to the 150 MB hard cap |
 | `MAX_ACTIVE_INTERFACE_BUILDS` | `2` | Concurrent addon build limit (maximum 8) |
 | `ALLOW_LEGACY_CONFIG_TOKENS` | `false` | Temporary opt-in for old plaintext Base64 configuration links |
 | `NODE_ENV` | (user value) | Standard Node semantics |
@@ -262,8 +355,8 @@ curl -X POST http://localhost:7000/api/prefetch \
 |------|------------------|----------------|
 | Server-side fetches | Reject private/reserved IPv4 and IPv6 destinations, pin DNS answers, revalidate redirects, cap response sizes and timeouts | Use public HTTP(S) provider and EPG URLs |
 | Token Leakage | Newly generated tokens encrypted with AES-256-GCM | Set a strong `CONFIG_SECRET`; keep links private; rotate provider credentials if a plain token was exposed |
-| EPG Size | Response-size caps and deadlines | Adjust `PREFETCH_MAX_BYTES` and `PROVIDER_MAX_BYTES` for large XMLTV feeds, up to the 150 MB hard cap |
-| DoS / Abuse | Prefetch and addon-build concurrency caps; bounded caches | Per-IP rate limiting is not currently implemented |
+| EPG Size | Streaming byte caps and deadlines | Adjust `EPG_MAX_BYTES` for XMLTV feeds, up to the 150 MB hard cap |
+| DoS / Abuse | Bounded caches, build/concurrency caps, per-IP fixed-window limits on `/encrypt`, public preflight, and tokenized addon requests | Limits are process-local; each replica maintains its own counters. Railway uses its validated `X-Real-IP` header, and Render trusts one configured proxy hop. |
 | Sensitive credentials | New links use authenticated encryption; plaintext legacy tokens are disabled by default | Keep `CONFIG_SECRET` private, keep manifest links private, and rotate credentials if a plaintext token was exposed |
 
 ---
@@ -318,10 +411,13 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 
 | Mode | How |
 |------|-----|
-| Enable debug globally | `DEBUG_MODE=true` (only temporarily; avoid sharing logs) |
+| Normal deploy logs | `LOG_LEVEL=info` (default): startup, provider refresh summaries, cache-load status, warnings and errors |
+| Show diagnostic details | `LOG_LEVEL=debug` or `DEBUG_MODE=true` |
+| Warnings and errors only | `LOG_LEVEL=warn` |
+| Errors only | `LOG_LEVEL=error` |
 | Per-token debug | Check “Enable Debug Logging” in UI |
-| Inspect parsing | Console shows playlist size, entries, EPG programmes |
-| Timeout fallback | Buttons enable after build timeout to allow manual retry |
+
+Routine cache writes and per-item TMDb/OMDb request logs are suppressed. `LOG_LEVEL=debug` shows catalogue warm-up start, progress at 25%, 50%, and 75%, very slow catalogue/EPG requests, and aggregate metadata diagnostics. Warm-up completion reports provider-fallback counts and reasons in one line; it does not print a per-series list.
 
 ---
 
@@ -434,9 +530,7 @@ Attribution appreciated but not required.
 
 ## 🧪 Serverless Note
 
-A `serverless.js` handler is included (experimental):
-- Cold starts rebuild addon interface
-- You must adapt dynamic token passing (currently static)
+The included `serverless.js` / `vercel.json` adapter is experimental and does not parse tokenized per-request configuration. It is not suitable for the normal Railway/Docker deployment path or for deployments that require durable volume-backed catalogue and metadata caches. Use `server.js` on a persistent Node service unless the adapter is completed for your platform.
 
 ---
 

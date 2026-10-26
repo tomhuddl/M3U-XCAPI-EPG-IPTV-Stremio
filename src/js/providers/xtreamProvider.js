@@ -6,6 +6,24 @@
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
 
+function getEpgFetchConcurrency() {
+    const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
+    return Number.isSafeInteger(parsed) && parsed >= 1 ? Math.min(parsed, 4) : 2;
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(items.length, concurrency);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (nextIndex < items.length) {
+            const index = nextIndex++;
+            results[index] = await mapper(items[index], index);
+        }
+    }));
+    return results;
+}
+
 async function fetchData(addonInstance) {
   const { config } = addonInstance;
   const {
@@ -157,12 +175,15 @@ async function fetchData(addonInstance) {
     });
 
     if (config.includeSeries !== false) {
+      const seriesFetchStartedAt = Date.now();
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
           fetch(`${base}&action=get_series`, { timeout: 35000 }),
           fetch(`${base}&action=get_series_categories`, {
             timeout: 20000,
-          }).catch(() => null),
+          }).catch((error) => {
+            return null;
+          }),
         ]);
         let seriesCatMap = {};
         try {
@@ -200,10 +221,30 @@ async function fetchData(addonInstance) {
                 },
               };
             });
+            const summary = { count: seriesList.length, durationMs: Date.now() - seriesFetchStartedAt };
+            if (seriesList.length) {
+              addonInstance.log?.info?.("Xtream series loaded", summary);
+            } else {
+              addonInstance.log?.warn?.("Xtream get_series returned an empty list", summary);
+            }
+          } else {
+            addonInstance.log?.warn?.("Xtream get_series returned a non-list response", {
+              responseType: seriesList === null ? "null" : typeof seriesList,
+              durationMs: Date.now() - seriesFetchStartedAt,
+            });
           }
+        } else {
+          addonInstance.log?.warn?.("Xtream get_series returned an HTTP error", {
+            status: seriesResp.status,
+            durationMs: Date.now() - seriesFetchStartedAt,
+          });
         }
-      } catch (e) {
-        // Series optional
+      } catch (error) {
+        addonInstance.log?.warn?.("Xtream get_series request failed", {
+          name: error?.name || "Error",
+          code: typeof error?.code === "string" ? error.code : null,
+          durationMs: Date.now() - seriesFetchStartedAt,
+        });
       }
     }
   }
@@ -212,35 +253,39 @@ async function fetchData(addonInstance) {
   if (config.enableEpg) {
     const customEpgUrl = config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
       ? config.epgUrl.trim() : null;
-    const primaryEpgUrl = customEpgUrl || `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
+    const primaryEpgUrl = customEpgUrl || xtreamUrl + "/xmltv.php?username=" +
+      encodeURIComponent(xtreamUsername) + "&password=" + encodeURIComponent(xtreamPassword);
     const epgSources = [...new Set([primaryEpgUrl, ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
-    const merged = {};
+    const allowedIds = new Set(addonInstance.channels
+      .map(channel => channel.attributes?.["tvg-id"] || channel.attributes?.["tvg-name"])
+      .filter(Boolean)
+      .map(String));
     const retentionBudget = { programmes: 0, textChars: 0 };
-    for (const sourceUrl of epgSources) {
+    const parsedSources = await mapWithConcurrency(epgSources, getEpgFetchConcurrency(), async sourceUrl => {
       try {
         const epgResp = await fetch(sourceUrl, { timeout: 120000 });
         if (!epgResp.ok || !epgResp.body) {
           if (epgResp.body) epgResp.body.destroy();
-          continue;
+          return null;
         }
-        const allowedIds = new Set(addonInstance.channels
-          .map(channel => channel.attributes?.["tvg-id"] || channel.attributes?.["tvg-name"])
-          .filter(Boolean)
-          .map(String));
-        const parsed = await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
-        for (const [channelId, programmes] of Object.entries(parsed)) {
-          if (!merged[channelId]) merged[channelId] = [];
-          merged[channelId].push(...programmes);
-        }
+        return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
       } catch {
-        // Keep data from other feeds if this source is unavailable.
+        return null;
+      }
+    });
+    const merged = {};
+    for (const parsed of parsedSources) {
+      if (!parsed) continue;
+      for (const [channelId, programmes] of Object.entries(parsed)) {
+        if (!merged[channelId]) merged[channelId] = [];
+        merged[channelId].push(...programmes);
       }
     }
     for (const channelId of Object.keys(merged)) {
       const seen = new Set();
       merged[channelId] = merged[channelId]
         .filter(programme => {
-          const key = [programme.start, programme.stop, programme.title].join('|');
+          const key = [programme.start, programme.stop, programme.title].join("|");
           if (seen.has(key)) return false;
           seen.add(key);
           return true;
@@ -249,6 +294,7 @@ async function fetchData(addonInstance) {
     }
     addonInstance.epgData = merged;
   }
+
 }
 
 function normalizeTmdbId(value) {
@@ -277,9 +323,19 @@ async function fetchMovieInfo(addonInstance, streamId) {
   }
 }
 
-async function fetchSeriesTmdbId(addonInstance, seriesId) {
+async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
   const { config } = addonInstance;
-  if (!seriesId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const report = details => {
+    if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details);
+  };
+  if (!seriesId) {
+    report({ reason: "provider_series_id_missing", source: "xtream_get_series_info" });
+    return null;
+  }
+  if (!config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) {
+    report({ reason: "provider_credentials_missing", source: "xtream_get_series_info" });
+    return null;
+  }
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   try {
     // Discover only needs the series TMDb ID. Avoid constructing and sorting every
@@ -288,11 +344,50 @@ async function fetchSeriesTmdbId(addonInstance, seriesId) {
       `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
       { timeout: 25000 },
     );
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const info = payload?.info && typeof payload.info === "object" ? payload.info : {};
-    return normalizeTmdbId(info.tmdb || info.tmdb_id || payload?.tmdb || payload?.tmdb_id);
-  } catch {
+    if (!response.ok) {
+      if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+      report({
+        reason: "provider_http_error",
+        source: "xtream_get_series_info",
+        httpStatus: response.status
+      });
+      return null;
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      report({
+        reason: "provider_invalid_json",
+        source: "xtream_get_series_info",
+        errorName: error && error.name ? error.name : "SyntaxError"
+      });
+      return null;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      report({ reason: "provider_invalid_response", source: "xtream_get_series_info" });
+      return null;
+    }
+    const info = payload.info && typeof payload.info === "object" ? payload.info : {};
+    const rawTmdbId = info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id || null;
+    const tmdbId = normalizeTmdbId(rawTmdbId);
+    report({
+      reason: tmdbId
+        ? "provider_tmdb_id_found"
+        : rawTmdbId ? "provider_tmdb_id_invalid" : "provider_tmdb_id_missing",
+      source: "xtream_get_series_info"
+    });
+    return tmdbId;
+  } catch (error) {
+    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+      ? error.code
+      : undefined;
+    report({
+      reason: "provider_request_error",
+      source: "xtream_get_series_info",
+      errorName: error && error.name ? error.name : "Error",
+      ...(errorCode ? { errorCode } : {})
+    });
     return null;
   }
 }
@@ -310,12 +405,15 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     return { videos: [] };
 
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+  const startedAt = Date.now();
   try {
     const infoResp = await fetch(
       `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
       { timeout: 25000 },
     );
-    if (!infoResp.ok) return { videos: [] };
+    if (!infoResp.ok) {
+      return { videos: [], fetchError: `HTTP ${infoResp.status}`, fetchedAt: Date.now() };
+    }
     const infoJson = await infoResp.json();
     const videos = [];
     const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
@@ -370,8 +468,17 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     // Sort by season then episode
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
     return { videos, tmdbId, fetchedAt: Date.now() };
-  } catch {
-    return { videos: [] };
+  } catch (error) {
+    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+      ? error.code
+      : undefined;
+    return {
+      videos: [],
+      fetchError: "Provider request failed",
+      errorName: error?.name || "Error",
+      ...(errorCode ? { errorCode } : {}),
+      fetchedAt: Date.now()
+    };
   }
 }
 
