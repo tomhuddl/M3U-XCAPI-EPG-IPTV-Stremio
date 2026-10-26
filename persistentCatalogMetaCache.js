@@ -139,6 +139,34 @@ class PersistentCatalogMetaCache {
         this.scheduleWrite();
     }
 
+    async delete(key) {
+        if (!this.enabled) return;
+        await this.init();
+        if (this.entries.delete(String(key))) {
+            this.dirty = true;
+            this.scheduleWrite();
+        }
+    }
+
+    async retainCatalogItems(itemIds) {
+        if (!this.enabled) return;
+        await this.init();
+        const keep = new Set(Array.from(itemIds || [], value => String(value)));
+        let changed = false;
+        for (const key of this.entries.keys()) {
+            // Warm-up completion markers are keyed separately from catalog items.
+            if (key.startsWith("__catalog_prefetch_status__:")) continue;
+            if (!keep.has(key)) {
+                this.entries.delete(key);
+                changed = true;
+            }
+        }
+        if (changed) {
+            this.dirty = true;
+            this.scheduleWrite();
+        }
+    }
+
     scheduleWrite(delay = 500) {
         if (!this.enabled || this.writeTimer) return;
         this.writeTimer = setTimeout(() => {

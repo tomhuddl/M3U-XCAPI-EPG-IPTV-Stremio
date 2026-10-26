@@ -42,7 +42,10 @@ class PersistentAddonDataCache {
                 !Array.isArray(parsed.data.movies) ||
                 !Array.isArray(parsed.data.series) ||
                 !parsed.data.epgData || typeof parsed.data.epgData !== "object" ||
-                !Number.isFinite(parsed.data.lastUpdate)) {
+                !Number.isFinite(parsed.data.lastUpdate) ||
+                (parsed.data.directSeriesEpisodes !== undefined &&
+                    (!parsed.data.directSeriesEpisodes || typeof parsed.data.directSeriesEpisodes !== "object" ||
+                        Array.isArray(parsed.data.directSeriesEpisodes)))) {
                 console.warn("[DATA-CACHE] Persistent data file failed validation; ignoring it");
                 return null;
             }
@@ -59,7 +62,10 @@ class PersistentAddonDataCache {
         if (!this.enabled) return false;
         if (!data || !Array.isArray(data.channels) || !Array.isArray(data.movies) ||
             !Array.isArray(data.series) || !data.epgData || typeof data.epgData !== "object" ||
-            !Number.isFinite(data.lastUpdate)) {
+            !Number.isFinite(data.lastUpdate) ||
+            (data.directSeriesEpisodes !== undefined &&
+                (!data.directSeriesEpisodes || typeof data.directSeriesEpisodes !== "object" ||
+                    Array.isArray(data.directSeriesEpisodes)))) {
             throw new Error("Refusing to persist an incomplete provider data snapshot");
         }
 

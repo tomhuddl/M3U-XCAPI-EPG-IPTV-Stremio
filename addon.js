@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const PersistentAddonDataCache = require("./persistentAddonDataCache");
+const PersistentSeriesInfoCache = require("./persistentSeriesInfoCache");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
 
@@ -395,6 +396,48 @@ function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_IN
 }
 const CACHE_TTL_MS = parsePositiveInteger(process.env.CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000);
 const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500);
+const PROVIDER_REMOVAL_GUARD_MIN_ITEMS = parsePositiveInteger(
+    process.env.PROVIDER_REMOVAL_GUARD_MIN_ITEMS, 10, 1, 1000000
+);
+const PROVIDER_REMOVAL_GUARD_PERCENT = parsePositiveInteger(
+    process.env.PROVIDER_REMOVAL_GUARD_PERCENT, 25, 1, 100
+);
+
+function getSectionRemovalStats(previousItems, currentItems) {
+    const previousById = new Map(
+        (Array.isArray(previousItems) ? previousItems : [])
+            .filter(item => item && item.id != null)
+            .map(item => [String(item.id), item])
+    );
+    const currentIds = new Set(
+        (Array.isArray(currentItems) ? currentItems : [])
+            .filter(item => item && item.id != null)
+            .map(item => String(item.id))
+    );
+    const removedItems = [...previousById.entries()]
+        .filter(([id]) => !currentIds.has(id))
+        .map(([, item]) => item);
+    const previousCount = previousById.size;
+    const removedCount = removedItems.length;
+    const removedPercent = previousCount ? (removedCount / previousCount) * 100 : 0;
+    const largeDrop =
+        (removedCount >= PROVIDER_REMOVAL_GUARD_MIN_ITEMS &&
+            removedPercent >= PROVIDER_REMOVAL_GUARD_PERCENT) ||
+        (removedCount >= 5 && removedPercent >= 50);
+
+    return {
+        removedItems,
+        previousCount,
+        currentCount: currentIds.size,
+        removedCount,
+        removedPercent,
+        largeDrop
+    };
+}
+
+function getProviderSeriesKey(item) {
+    return String(item?.series_id || item?.id?.replace(/^iptv_series_/, '') || '');
+}
 
 const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
 const buildPromiseCache = new Map();
@@ -463,6 +506,7 @@ class M3UEPGAddon {
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
+        this.persistentSeriesInfoCache = new PersistentSeriesInfoCache(this.cacheKey);
         this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
         this.channels = []; // live TV
         this.movies = [];   // VOD movies
@@ -561,6 +605,34 @@ class M3UEPGAddon {
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
+
+            // Direct-M3U episode URLs and IDs are not derivable from the series
+            // summaries alone, so persist and restore the episode lists themselves.
+            if (this.providerName === 'direct') {
+                const savedEpisodes = cached.directSeriesEpisodes;
+                if (savedEpisodes && typeof savedEpisodes === 'object' && !Array.isArray(savedEpisodes)) {
+                    const episodesMap = new Map(
+                        Object.entries(savedEpisodes)
+                            .filter(([, episodes]) => Array.isArray(episodes))
+                            .map(([seriesHash, episodes]) => [`iptv_series_${seriesHash}`, episodes])
+                    );
+                    require('./src/js/providers/directProvider.js')
+                        .rebuildDirectEpisodeIndexes(this, episodesMap);
+                }
+
+                // A present but partial/corrupt map also needs a one-time rebuild.
+                const missingSeriesIndexes = this.series.filter(item =>
+                    !this.directSeriesEpisodeIndex.has(getProviderSeriesKey(item))
+                ).length;
+                if (this.series.length && missingSeriesIndexes > 0) {
+                    this.lastUpdate = 0;
+                    this.log.info('Direct-M3U episode index is incomplete; rebuilding it', {
+                        missingSeriesIndexes,
+                        totalSeries: this.series.length
+                    });
+                }
+            }
+
             const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
             providerRefreshState.set(this.cacheKey, Math.max(sharedLastUpdate, Number(this.lastUpdate) || 0));
             this.log.debug('Cache hit for data', {
@@ -581,7 +653,8 @@ class M3UEPGAddon {
             movies: this.movies,
             series: this.series,
             epgData: this.epgData,
-            lastUpdate: this.lastUpdate
+            lastUpdate: this.lastUpdate,
+            directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries())
         };
         dataCache.set(cacheKey, entry);
         await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
@@ -855,11 +928,22 @@ class M3UEPGAddon {
     }
     async ensureSeriesTmdbId(seriesId) {
         if (!seriesId) return null;
-        const cacheKey = 'series-tmdb-id:' + String(seriesId);
+        const normalizedSeriesId = String(seriesId);
+        const cacheKey = 'series-tmdb-id:' + normalizedSeriesId;
         const cached = this.seriesInfoCache.get(cacheKey);
         if (cached !== undefined) return cached;
 
-        const pendingKey = 'series-tmdb-id:' + String(seriesId);
+        if (this.providerName === 'xtream') {
+            const persisted = await this.persistentSeriesInfoCache.get(normalizedSeriesId, this.lastUpdate);
+            if (persisted?.fresh) {
+                const tmdbId = persisted.value.tmdbId || null;
+                this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                this.seriesInfoCache.set(cacheKey, tmdbId);
+                return tmdbId;
+            }
+        }
+
+        const pendingKey = 'series-tmdb-id:' + normalizedSeriesId;
         const pending = this.providerInfoInFlight.get(pendingKey);
         if (pending) return pending;
 
@@ -894,39 +978,61 @@ class M3UEPGAddon {
         if (!seriesId) {
             return null;
         }
-        const cached = this.seriesInfoCache.get(seriesId);
+        const normalizedSeriesId = String(seriesId);
+        const cached = this.seriesInfoCache.get(normalizedSeriesId);
         if (cached !== undefined) {
             return cached;
         }
 
-        const pendingKey = 'series-info:' + String(seriesId);
+        const pendingKey = 'series-info:' + normalizedSeriesId;
         const pending = this.providerInfoInFlight.get(pendingKey);
         if (pending) {
             return pending;
         }
 
         const task = (async () => {
+            const persisted = this.providerName === 'xtream'
+                ? await this.persistentSeriesInfoCache.get(normalizedSeriesId, this.lastUpdate)
+                : null;
+            if (persisted?.fresh) {
+                this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                return persisted.value;
+            }
+
             try {
                 const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
                 if (typeof providerModule.fetchSeriesInfo === 'function') {
-                    const info = await providerModule.fetchSeriesInfo(this, seriesId);
-                    // A failed provider request is not a valid empty series.
-                    // Do not cache it, so a later detail open can retry immediately.
+                    const info = await providerModule.fetchSeriesInfo(this, normalizedSeriesId);
+                    // A failed provider request is not a valid empty series. Use a
+                    // saved episode list as fallback, while keeping it due for retry.
                     if (info?.fetchError) {
-                        this.log.warn('Series info request failed; result not cached', {
-                            seriesId: String(seriesId),
+                        this.log.warn('Series info request failed; retaining saved details when available', {
+                            seriesId: normalizedSeriesId,
                             error: String(info.fetchError)
                         });
+                        if (persisted?.value) {
+                            this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                            return persisted.value;
+                        }
                         return info;
                     }
-                    this.seriesInfoCache.set(seriesId, info);
+                    this.seriesInfoCache.set(normalizedSeriesId, info);
+                    if (this.providerName === 'xtream') {
+                        await this.persistentSeriesInfoCache
+                            .set(normalizedSeriesId, info, this.lastUpdate)
+                            .catch(error => this.log.warn('Persistent series detail save failed:', error?.name || 'Error'));
+                    }
                     return info;
                 }
-            } catch (e) {
+            } catch (error) {
+                if (persisted?.value) {
+                    this.seriesInfoCache.set(normalizedSeriesId, persisted.value);
+                    return persisted.value;
+                }
             }
             // Fallback empty structure
             const empty = { videos: [] };
-            this.seriesInfoCache.set(seriesId, empty);
+            this.seriesInfoCache.set(normalizedSeriesId, empty);
             return empty;
         })();
 
@@ -937,6 +1043,64 @@ class M3UEPGAddon {
             if (this.providerInfoInFlight.get(pendingKey) === task) {
                 this.providerInfoInFlight.delete(pendingKey);
             }
+        }
+    }
+
+    async pruneRemovedCatalogState(previous) {
+        const currentMovieIds = new Set(this.movies.map(item => String(item?.id || '')).filter(Boolean));
+        const currentSeriesIds = new Set(this.series.map(item => String(item?.id || '')).filter(Boolean));
+        const currentCatalogIds = new Set([...currentMovieIds, ...currentSeriesIds]);
+        const currentSeriesKeys = new Set(this.series.map(getProviderSeriesKey).filter(Boolean));
+
+        // EPG programme groups are keyed by XMLTV channel ID/name. Drop groups
+        // that belonged to the old channel list only when no current channel uses
+        // that key; clone first so a later rollback still has the original guide.
+        const currentEpgIds = new Set(this.channels.map(item =>
+            String(item?.attributes?.['tvg-id'] || item?.attributes?.['tvg-name'] || '')
+        ).filter(Boolean));
+        const removedEpgIds = new Set((Array.isArray(previous.channels) ? previous.channels : [])
+            .map(item => String(item?.attributes?.['tvg-id'] || item?.attributes?.['tvg-name'] || ''))
+            .filter(id => id && !currentEpgIds.has(id)));
+        const orphanedEpgIds = [...removedEpgIds].filter(id =>
+            Object.prototype.hasOwnProperty.call(this.epgData || {}, id)
+        );
+        if (orphanedEpgIds.length) {
+            this.epgData = { ...(this.epgData || {}) };
+            for (const id of orphanedEpgIds) delete this.epgData[id];
+            this.log.info('Removed orphaned EPG channel groups', { count: orphanedEpgIds.length });
+        }
+
+        // Remove cached cards for vanished titles so they cannot linger in memory
+        // or on disk after an accepted provider deletion.
+        for (const id of this.catalogMetaCache.keys()) {
+            if (!currentCatalogIds.has(String(id))) this.catalogMetaCache.delete(id);
+        }
+        for (const id of this.catalogMetaStaleFallbacks) {
+            if (!currentCatalogIds.has(String(id))) this.catalogMetaStaleFallbacks.delete(id);
+        }
+        try {
+            await this.persistentCatalogMetaCache.retainCatalogItems(currentCatalogIds);
+            await this.persistentCatalogMetaCache.flush();
+        } catch (error) {
+            this.log.warn('Could not prune removed catalogue metadata:', error?.name || 'Error');
+        }
+
+        // Provider refreshes may add or remove episodes for an existing series.
+        // Drop process-local episode details so the next open uses the new listing.
+        const seriesKeysToInvalidate = new Set([
+            ...(Array.isArray(previous.series) ? previous.series : []).map(getProviderSeriesKey),
+            ...this.series.map(getProviderSeriesKey)
+        ].filter(Boolean));
+        for (const seriesKey of seriesKeysToInvalidate) {
+            this.seriesInfoCache.delete(seriesKey);
+            this.seriesInfoCache.delete('series-tmdb-id:' + seriesKey);
+        }
+
+        try {
+            await this.persistentSeriesInfoCache.retainSeries(currentSeriesKeys);
+            await this.persistentSeriesInfoCache.flush();
+        } catch (error) {
+            this.log.warn('Could not prune removed persistent series details:', error?.name || 'Error');
         }
     }
 
@@ -957,28 +1121,37 @@ class M3UEPGAddon {
             movies: this.movies,
             series: this.series,
             epgData: this.epgData,
-            lastUpdate: this.lastUpdate
+            lastUpdate: this.lastUpdate,
+            directSeriesEpisodeIndex: this.directSeriesEpisodeIndex,
+            directSeriesEpisodeById: this.directSeriesEpisodeById
         };
         try {
             const start = Date.now();
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
             await providerModule.fetchData(this);
 
-            // Providers can return a partial success (for example, Xtream live and
-            // VOD endpoints work while get_series fails). Never let an unexpectedly
-            // empty section erase a previously populated section while other sections
-            // make the overall refresh look successful. Preserve ordering and IDs by
-            // retaining the exact last-good array; a truly empty provider section can
-            // still be accepted on first load when no previous data exists.
+            // Small provider-side deletions are normal. Reject only a large share
+            // of removals so a partial/outage response cannot erase a working library.
             for (const section of ['channels', 'movies', 'series']) {
-                const previousItems = previous[section];
-                const currentItems = this[section];
-                if (Array.isArray(previousItems) && previousItems.length > 0 &&
-                    Array.isArray(currentItems) && currentItems.length === 0) {
-                    this[section] = previousItems;
-                    this.log.warn('Provider refresh returned an empty section; retaining last-known-good data', {
+                const stats = getSectionRemovalStats(previous[section], this[section]);
+                if (stats.largeDrop) {
+                    this.log.warn('Provider refresh rejected after an unusually large catalogue reduction', {
                         section,
-                        previousCount: previousItems.length
+                        removedCount: stats.removedCount,
+                        previousCount: stats.previousCount,
+                        currentCount: stats.currentCount,
+                        removedPercent: Number(stats.removedPercent.toFixed(1))
+                    });
+                    throw new Error(
+                        `Provider refresh removed ${stats.removedCount}/${stats.previousCount} ${section} items (${stats.removedPercent.toFixed(1)}%); retaining last-known-good catalogue`
+                    );
+                }
+                if (stats.removedCount > 0) {
+                    this.log.info('Provider catalogue items removed', {
+                        section,
+                        removedCount: stats.removedCount,
+                        previousCount: stats.previousCount,
+                        currentCount: stats.currentCount
                     });
                 }
             }
@@ -1001,17 +1174,23 @@ class M3UEPGAddon {
             const previousHadCatalogue = previous.channels.length + previous.movies.length + previous.series.length > 0;
             const currentHasCatalogue = this.channels.length + this.movies.length + this.series.length > 0;
             if (previousHadCatalogue && !currentHasCatalogue) {
+                this.log.warn('Provider refresh returned an empty catalogue; retaining the previous catalogue');
                 throw new Error('Provider refresh returned an empty catalogue; retaining previous data');
             }
 
             this.lastUpdate = Date.now();
             providerRefreshState.set(this.cacheKey, this.lastUpdate);
+            await this.pruneRemovedCatalogState(previous);
             if (CACHE_ENABLED) await this.saveToCache();
             else {
                 try {
                     await this.persistentAddonDataCache.save({
-                        channels: this.channels, movies: this.movies, series: this.series,
-                        epgData: this.epgData, lastUpdate: this.lastUpdate
+                        channels: this.channels,
+                        movies: this.movies,
+                        series: this.series,
+                        epgData: this.epgData,
+                        lastUpdate: this.lastUpdate,
+                        directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries())
                     });
                 } catch (error) {
                     this.log.warn('Persistent provider data save failed', {
@@ -1037,6 +1216,8 @@ class M3UEPGAddon {
             this.series = previous.series;
             this.epgData = previous.epgData;
             this.lastUpdate = previous.lastUpdate;
+            this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
+            this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
             this.log.error('[UPDATE] Failed; retaining last-known-good data:', e && e.name ? e.name : 'Error');
         }
     }
@@ -1425,7 +1606,29 @@ class M3UEPGAddon {
         runNext();
     }
 
+    isCatalogItemCurrent(id) {
+        return Boolean(
+            findCatalogueItemById(this.movies, id) ||
+            findCatalogueItemById(this.series, id)
+        );
+    }
+
+    async persistCatalogMetaIfCurrent(id, preview) {
+        const key = String(id);
+        if (!this.isCatalogItemCurrent(key)) return false;
+        this.catalogMetaCache.set(key, preview);
+        await this.persistentCatalogMetaCache.set(key, preview);
+        if (!this.isCatalogItemCurrent(key)) {
+            this.catalogMetaCache.delete(key);
+            await this.persistentCatalogMetaCache.delete(key);
+            return false;
+        }
+        return true;
+    }
+
     cacheCatalogMetaPreview(id, preview, persist = true) {
+        // Ignore any lookup that finished after its catalog item was removed.
+        if (!this.isCatalogItemCurrent(id)) return;
         // A fresh metadata result sets its own timestamps in getCatalogMetaAsync.
         // For first-time entries, initialize both clocks; cached entries retain
         // their existing timestamps rather than postponing a due retry on every view.
@@ -1439,7 +1642,12 @@ class M3UEPGAddon {
         };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
-            const write = this.persistentCatalogMetaCache.set(id, preview);
+            const write = this.persistentCatalogMetaCache.set(id, preview).then(async () => {
+                if (!this.isCatalogItemCurrent(id)) {
+                    this.catalogMetaCache.delete(String(id));
+                    await this.persistentCatalogMetaCache.delete(id);
+                }
+            });
             this.catalogMetaPersistWrites.add(write);
             write.catch(error => {
                 this.log.warn('Persistent catalogue metadata cache write failed:', error?.name || 'Error');
@@ -1660,13 +1868,14 @@ class M3UEPGAddon {
 
     async getCatalogMetaAsync(id, type) {
         const key = String(id || '');
-        if (!key) return null;
+        if (!key || !this.isCatalogItemCurrent(key)) return null;
         const cached = this.catalogMetaCache.get(key);
         if (cached !== undefined) {
             // An LRU hit must not keep popular titles permanently exempt from the
             // 14-day metadata refresh. If persistent storage is disabled/unavailable,
             // make the same due decision from the in-memory preview instead.
             const persisted = await this.persistentCatalogMetaCache.get(key);
+            if (!this.isCatalogItemCurrent(key)) return null;
             const refreshInterval = parsePositiveInteger(
                 process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
@@ -1683,10 +1892,14 @@ class M3UEPGAddon {
             // Due entries fall through to the shared in-flight refresh below.
         }
         const pending = this.catalogMetaInFlight.get(key);
-        if (pending) return pending;
+        if (pending) {
+            const result = await pending;
+            return this.isCatalogItemCurrent(key) ? result : null;
+        }
 
         const task = (async () => {
             const persisted = await this.persistentCatalogMetaCache.get(key);
+            if (!this.isCatalogItemCurrent(key)) return null;
             const isUsablePreview = value => {
                 if (!value || typeof value !== 'object' || !String(value.name || '').trim()) return false;
                 // Older/partial previews must not suppress the normal metadata lookup.
@@ -1718,7 +1931,11 @@ class M3UEPGAddon {
                 this.catalogMetaCache.set(key, persisted.value);
                 return persisted.value;
             }
-            const refreshed = await this._getCatalogMetaAsync(id, type, omdbMetadataNeedsRefresh(persisted?.value) || catalogMetadataNeedsRefresh(persisted?.value));
+            const refreshed = await this._getCatalogMetaAsync(
+                id, type,
+                omdbMetadataNeedsRefresh(persisted?.value) || catalogMetadataNeedsRefresh(persisted?.value)
+            );
+            if (!this.isCatalogItemCurrent(key)) return null;
             if (refreshed) {
                 // Merge field-by-field so a partial successful upstream refresh cannot
                 // erase useful metadata from the last saved preview. Fresh values win;
@@ -1742,9 +1959,7 @@ class M3UEPGAddon {
                     ? (refreshed.metadataCheckedAt || Date.now())
                     : (Number(previous.metadataCheckedAt) || Number(persisted.savedAt) || Date.now());
                 merged.missingMetadataCheckedAt = Date.now();
-                this.catalogMetaCache.set(key, merged);
-                await this.persistentCatalogMetaCache.set(key, merged);
-                return merged;
+                return await this.persistCatalogMetaIfCurrent(key, merged) ? merged : null;
             }
             if (persisted?.value && isUsablePreview(persisted.value)) {
                 // A failed/empty upstream refresh is still an attempt. Persist its
@@ -1754,8 +1969,8 @@ class M3UEPGAddon {
                     ...persisted.value,
                     missingMetadataCheckedAt: Date.now()
                 };
-                this.catalogMetaCache.set(key, retained);
-                await this.persistentCatalogMetaCache.set(key, retained);
+                const saved = await this.persistCatalogMetaIfCurrent(key, retained);
+                if (!saved || !this.isCatalogItemCurrent(key)) return null;
                 this.catalogMetaStaleFallbacks.add(key);
                 return retained;
             }
@@ -1763,7 +1978,8 @@ class M3UEPGAddon {
         })();
         this.catalogMetaInFlight.set(key, task);
         try {
-            return await task;
+            const result = await task;
+            return this.isCatalogItemCurrent(key) ? result : null;
         } finally {
             if (this.catalogMetaInFlight.get(key) === task) {
                 this.catalogMetaInFlight.delete(key);
