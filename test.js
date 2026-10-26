@@ -121,6 +121,7 @@ function testSearchNormalisationIgnoresPunctuationAndExtraWhitespace() {
     assert.strictEqual(normalizeSearchText("Spider—Man: Brand New Day"), "spider man brand new day");
     assert.strictEqual(normalizeSearchText("Café"), normalizeSearchText("CAFÉ"));
     assert.strictEqual(normalizeSearchText("Amélie"), "amelie");
+    assert.strictEqual(normalizeSearchText("It's Time"), normalizeSearchText("Its Time"));
     assert.strictEqual(normalizeSearchText("   ---   "), "");
 }
 
@@ -131,12 +132,12 @@ function testSearchSupportsReorderedWordsAndPartialTyping() {
     assert.strictEqual(matchesSearchText("man man", "Spider-Man"), false);
 }
 
-function testNormalizedSearchMatcherPreservesSearchBehaviour() {
+function testNormalizedSearchMatcherAgreesWithPublicMatcher() {
     const normalize = normalizeSearchText;
     const cases = [
         ["man spider", "Spider-Man: Brand New Day", true],
         ["spid man", "Spider-Man", true],
-        ["spidr man", "Spider-Man", true],
+        ["spidr man", "Spider-Man", false],
         ["spxxr man", "Spider-Man", false],
         ["man man", "Spider-Man", false],
         ["", "Spider-Man", false]
@@ -151,8 +152,8 @@ function testNormalizedSearchMatcherPreservesSearchBehaviour() {
     }
 }
 
-function testSearchAllowsConservativeSingleCharacterTypos() {
-    assert.strictEqual(matchesSearchText("spidr man", "Spider-Man"), true);
+function testSearchRejectsTypoOnlyMatches() {
+    assert.strictEqual(matchesSearchText("spidr man", "Spider-Man"), false);
     assert.strictEqual(matchesSearchText("Amelie", "Amélie"), true);
     assert.strictEqual(matchesSearchText("spxxr man", "Spider-Man"), false);
     assert.strictEqual(matchesSearchText("spi", "Spider-Man"), true);
@@ -922,8 +923,8 @@ async function main() {
         testXtreamTmdbIdNormalization,
         testSearchNormalisationIgnoresPunctuationAndExtraWhitespace,
         testSearchSupportsReorderedWordsAndPartialTyping,
-        testNormalizedSearchMatcherPreservesSearchBehaviour,
-        testSearchAllowsConservativeSingleCharacterTypos,
+        testNormalizedSearchMatcherAgreesWithPublicMatcher,
+        testSearchRejectsTypoOnlyMatches,
         testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
         // Run performance regression tests before the known baseline metadata assertion failure.
         testScheduledProgramsCacheParsedTimestamps,

@@ -231,24 +231,24 @@ function matchesGenre(category, selectedGenre) {
 
 /**
  * Normalise catalogue search text without changing the displayed title.
- * Unicode punctuation/symbols become spaces, and repeated whitespace collapses,
- * making hyphenated and unhyphenated title variants equivalent.
+ * Apostrophes are ignored, while other punctuation/symbols become spaces.
+ * This makes "it's" and "its", and hyphenated/unhyphenated titles, equivalent.
  */
 function normalizeSearchText(value) {
     return String(value ?? '')
         .normalize('NFKD')
         .replace(/\p{M}+/gu, '')
         .toLowerCase()
+        .replace(/['’‘ʼ]/gu, '')
         .replace(/[\p{P}\p{S}]+/gu, ' ')
         .replace(/\s+/g, ' ')
         .trim();
 }
 
 /**
- * Return true when every query word can be matched to a distinct title word.
- * Exact phrase matching remains the fast path; token matching also supports
- * reordered words, partial words while typing, and a single-character typo
- * in words of at least five characters.
+ * Score a title match for relevance. Exact titles and phrase/whole-word matches
+ * rank above partial-token and in-word substring matches. Query tokens may
+ * still appear in any order, but typo-only matches are intentionally excluded.
  */
 // Search normalization is repeated for every catalogue item and every query.
 // Keep a bounded cache so large libraries avoid re-normalizing the same titles.
@@ -330,67 +330,59 @@ function matchesSearchText(query, title) {
     );
 }
 
-function createNormalizedSearchMatcher(q) {
-    if (!q) return () => false;
+function allQueryWordsMatch(queryWords, titleWords, allowPrefix) {
+    if (!queryWords.length || queryWords.length > titleWords.length) return false;
+    const orderedQueryWords = [...queryWords].sort((a, b) => b.length - a.length);
+    const used = new Set();
 
-    // Query tokenization and ordering are independent of the title, so compile
-    // them once per search request rather than once per catalogue item.
-    const words = q.split(' ').filter(Boolean).sort((a, b) => b.length - a.length);
-    return function matchNormalizedTitle(text, preparedTitleWords) {
-        if (!text) return false;
-        if (text.includes(q)) return true;
+    function assign(index) {
+        if (index >= orderedQueryWords.length) return true;
+        const queryWord = orderedQueryWords[index];
+        for (let i = 0; i < titleWords.length; i++) {
+            if (used.has(i)) continue;
+            const titleWord = titleWords[i];
+            if (allowPrefix ? !titleWord.startsWith(queryWord) : titleWord !== queryWord) continue;
+            used.add(i);
+            if (assign(index + 1)) return true;
+            used.delete(i);
+        }
+        return false;
+    }
+
+    return assign(0);
+}
+
+function createNormalizedSearchScorer(q) {
+    if (!q) return () => 0;
+    const queryWords = q.split(' ').filter(Boolean);
+
+    return function scoreNormalizedTitle(text, preparedTitleWords) {
+        if (!text) return 0;
+        if (text === q) return 1000;
+        if (text.startsWith(q + ' ')) return 900;
+
+        // Boundaries are spaces because normalization converts other punctuation
+        // into spaces. This gives whole-word phrases priority over substrings such
+        // as "time" inside "lifetime".
+        if ((' ' + text + ' ').includes(' ' + q + ' ')) return 800;
 
         const titleWords = preparedTitleWords || text.split(' ').filter(Boolean);
-        if (!words.length || words.length > titleWords.length) return false;
-        const used = new Set();
+        if (allQueryWordsMatch(queryWords, titleWords, false)) return 700;
+        if (allQueryWordsMatch(queryWords, titleWords, true)) return 600;
 
-        function matchesWord(queryWord, titleWord) {
-            if (titleWord.startsWith(queryWord)) return true;
-            if (queryWord.length < 5 || titleWord.length < 5) return false;
-            return editDistanceAtMostOne(queryWord, titleWord);
-        }
-
-        function assign(index) {
-            if (index >= words.length) return true;
-            const word = words[index];
-            for (let i = 0; i < titleWords.length; i++) {
-                if (used.has(i) || !matchesWord(word, titleWords[i])) continue;
-                used.add(i);
-                if (assign(index + 1)) return true;
-                used.delete(i);
-            }
-            return false;
-        }
-
-        return assign(0);
+        // Keep substring matching as a last-resort recall tier, below whole words.
+        if (text.includes(q)) return 300;
+        return 0;
     };
+}
+
+function createNormalizedSearchMatcher(q) {
+    const score = createNormalizedSearchScorer(q);
+    return (text, preparedTitleWords) => score(text, preparedTitleWords) > 0;
 }
 
 function matchesNormalizedSearchText(q, text) {
     return createNormalizedSearchMatcher(q)(text);
-}
-
-function editDistanceAtMostOne(a, b) {
-    if (Math.abs(a.length - b.length) > 1) return false;
-    let i = 0;
-    let j = 0;
-    let edits = 0;
-    while (i < a.length && j < b.length) {
-        if (a[i] === b[j]) {
-            i++;
-            j++;
-            continue;
-        }
-        if (++edits > 1) return false;
-        if (a.length > b.length) i++;
-        else if (b.length > a.length) j++;
-        else {
-            i++;
-            j++;
-        }
-    }
-    if (i < a.length || j < b.length) edits++;
-    return edits <= 1;
 }
 
 const DEBUG_ENV = isDebugEnabled();
@@ -2522,19 +2514,23 @@ async function createAddon(config) {
                         return matchesGenre(cat, selectedGenre);
                     });
                 }
-                // Keep normalized titles indexed per immutable catalogue array. This
-                // avoids repeatedly normalizing thousands of titles on every search,
-                // without changing matching rules, result order, or displayed titles.
+                // Reuse normalized titles from the per-catalogue index, then rank
+                // matching cards before pagination so the best results appear first.
                 if (!queryCacheHit && normalizedSearchQuery) {
                     const searchIndexResult = getCatalogueSearchIndex(items);
                     const searchIndex = searchIndexResult.index;
-                    const matcher = createNormalizedSearchMatcher(normalizedSearchQuery);
-                    filtered = filtered.filter(i => {
-                        const indexedTitle = searchIndex.get(i);
-                        return indexedTitle
-                            ? matcher(indexedTitle.text, indexedTitle.words)
-                            : matcher(getNormalizedSearchText(i.name));
-                    });
+                    const scoreTitle = createNormalizedSearchScorer(normalizedSearchQuery);
+                    filtered = filtered
+                        .map((item, originalPosition) => {
+                            const indexedTitle = searchIndex.get(item);
+                            const score = indexedTitle
+                                ? scoreTitle(indexedTitle.text, indexedTitle.words)
+                                : scoreTitle(getNormalizedSearchText(item.name));
+                            return { item, originalPosition, score };
+                        })
+                        .filter(match => match.score > 0)
+                        .sort((a, b) => b.score - a.score || a.originalPosition - b.originalPosition)
+                        .map(match => match.item);
                 }
 
                 if (queryResultCache && !queryCacheHit) {
