@@ -300,9 +300,19 @@ async function fetchMovieInfo(addonInstance, streamId) {
   }
 }
 
-async function fetchSeriesTmdbId(addonInstance, seriesId) {
+async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
   const { config } = addonInstance;
-  if (!seriesId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
+  const report = details => {
+    if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details);
+  };
+  if (!seriesId) {
+    report({ reason: "provider_series_id_missing", source: "xtream_get_series_info" });
+    return null;
+  }
+  if (!config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) {
+    report({ reason: "provider_credentials_missing", source: "xtream_get_series_info" });
+    return null;
+  }
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   try {
     // Discover only needs the series TMDb ID. Avoid constructing and sorting every
@@ -311,11 +321,50 @@ async function fetchSeriesTmdbId(addonInstance, seriesId) {
       `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
       { timeout: 25000 },
     );
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const info = payload?.info && typeof payload.info === "object" ? payload.info : {};
-    return normalizeTmdbId(info.tmdb || info.tmdb_id || payload?.tmdb || payload?.tmdb_id);
-  } catch {
+    if (!response.ok) {
+      if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+      report({
+        reason: "provider_http_error",
+        source: "xtream_get_series_info",
+        httpStatus: response.status
+      });
+      return null;
+    }
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      report({
+        reason: "provider_invalid_json",
+        source: "xtream_get_series_info",
+        errorName: error && error.name ? error.name : "SyntaxError"
+      });
+      return null;
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      report({ reason: "provider_invalid_response", source: "xtream_get_series_info" });
+      return null;
+    }
+    const info = payload.info && typeof payload.info === "object" ? payload.info : {};
+    const rawTmdbId = info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id || null;
+    const tmdbId = normalizeTmdbId(rawTmdbId);
+    report({
+      reason: tmdbId
+        ? "provider_tmdb_id_found"
+        : rawTmdbId ? "provider_tmdb_id_invalid" : "provider_tmdb_id_missing",
+      source: "xtream_get_series_info"
+    });
+    return tmdbId;
+  } catch (error) {
+    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+      ? error.code
+      : undefined;
+    report({
+      reason: "provider_request_error",
+      source: "xtream_get_series_info",
+      errorName: error && error.name ? error.name : "Error",
+      ...(errorCode ? { errorCode } : {})
+    });
     return null;
   }
 }

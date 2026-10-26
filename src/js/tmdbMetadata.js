@@ -64,25 +64,45 @@ function tmdbConfigured() {
 
 const TMDB_DEBUG = isDebugEnabled();
 
+function recordLookupDiagnostic(target, details) {
+  if (target && typeof target === "object" && details && typeof details === "object") {
+    Object.assign(target, details);
+  }
+}
+
 function logRequestDebug(event, details) {
   if (TMDB_DEBUG) logAt("debug", "[DEBUG] TMDb request", { event, ...details });
 }
 
-async function request(path, { refresh = false } = {}) {
-  if (!tmdbConfigured()) return null;
+async function request(path, { refresh = false, diagnostics = null } = {}) {
+  if (!tmdbConfigured()) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured" });
+    return null;
+  }
   const cacheKey = "tmdb:" + path;
   const cached = cache.get(cacheKey);
   if (!refresh && cached !== undefined) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_cached_response", source: "memory_cache" });
     logRequestDebug("cache-hit", { path, ms: 0 });
     return cached;
   }
   if (!refresh && negativeCache.has(cacheKey)) {
+    recordLookupDiagnostic(diagnostics, {
+      reason: "tmdb_not_found",
+      source: "negative_cache",
+      httpStatus: 404
+    });
     logRequestDebug("negative-cache-hit", { path, ms: 0 });
     return null;
   }
   if (pending.has(cacheKey)) {
     logRequestDebug("in-flight-join", { path });
-    return pending.get(cacheKey);
+    const result = await pending.get(cacheKey);
+    recordLookupDiagnostic(diagnostics, {
+      reason: result ? "tmdb_response_received" : "tmdb_lookup_failed",
+      source: "in_flight"
+    });
+    return result;
   }
 
   const task = (async () => {
@@ -91,13 +111,13 @@ async function request(path, { refresh = false } = {}) {
     try {
       const separator = path.includes("?") ? "&" : "?";
       const url = TMDB_API_BASE + path + separator + "api_key=" + encodeURIComponent(TMDB_API_KEY);
-      const diagnostics = {};
+      const requestDiagnostics = {};
       const response = await safeFetch(url, {
         timeout: 12000,
         // Opt in only for TMDb requests. safeFetch still resolves and validates
         // DNS for every request before selecting an agent pinned to those addresses.
         reuseConnection: true,
-        diagnostics,
+        diagnostics: requestDiagnostics,
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" },
       });
       status = response.status;
@@ -109,6 +129,10 @@ async function request(path, { refresh = false } = {}) {
           response.body.destroy();
         }
         if (response.status === 404) negativeCache.set(cacheKey, true);
+        recordLookupDiagnostic(diagnostics, {
+          reason: response.status === 404 ? "tmdb_not_found" : "tmdb_http_error",
+          httpStatus: response.status
+        });
         logRequestDebug("http-miss", { path, status, ms: Date.now() - startedAt });
         return null;
       }
@@ -118,23 +142,49 @@ async function request(path, { refresh = false } = {}) {
       const responseText = await response.text();
       const bodyMs = Date.now() - bodyStartedAt;
       const parseStartedAt = Date.now();
-      const data = JSON.parse(responseText);
+      let data;
+      try {
+        data = JSON.parse(responseText);
+      } catch (error) {
+        recordLookupDiagnostic(diagnostics, {
+          reason: "tmdb_invalid_json",
+          httpStatus: status,
+          errorName: error && error.name ? error.name : "SyntaxError"
+        });
+        logRequestDebug("invalid-json", { path, status, ms: Date.now() - startedAt });
+        return null;
+      }
       const parseMs = Date.now() - parseStartedAt;
       if (!data || typeof data !== "object" || Array.isArray(data)) {
+        recordLookupDiagnostic(diagnostics, { reason: "tmdb_invalid_response", httpStatus: status });
         logRequestDebug("invalid-response", { path, status, ms: Date.now() - startedAt });
         return null;
       }
       cache.set(cacheKey, data);
+      recordLookupDiagnostic(diagnostics, {
+        reason: "tmdb_response_received",
+        source: "api",
+        httpStatus: status
+      });
       logRequestDebug("fetched", {
         path, status, ms: Date.now() - startedAt,
-        dnsMs: diagnostics.dnsMs ?? null,
-        headersMs: diagnostics.headersMs ?? null,
+        dnsMs: requestDiagnostics.dnsMs ?? null,
+        headersMs: requestDiagnostics.headersMs ?? null,
         bodyMs,
         parseMs,
-        freeSocketsBeforeRequest: diagnostics.freeSocketsBeforeRequest ?? null,
+        freeSocketsBeforeRequest: requestDiagnostics.freeSocketsBeforeRequest ?? null,
       });
       return data;
     } catch (error) {
+      const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+        ? error.code
+        : undefined;
+      recordLookupDiagnostic(diagnostics, {
+        reason: "tmdb_request_error",
+        ...(status ? { httpStatus: status } : {}),
+        errorName: error && error.name ? error.name : "Error",
+        ...(errorCode ? { errorCode } : {})
+      });
       logRequestDebug("request-error", {
         path,
         status,
@@ -268,12 +318,36 @@ async function getMovieCatalogMetadata(tmdbId, options = {}) {
 }
 
 async function getSeriesCatalogMetadata(tmdbId, options = {}) {
+  const diagnostics = options?.diagnostics;
   const id = validTmdbId(tmdbId);
-  if (!id) return null;
+  if (!id) {
+    recordLookupDiagnostic(diagnostics, {
+      reason: tmdbId == null || String(tmdbId).trim() === ""
+        ? "tmdb_id_missing"
+        : "tmdb_id_invalid"
+    });
+    return null;
+  }
+  if (!tmdbConfigured()) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured", tmdbId: id });
+    return null;
+  }
   // Append images alongside aggregate credits so Discover receives the
   // transparent title logo without an extra request for each series.
   const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null", options);
-  return mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
+  const metadata = mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
+  if (metadata) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_match_found", tmdbId: id });
+  } else if (
+    diagnostics &&
+    ["tmdb_response_received", "tmdb_cached_response"].includes(diagnostics.reason)
+  ) {
+    recordLookupDiagnostic(diagnostics, {
+      reason: "tmdb_response_missing_series_name",
+      tmdbId: id
+    });
+  }
+  return metadata;
 }
 
 async function getMovieMetadata(tmdbId) {
