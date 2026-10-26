@@ -8,11 +8,16 @@ const cache = new LRUCache({ max: parsePositiveInteger(process.env.OMDB_CACHE_MA
 const pending = new Map();
 const retryableFailures = new Map();
 const DAILY_REQUEST_LIMIT = parsePositiveInteger(process.env.OMDB_DAILY_REQUEST_LIMIT, 100000, 1, 100000);
+const DAILY_RESERVATION_BLOCK_SIZE = parsePositiveInteger(
+  process.env.OMDB_DAILY_RESERVATION_BLOCK_SIZE, 25, 1, 1000
+);
 const DATA_DIR = process.env.PERSISTENT_DATA_DIR || path.join(process.cwd(), "data");
 const USAGE_FILE = path.join(DATA_DIR, "omdb-usage.json");
 let usageState = null;
 let usageLoadPromise = null;
 let usageWriteQueue = Promise.resolve();
+let reservedRequestsRemaining = 0;
+let usageReservationPromise = null;
 const diagnostics = {
   apiKeyConfigured: Boolean(API_KEY),
   attempts: 0,
@@ -61,24 +66,47 @@ async function reserveDailyRequest() {
   if (state.day !== today) {
     state.day = today;
     state.count = 0;
+    reservedRequestsRemaining = 0;
+  }
+  if (reservedRequestsRemaining > 0) {
+    reservedRequestsRemaining--;
+    return true;
   }
   if (state.count >= DAILY_REQUEST_LIMIT) return false;
-  state.count++;
-  const snapshot = { day: state.day, count: state.count };
-  let persisted = true;
-  // Recover the queue after a previous write error, then retry this latest
-  // snapshot. Never spend an OMDb request if the daily budget cannot be saved:
-  // a restart must not reset the guard and accidentally exceed the daily limit.
-  usageWriteQueue = usageWriteQueue.catch(() => {}).then(async () => {
-    await fs.promises.mkdir(DATA_DIR, { recursive: true });
-    const temp = USAGE_FILE + ".tmp";
-    await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
-    await fs.promises.rename(temp, USAGE_FILE);
-  }).catch(() => {
-    persisted = false;
-  });
-  await usageWriteQueue;
-  return persisted;
+  if (usageReservationPromise) {
+    const reserved = await usageReservationPromise;
+    return reserved ? reserveDailyRequest() : false;
+  }
+
+  const reservation = (async () => {
+    const grant = Math.min(DAILY_RESERVATION_BLOCK_SIZE, DAILY_REQUEST_LIMIT - state.count);
+    if (grant <= 0) return false;
+    const snapshot = { day: state.day, count: state.count + grant };
+    let persisted = true;
+    // Persist the budget block before using any of it. If the process stops, the
+    // unused slots are conservatively counted, so a restart cannot exceed quota.
+    usageWriteQueue = usageWriteQueue.catch(() => {}).then(async () => {
+      await fs.promises.mkdir(DATA_DIR, { recursive: true });
+      const temp = USAGE_FILE + "." + process.pid + ".tmp";
+      await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
+      await fs.promises.rename(temp, USAGE_FILE);
+    }).catch(() => {
+      persisted = false;
+    });
+    await usageWriteQueue;
+    if (!persisted) return false;
+    state.count = snapshot.count;
+    reservedRequestsRemaining = grant;
+    return true;
+  })();
+  usageReservationPromise = reservation;
+  let reserved;
+  try {
+    reserved = await reservation;
+  } finally {
+    if (usageReservationPromise === reservation) usageReservationPromise = null;
+  }
+  return reserved ? reserveDailyRequest() : false;
 }
 
 function parsePositiveInteger(value, fallback, min, max) {

@@ -5,7 +5,6 @@ require('dotenv').config({ quiet: true });
 const { getRouter } = require("stremio-addon-sdk");
 const express = require("express");
 const path = require("path");
-const crypto = require("crypto");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
 const { isDebugEnabled, logAt } = require("./logger");
@@ -18,9 +17,6 @@ function dlog(...args) {
   logAt("debug", "[DEBUG]", ...args);
 }
 
-const CACHE_ENABLED =
-  (process.env.CACHE_ENABLED || "true").toLowerCase() !== "false";
-
 const parsePositiveInteger = (value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isSafeInteger(parsed) && parsed >= min
@@ -28,15 +24,30 @@ const parsePositiveInteger = (value, fallback, min = 1, max = Number.MAX_SAFE_IN
     : fallback;
 };
 
+// Interfaces own scheduled refresh jobs; retain them until memory pressure evicts
+// them, while the provider-data cache continues to use CACHE_TTL_MS.
 const INTERFACE_TTL_MS = parsePositiveInteger(
-  process.env.CACHE_TTL_MS,
-  6 * 3600 * 1000,
-  1000,
+  process.env.INTERFACE_CACHE_TTL_MS,
+  0,
+  0,
   30 * 24 * 3600 * 1000,
 );
+const INTERFACE_CACHE_MAX_BYTES = parsePositiveInteger(
+  process.env.INTERFACE_CACHE_MAX_BYTES,
+  256 * 1024 * 1024,
+  16 * 1024 * 1024,
+  4 * 1024 * 1024 * 1024,
+);
 const interfaceCache = new LRUCache({
-  max: parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500),
+  max: parsePositiveInteger(process.env.MAX_INTERFACE_CACHE_ENTRIES, 3, 1, 100),
   ttl: INTERFACE_TTL_MS,
+  maxWeight: INTERFACE_CACHE_MAX_BYTES,
+  sizeOf: (iface) => iface && Number.isFinite(iface.__cacheWeight) ? iface.__cacheWeight : 1,
+  onEvict: (iface) => {
+    createAddon.disposeAddonInterface(iface).catch((error) => {
+      logAt("warn", "[CACHE] Could not dispose an evicted addon interface:", error?.name || "Error");
+    });
+  },
 });
 const MAX_ACTIVE_INTERFACE_BUILDS = parsePositiveInteger(
   process.env.MAX_ACTIVE_INTERFACE_BUILDS,
@@ -637,10 +648,10 @@ app.use("/:token", async (req, res, next) => {
   }
   if (DEBUG && config.debug !== false) config.debug = true;
 
-  const ifaceKey =
-    "iface:" + crypto.createHash("sha256").update(token).digest("hex");
+  const ifaceKey = createAddon.createInterfaceKey(config);
 
-  let iface = CACHE_ENABLED ? interfaceCache.get(ifaceKey) : null;
+  let iface = interfaceCache.get(ifaceKey);
+  let acquired = false;
   if (!iface) {
     if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
       res.setHeader("Retry-After", "5");
@@ -650,8 +661,20 @@ app.use("/:token", async (req, res, next) => {
     try {
       dlog("Building addon interface (cache miss)");
       iface = await createAddon(config);
-      if (CACHE_ENABLED) interfaceCache.set(ifaceKey, iface);
+      acquired = createAddon.acquireAddonInterface(iface);
+      // The same config may have been evicted while another request awaited this
+      // build. createAddon waits for its old instance to flush before rebuilding.
+      if (!acquired) {
+        iface = await createAddon(config);
+        acquired = createAddon.acquireAddonInterface(iface);
+      }
+      if (!acquired) {
+        res.setHeader("Retry-After", "1");
+        return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
+      }
+      interfaceCache.set(ifaceKey, iface);
     } catch (e) {
+      if (acquired) createAddon.releaseAddonInterface(iface);
       // Provider errors can include request URLs; don't log them with credentials.
       console.error("[SERVER] Addon build failed:", e && e.name ? e.name : "Error");
       return res.status(500).json({ error: "Addon build error" });
@@ -659,8 +682,21 @@ app.use("/:token", async (req, res, next) => {
       activeInterfaceBuilds = Math.max(0, activeInterfaceBuilds - 1);
     }
   } else {
+    acquired = createAddon.acquireAddonInterface(iface);
   }
 
+  if (!acquired) {
+    res.setHeader("Retry-After", "1");
+    return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
+  }
+  let released = false;
+  const releaseInterface = () => {
+    if (released) return;
+    released = true;
+    createAddon.releaseAddonInterface(iface);
+  };
+  res.once("finish", releaseInterface);
+  res.once("close", releaseInterface);
   req.addonInterface = iface;
   req.configToken = token;
   next();
@@ -832,6 +868,35 @@ app.use((error, req, res, next) => {
 });
 
 const port = process.env.PORT || 7000;
-app.listen(port, () => {
+const server = app.listen(port, () => {
   logAt("info", `🚀 Server running on port ${port} (debug=${DEBUG}, prefetch=${PREFETCH_ENABLED})`);
 });
+
+let shutdownPromise = null;
+async function shutdown(signal) {
+  if (shutdownPromise) return shutdownPromise;
+  logAt("info", `[SHUTDOWN] ${signal} received; flushing persistent caches`);
+  const closePromise = new Promise((resolve) => server.close(resolve));
+  const forceCloseTimer = setTimeout(() => {
+    if (typeof server.closeAllConnections === "function") server.closeAllConnections();
+  }, 15000);
+  if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
+
+  shutdownPromise = (async () => {
+    await closePromise;
+    const interfaces = interfaceCache.entries().map(([, iface]) => iface);
+    await Promise.allSettled(interfaces.map((iface) => createAddon.disposeAddonInterface(iface)));
+    await createAddon.flushAddonDisposals();
+    interfaceCache.clear();
+    await createAddon.closeRedisClient();
+    await closePromise;
+    clearTimeout(forceCloseTimer);
+    logAt("info", "[SHUTDOWN] Persistent caches flushed");
+  })().catch((error) => {
+    logAt("error", "[SHUTDOWN] Could not finish graceful shutdown:", error?.name || "Error");
+  });
+  return shutdownPromise;
+}
+
+process.once("SIGTERM", () => { shutdown("SIGTERM"); });
+process.once("SIGINT", () => { shutdown("SIGINT"); });

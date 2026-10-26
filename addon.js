@@ -10,6 +10,7 @@ const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const PersistentAddonDataCache = require("./persistentAddonDataCache");
 const PersistentSeriesInfoCache = require("./persistentSeriesInfoCache");
+const cleanupPersistentCacheFiles = require("./persistentCacheMaintenance");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
 
@@ -408,7 +409,8 @@ function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_IN
         : fallback;
 }
 const CACHE_TTL_MS = parsePositiveInteger(process.env.CACHE_TTL_MS, 6 * 3600 * 1000, 1000, 30 * 24 * 3600 * 1000);
-const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 100, 1, 500);
+const MAX_CACHE_ENTRIES = parsePositiveInteger(process.env.MAX_CACHE_ENTRIES, 10, 1, 500);
+const CACHE_MEMORY_MAX_BYTES = parsePositiveInteger(process.env.CACHE_MEMORY_MAX_BYTES, 256 * 1024 * 1024, 16 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
 const PROVIDER_REMOVAL_GUARD_MIN_ITEMS = parsePositiveInteger(
     process.env.PROVIDER_REMOVAL_GUARD_MIN_ITEMS, 10, 1, 1000000
 );
@@ -465,8 +467,29 @@ async function mapWithConcurrency(items, concurrency, mapper) {
     return results;
 }
 
-const dataCache = new LRUCache({ max: MAX_CACHE_ENTRIES, ttl: CACHE_TTL_MS });
+function estimateProviderCacheBytes(entry) {
+    if (!entry || typeof entry !== 'object') return 1;
+    const catalogueCount = ['channels', 'movies', 'series'].reduce(
+        (total, key) => total + (Array.isArray(entry[key]) ? entry[key].length : 0), 0
+    );
+    const epgProgrammeCount = Object.values(entry.epgData || {}).reduce(
+        (total, programmes) => total + (Array.isArray(programmes) ? programmes.length : 0), 0
+    );
+    const directEpisodeCount = Object.values(entry.directSeriesEpisodes || {}).reduce(
+        (total, episodes) => total + (Array.isArray(episodes) ? episodes.length : 0), 0
+    );
+    return 2 * 1024 * 1024 + catalogueCount * 1200 + epgProgrammeCount * 320 + directEpisodeCount * 600;
+}
+
+const dataCache = new LRUCache({
+    max: MAX_CACHE_ENTRIES,
+    ttl: CACHE_TTL_MS,
+    maxWeight: CACHE_MEMORY_MAX_BYTES,
+    sizeOf: estimateProviderCacheBytes
+});
 const buildPromiseCache = new Map();
+const addonInterfaceInstances = new WeakMap();
+const addonDisposals = new Map();
 
 // Multiple configuration tokens can create separate addon instances for the same
 // provider account. Keep refresh timestamps and scheduled jobs shared by provider
@@ -522,6 +545,12 @@ function createCacheKey(config) {
     return crypto.createHash('sha256').update(stableStringify(minimal)).digest('hex');
 }
 
+function createInterfaceKey(config) {
+    // Debug verbosity changes logging only. Equivalent provider configurations
+    // must share one addon instance and one persistent-cache writer.
+    return createCacheKey(config);
+}
+
 class M3UEPGAddon {
     constructor(config = {}, manifestRef) {
         if (!config.provider) {
@@ -531,6 +560,12 @@ class M3UEPGAddon {
         this.config = config;
         this.manifestRef = manifestRef;
         this.cacheKey = createCacheKey(config);
+        this.disposed = false;
+        this.disposePromise = null;
+        this.activeRequestCount = 0;
+        this.activeRequestDrainPromise = null;
+        this.activeRequestDrainResolve = null;
+        this.pendingRemovalCandidates = {};
         this.persistentAddonDataCache = new PersistentAddonDataCache(this.cacheKey);
         this.persistentSeriesInfoCache = new PersistentSeriesInfoCache(this.cacheKey);
         this.updateInterval = parsePositiveInteger(process.env.DATA_REFRESH_INTERVAL_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
@@ -618,6 +653,77 @@ class M3UEPGAddon {
         });
     }
 
+    estimateMemoryBytes() {
+        const catalogueCount = this.channels.length + this.movies.length + this.series.length;
+        const epgProgrammeCount = Object.values(this.epgData || {}).reduce(
+            (total, programmes) => total + (Array.isArray(programmes) ? programmes.length : 0), 0
+        );
+        const directEpisodeCount = this.directSeriesEpisodeById.size;
+        const seriesDetailVideoCount = this.persistentSeriesInfoCache.entries.size
+            ? [...this.persistentSeriesInfoCache.entries.values()].reduce(
+                (total, entry) => total + (entry.value?.videos?.length || 0), 0
+            )
+            : 0;
+        // The Xtream detail map is lazy-loaded after interface construction. Reserve
+        // a conservative allowance for its configured entry capacity in advance.
+        const seriesDetailVideoCapacity = this.providerName === 'xtream'
+            ? this.persistentSeriesInfoCache.maxEntries * 10
+            : 0;
+        const metadataCapacity = Math.max(
+            this.persistentCatalogMetaCache.entries.size,
+            this.movies.length + this.series.length
+        );
+        return 4 * 1024 * 1024 +
+            metadataCapacity * 3000 +
+            catalogueCount * 1200 + epgProgrammeCount * 320 +
+            directEpisodeCount * 600 + Math.max(seriesDetailVideoCount, seriesDetailVideoCapacity) * 500;
+    }
+
+    acquireRequest() {
+        if (this.disposed) return false;
+        this.activeRequestCount++;
+        return true;
+    }
+
+    releaseRequest() {
+        this.activeRequestCount = Math.max(0, this.activeRequestCount - 1);
+        if (this.disposed && this.activeRequestCount === 0 && this.activeRequestDrainResolve) {
+            this.activeRequestDrainResolve();
+            this.activeRequestDrainResolve = null;
+            this.activeRequestDrainPromise = null;
+        }
+    }
+
+    async dispose() {
+        if (this.disposePromise) return this.disposePromise;
+        this.disposed = true;
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+        this.disposePromise = (async () => {
+            if (this.activeRequestCount > 0) {
+                this.activeRequestDrainPromise = new Promise(resolve => {
+                    this.activeRequestDrainResolve = resolve;
+                });
+                await this.activeRequestDrainPromise;
+            }
+            const refresh = providerRefreshInFlight.get(this.cacheKey);
+            if (refresh) await Promise.allSettled([refresh]);
+            const jobs = [...this.catalogPrefetchJobs.values()];
+            await Promise.allSettled(jobs);
+            while (this.catalogMetaPersistWrites.size) {
+                await Promise.allSettled([...this.catalogMetaPersistWrites]);
+            }
+            await Promise.allSettled([
+                this.persistentAddonDataCache.flush(),
+                this.persistentCatalogMetaCache.flush(),
+                this.persistentSeriesInfoCache.flush()
+            ]);
+            providerRefreshState.delete(this.cacheKey);
+        })();
+        return this.disposePromise;
+    }
     async loadFromCache() {
         const cacheKey = 'addon:data:' + this.cacheKey;
         // CACHE_ENABLED controls the in-memory/Redis layers only. A configured
@@ -641,6 +747,8 @@ class M3UEPGAddon {
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
+            this.pendingRemovalCandidates = cached.pendingRemovalCandidates && typeof cached.pendingRemovalCandidates === 'object'
+                ? cached.pendingRemovalCandidates : {};
 
             // Direct-M3U episode URLs and IDs are not derivable from the series
             // summaries alone, so persist and restore the episode lists themselves.
@@ -690,7 +798,8 @@ class M3UEPGAddon {
             series: this.series,
             epgData: this.epgData,
             lastUpdate: this.lastUpdate,
-            directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries())
+            directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
+            pendingRemovalCandidates: this.pendingRemovalCandidates
         };
         dataCache.set(cacheKey, entry);
         await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
@@ -1242,7 +1351,7 @@ class M3UEPGAddon {
 
     async _updateData(force = false) {
         const now = Date.now();
-        if (!force && CACHE_ENABLED) {
+        if (!force) {
             if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) {
                 return;
             }
@@ -1256,30 +1365,84 @@ class M3UEPGAddon {
             series: this.series,
             epgData: this.epgData,
             lastUpdate: this.lastUpdate,
-            directSeriesEpisodeIndex: this.directSeriesEpisodeIndex,
-            directSeriesEpisodeById: this.directSeriesEpisodeById
+            directSeriesEpisodeIndex: new Map(this.directSeriesEpisodeIndex),
+            directSeriesEpisodeById: new Map(this.directSeriesEpisodeById),
+            pendingRemovalCandidates: this.pendingRemovalCandidates
         };
         try {
             const start = Date.now();
             const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
             await providerModule.fetchData(this);
 
-            // Small provider-side deletions are normal. Reject only a large share
-            // of removals so a partial/outage response cannot erase a working library.
+            // Accept ordinary provider removals immediately. A major reduction or
+            // an emptied section must appear in two consecutive refreshes before it
+            // replaces the last-known-good catalogue.
+            const removalCandidates = { ...(previous.pendingRemovalCandidates || {}) };
+            const unconfirmedDrops = [];
+            const providerConfirmations = parsePositiveInteger(
+                process.env.PROVIDER_REMOVAL_CONFIRMATIONS, 2, 2, 5
+            );
             for (const section of ['channels', 'movies', 'series']) {
                 const stats = getSectionRemovalStats(previous[section], this[section]);
-                if (stats.largeDrop) {
-                    this.log.warn('Provider refresh rejected after an unusually large catalogue reduction', {
-                        section,
-                        removedCount: stats.removedCount,
-                        previousCount: stats.previousCount,
-                        currentCount: stats.currentCount,
-                        removedPercent: Number(stats.removedPercent.toFixed(1))
-                    });
-                    throw new Error(
-                        `Provider refresh removed ${stats.removedCount}/${stats.previousCount} ${section} items (${stats.removedPercent.toFixed(1)}%); retaining last-known-good catalogue`
-                    );
+                const guardedDrop = stats.largeDrop || (stats.previousCount > 0 && stats.currentCount === 0);
+                if (guardedDrop) {
+                    const ids = (Array.isArray(this[section]) ? this[section] : [])
+                        .filter(item => item && item.id != null)
+                        .map(item => String(item.id))
+                        .sort();
+                    const fingerprint = crypto.createHash('sha256').update(ids.join('\n')).digest('hex');
+                    const prior = removalCandidates[section];
+                    const confirmations = prior?.fingerprint === fingerprint
+                        ? Math.min(providerConfirmations, (Number(prior.confirmations) || 1) + 1)
+                        : 1;
+                    removalCandidates[section] = { fingerprint, confirmations, observedAt: Date.now() };
+                    if (confirmations < providerConfirmations) {
+                        unconfirmedDrops.push({
+                            section,
+                            removedCount: stats.removedCount,
+                            previousCount: stats.previousCount,
+                            currentCount: stats.currentCount,
+                            removedPercent: Number(stats.removedPercent.toFixed(1))
+                        });
+                    }
+                } else {
+                    delete removalCandidates[section];
                 }
+            }
+            if (unconfirmedDrops.length) {
+                this.channels = previous.channels;
+                this.movies = previous.movies;
+                this.series = previous.series;
+                this.epgData = previous.epgData;
+                this.lastUpdate = previous.lastUpdate;
+                this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
+                this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
+                this.pendingRemovalCandidates = removalCandidates;
+                this.log.warn('Provider catalogue reduction needs one matching refresh before acceptance', {
+                    sections: unconfirmedDrops,
+                    requiredMatchingRefreshes: providerConfirmations
+                });
+                if (CACHE_ENABLED) await this.saveToCache();
+                else {
+                    try {
+                        await this.persistentAddonDataCache.save({
+                            channels: this.channels,
+                            movies: this.movies,
+                            series: this.series,
+                            epgData: this.epgData,
+                            lastUpdate: this.lastUpdate,
+                            directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
+                            pendingRemovalCandidates: this.pendingRemovalCandidates
+                        });
+                    } catch (error) {
+                        this.log.warn('Persistent removal confirmation state save failed', error?.name || 'Error');
+                    }
+                }
+                this.buildGenresInManifest();
+                return;
+            }
+            for (const section of ['channels', 'movies', 'series']) {
+                const stats = getSectionRemovalStats(previous[section], this[section]);
                 if (stats.removedCount > 0) {
                     this.log.info('Provider catalogue items removed', {
                         section,
@@ -1312,6 +1475,7 @@ class M3UEPGAddon {
                 throw new Error('Provider refresh returned an empty catalogue; retaining previous data');
             }
 
+            this.pendingRemovalCandidates = {};
             this.lastUpdate = Date.now();
             providerRefreshState.set(this.cacheKey, this.lastUpdate);
             await this.pruneRemovedCatalogState(previous);
@@ -1324,7 +1488,8 @@ class M3UEPGAddon {
                         series: this.series,
                         epgData: this.epgData,
                         lastUpdate: this.lastUpdate,
-                        directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries())
+                        directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
+                        pendingRemovalCandidates: this.pendingRemovalCandidates
                     });
                 } catch (error) {
                     this.log.warn('Persistent provider data save failed', {
@@ -1352,12 +1517,13 @@ class M3UEPGAddon {
             this.lastUpdate = previous.lastUpdate;
             this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
             this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
+            this.pendingRemovalCandidates = previous.pendingRemovalCandidates;
             this.log.error('[UPDATE] Failed; retaining last-known-good data:', e && e.name ? e.name : 'Error');
         }
     }
 
     startScheduledRefresh() {
-        if (this.refreshTimer) return;
+        if (this.refreshTimer || this.disposed) return;
         const refreshCheckInterval = parsePositiveInteger(
             process.env.DATA_REFRESH_CHECK_INTERVAL_MS, 60 * 60 * 1000,
             5 * 60 * 1000, 6 * 60 * 60 * 1000
@@ -1797,6 +1963,7 @@ class M3UEPGAddon {
     }
 
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
+        if (this.disposed) return;
         if (type !== 'movie' && type !== 'series') return;
         if (this.catalogPrefetchJobs.has(type)) return;
         if ((this.catalogPrefetchRetryAfter.get(type) || 0) > Date.now()) return;
@@ -1868,6 +2035,7 @@ class M3UEPGAddon {
             let nextProgressPercent = 25;
             const providerFallbackReasons = {};
             for (let offset = 0; offset < items.length; offset += pageSize) {
+                if (this.disposed) return;
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
                 if (!batch.length) continue;
                 // Force the warm-up through the metadata refresh path even when an old
@@ -2496,6 +2664,7 @@ async function createAddon(config) {
     };
 
     const cacheKey = createCacheKey(config);
+    const buildKey = createInterfaceKey(config);
     const debugFlag = !!config.debug || DEBUG_ENV;
     if (debugFlag) {
         logAt('debug', '[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
@@ -2503,12 +2672,15 @@ async function createAddon(config) {
         logAt('debug', `[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
     }
 
-    if (CACHE_ENABLED && buildPromiseCache.has(cacheKey)) {
+    if (buildPromiseCache.has(buildKey)) {
         if (debugFlag) logAt('debug', '[DEBUG] Reusing in-progress addon build');
-        return buildPromiseCache.get(cacheKey);
+        return buildPromiseCache.get(buildKey);
     }
 
     const buildPromise = (async () => {
+        const priorDisposal = addonDisposals.get(cacheKey);
+        if (priorDisposal) await priorDisposal.catch(() => {});
+        await cleanupPersistentCacheFiles(cacheKey);
         const addonInstance = new M3UEPGAddon(config, manifest);
         await addonInstance.loadFromCache();
         try {
@@ -2886,6 +3058,12 @@ async function createAddon(config) {
         });
 
         const iface = builder.getInterface();
+        Object.defineProperty(iface, '__cacheWeight', {
+            value: addonInstance.estimateMemoryBytes(),
+            enumerable: false,
+            configurable: false
+        });
+        addonInterfaceInstances.set(iface, addonInstance);
 
         // POST-BUILD: Inject 'options' into each catalog's genre extra entry.
         // This MUST happen after getInterface() because the SDK linter would reject
@@ -2906,19 +3084,55 @@ async function createAddon(config) {
         return iface;
     })();
 
-    if (CACHE_ENABLED) buildPromiseCache.set(cacheKey, buildPromise);
+    buildPromiseCache.set(buildKey, buildPromise);
     try {
         const iface = await buildPromise;
         return iface;
     } finally {
         // Coalesce concurrent builds, but don't retain completed promises forever.
-        if (buildPromiseCache.get(cacheKey) === buildPromise) {
-            buildPromiseCache.delete(cacheKey);
+        if (buildPromiseCache.get(buildKey) === buildPromise) {
+            buildPromiseCache.delete(buildKey);
         }
     }
 }
 
 module.exports = createAddon;
+module.exports.createCacheKey = createCacheKey;
+module.exports.closeRedisClient = async function closeRedisClient() {
+    if (!redisClient) return;
+    const client = redisClient;
+    redisClient = null;
+    try {
+        if (client.status === 'ready') await client.quit();
+        else client.disconnect();
+    } catch {
+        client.disconnect();
+    }
+};
+module.exports.createInterfaceKey = createInterfaceKey;
+module.exports.acquireAddonInterface = function acquireAddonInterface(iface) {
+    const addon = addonInterfaceInstances.get(iface);
+    return addon ? addon.acquireRequest() : false;
+};
+module.exports.releaseAddonInterface = function releaseAddonInterface(iface) {
+    const addon = addonInterfaceInstances.get(iface);
+    if (addon) addon.releaseRequest();
+};
+module.exports.disposeAddonInterface = async function disposeAddonInterface(iface) {
+    const addon = addonInterfaceInstances.get(iface);
+    if (!addon) return;
+    const disposal = addon.dispose();
+    addonDisposals.set(addon.cacheKey, disposal);
+    try {
+        await disposal;
+    } finally {
+        addonInterfaceInstances.delete(iface);
+        if (addonDisposals.get(addon.cacheKey) === disposal) addonDisposals.delete(addon.cacheKey);
+    }
+};
+module.exports.flushAddonDisposals = async function flushAddonDisposals() {
+    await Promise.allSettled([...addonDisposals.values()]);
+};
 module.exports.M3UEPGAddon = M3UEPGAddon;
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;

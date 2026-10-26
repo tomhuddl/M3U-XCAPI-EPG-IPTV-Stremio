@@ -57,7 +57,8 @@ Minimal `.env`:
 PORT=7000
 CACHE_ENABLED=true
 CACHE_TTL_MS=21600000
-MAX_CACHE_ENTRIES=300
+MAX_CACHE_ENTRIES=10
+CACHE_MEMORY_MAX_BYTES=268435456
 DEBUG_MODE=false
 # Optional: set this to the path of a mounted durable volume in your host.
 # PERSISTENT_DATA_DIR=/data
@@ -190,16 +191,16 @@ Set **PERSISTENT_DATA_DIR** to the mount path of a persistent volume, such as **
 
 | File | Contents |
 |------|----------|
-| addon-data-[24-char config hash].json | Last successful provider snapshot: live channels, movies, series, parsed EPG programmes, successful refresh timestamp, and the Direct-M3U episode index. The file also has a format version and save timestamp. Each direct episode record includes its IPTV episode ID, title, season/episode numbers, thumbnail, release value, playable URL, and stream ID. |
-| catalog-meta/catalog-meta-[24-char config hash].json | Enriched movie/series metadata previews: artwork, descriptions, genres, year/release, runtime, rating, cast/director, IMDb/TMDb IDs, and metadata check timestamps. |
-| series-info/series-info-[24-char config hash].json | Xtream series details fetched on demand: episode IDs/titles, season and episode numbers, release values, thumbnails, playable URLs, stream IDs, series TMDb ID, fetch/save timestamps, and the provider-catalogue timestamp used to decide freshness. |
+| addon-data-[24-char config hash].json | Last successful provider snapshot: live channels, movies, series, parsed EPG programmes, successful refresh timestamp, and the Direct-M3U episode index. It also stores pending large-removal confirmation fingerprints. The file has a format version and save timestamp. Each direct episode record includes its IPTV episode ID, title, season/episode numbers, thumbnail, release value, playable URL, and stream ID. |
+| catalog-meta/catalog-meta-[24-char config hash].json and its .wal companion | Enriched movie/series metadata previews: artwork, descriptions, genres, year/release, runtime, rating, cast/director, IMDb/TMDb IDs, and metadata check timestamps. The append-only journal is compacted into the snapshot periodically. |
+| series-info/series-info-[24-char config hash].json and its .wal companion | Xtream series details fetched on demand: episode IDs/titles, season and episode numbers, release values, thumbnails, playable URLs, stream IDs, series TMDb ID, fetch/save timestamps, and the provider-catalogue timestamp used to decide freshness. |
 | omdb-usage.json | Current UTC day and OMDb requests reserved that day, so restarts do not reset the daily request limit. |
 
-The provider snapshots and metadata files are namespaced by a hash of the provider configuration. They do not store the raw configuration token, but episode URLs may contain provider credentials or playlist access tokens. Keep the volume private. CATALOG_META_CACHE_DIR and SERIES_INFO_CACHE_DIR can move their respective cache files elsewhere. The OMDb counter uses PERSISTENT_DATA_DIR, or ./data if it is unset.
+The provider snapshots and metadata files are namespaced by a hash of the provider configuration. They do not store the raw configuration token, but episode URLs may contain provider credentials or playlist access tokens. Keep the volume private. CATALOG_META_CACHE_DIR and SERIES_INFO_CACHE_DIR can move their respective cache files elsewhere. The OMDb counter uses PERSISTENT_DATA_DIR, or ./data if it is unset. Cache files older than PERSISTENT_CACHE_RETENTION_DAYS (90 days by default) are removed, except for the active configuration; abandoned .tmp files are removed after 24 hours. The metadata and episode journals are append-only write-ahead logs next to their .json snapshots. Keep one application process writing to a given persistent cache directory; the files do not use cross-process locks.
 
-Direct-M3U episode indexes are loaded from and saved in the provider snapshot, so episode lookup works immediately after a restart. Xtream does not download every season's episodes during catalogue refresh: the first series-detail request fetches them from get_series_info, stores the response in memory, and waits for the persistent series-info file write to finish before returning the episode list. Later requests reuse the saved result. An entry is fresh for the provider refresh interval (12 hours by default) only while the provider catalogue timestamp is unchanged. After a successful catalogue refresh, the next series-detail request fetches a fresh episode list. If Xtream is unavailable, a saved list can be served as a fallback for up to 30 days.
+Direct-M3U episode indexes are loaded from and saved in the provider snapshot, so episode lookup works immediately after a restart. Xtream does not download every season's episodes during catalogue refresh: the first series-detail request fetches them from get_series_info, stores the response in memory, and schedules a batched journal write (normally within 500 ms) without waiting for disk before returning the episode list. A graceful shutdown flushes pending journal writes. Later requests reuse the saved result. An entry is fresh for the provider refresh interval (12 hours by default) only while the provider catalogue timestamp is unchanged. After a successful catalogue refresh, the next series-detail request fetches a fresh episode list. If Xtream is unavailable, a saved list can be served as a fallback for up to 30 days.
 
-The provider catalogue and EPG are checked hourly and refreshed after 12 hours by default. A successful refresh stores the new timestamp. A failed refresh restores the previous catalogue, EPG and timestamp, leaving the refresh overdue for the next hourly check. A blank EPG result keeps the previous non-empty guide. A successful provider deletion removes the item from the saved catalogue; removed channels also lose orphaned EPG groups when no current channel uses that XMLTV ID, and removed movies/series lose their enriched metadata and series details. A few deletions are accepted. By default, a section drop is rejected when at least 10 items and 25% of that section disappear, or when at least 5 items and 50% disappear. A rejected refresh restores all previous provider data and leaves its timestamp overdue. If every section becomes empty at once, the empty catalogue is also rejected as a final failsafe. Set PROVIDER_REMOVAL_GUARD_MIN_ITEMS and PROVIDER_REMOVAL_GUARD_PERCENT to tune the main threshold.
+The provider catalogue and EPG are checked hourly and refreshed after 12 hours by default. A successful refresh stores the new timestamp. A failed refresh restores the previous catalogue, EPG and timestamp, leaving the refresh overdue for the next hourly check. A blank EPG result keeps the previous non-empty guide. A successful provider deletion removes the item from the saved catalogue; removed channels also lose orphaned EPG groups when no current channel uses that XMLTV ID, and removed movies/series lose their enriched metadata and series details. A few deletions are accepted immediately. By default, a large section drop is held on its first observation and accepted only after a second refresh returns the same remaining item IDs; an emptied non-empty section is also held for confirmation, including small sections. The first observation persists its fingerprint and leaves the last-good snapshot and refresh timestamp in place, so the hourly checker can confirm it on its next attempt. A failed provider request does not count as confirmation. Set PROVIDER_REMOVAL_GUARD_MIN_ITEMS, PROVIDER_REMOVAL_GUARD_PERCENT, and PROVIDER_REMOVAL_CONFIRMATIONS to tune the safeguard.
 
 Complete enriched catalogue metadata stays fresh for 14 days by default. If a normal refresh of a complete entry fails, the app waits 12 hours by default before retrying it (CATALOG_METADATA_FAILURE_RETRY_MS). Missing artwork, description, genres, year/release information, runtime, IMDb rating, cast, or movie director becomes eligible for another lookup after 12 hours (OMDB_MISSING_DATA_RETRY_MS). A known TMDb ID without an IMDb ID is also retried. The raw TMDb and OMDb API-response caches are process-memory only: their response TTLs do not make those raw responses survive a restart. TMDb's default response TTL is 14 days and confirmed 404 responses are cached for five minutes; OMDb's response TTL is 14 days. A persistent last-good catalogue preview can be used as a fallback for up to 30 days.
 
@@ -238,10 +239,13 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `TMDB_CACHE_MAX_ENTRIES` | 1000 | Maximum number of cached TMDb responses (bounded by the server) |
 | `TMDB_NEGATIVE_CACHE_TTL_MS` | 300000 (5m) | Cache lifetime for confirmed TMDb 404 responses; transient failures are not cached as 404s |
 | `OMDB_API_KEY` | unset | OMDb API key for IMDb rating/runtime lookups |
+| `OMDB_DAILY_RESERVATION_BLOCK_SIZE` | 25 | Persist OMDb daily quota in blocks to reduce volume writes; unused reserved requests count against the quota until the next UTC day |
 | `OMDB_CACHE_TTL_MS` | 1209600000 (14d) | Process-memory cache lifetime for OMDb API responses |
-| `CACHE_ENABLED` | `true` | Enables/disables the provider-data LRU and Redis layers; separate metadata/episode LRU caches and configured disk persistence still operate |
-| `CACHE_TTL_MS` | `21600000` (6h) | TTL for cached data |
+| `CACHE_ENABLED` | `true` | Enables/disables the provider-data LRU and Redis layers; provider refresh scheduling, the bounded addon-interface cache, separate metadata/episode caches, and configured disk persistence still operate |
+| `CACHE_TTL_MS` | `21600000` (6h) | TTL for provider catalogue data in the in-memory LRU, Redis snapshot, and series-info LRU |
 | `PERSISTENT_DATA_DIR` | unset | Mounted persistent directory for provider snapshots, direct episode indexes, enhanced metadata and Xtream episode details; set to the mount path (commonly /data) |
+| `PERSISTENT_DATA_MAX_BYTES` | 134217728 (128 MiB) | Maximum provider snapshot file size; bounded by 512 MiB |
+| `PERSISTENT_CACHE_RETENTION_DAYS` | 90 | Remove inactive config cache files after this many days (1–365) |
 | `CATALOG_META_CACHE_DIR` | unset | Optional override for the persistent movie/series metadata cache directory |
 | `SERIES_INFO_CACHE_DIR` | unset | Optional override for the persistent Xtream episode-detail cache directory |
 | `DATA_REFRESH_INTERVAL_MS` | 43200000 (12h) | Minimum interval between successful provider catalogue and EPG refreshes |
@@ -261,7 +265,12 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `OMDB_MISSING_DATA_RETRY_MS` | 43200000 (12h) | Retry interval for items with missing key metadata fields across provider/TMDb/OMDb |
 | `PROVIDER_REMOVAL_GUARD_MIN_ITEMS` | 10 | Minimum deleted items for the configurable large-drop safeguard |
 | `PROVIDER_REMOVAL_GUARD_PERCENT` | 25 | Percentage removed for the configurable large-drop safeguard |
-| `MAX_CACHE_ENTRIES` | 100 | Maximum entries in each in-memory cache; values are bounded by the server |
+| `PROVIDER_REMOVAL_CONFIRMATIONS` | 2 | Matching refresh observations required before accepting a guarded section drop |
+| `MAX_CACHE_ENTRIES` | 10 | Maximum provider-data LRU entries (also bounded by its memory limit) |
+| `CACHE_MEMORY_MAX_BYTES` | 268435456 (256 MiB) | Approximate memory budget for the provider-data LRU |
+| `MAX_INTERFACE_CACHE_ENTRIES` | 3 | Maximum addon interfaces retained in process memory |
+| `INTERFACE_CACHE_MAX_BYTES` | 268435456 (256 MiB) | Approximate memory budget for addon interfaces; eviction stops refresh timers and flushes persistent caches |
+| `INTERFACE_CACHE_TTL_MS` | 0 (no expiry) | Optional interface expiry; memory limits still evict least-recently-used interfaces |
 | `CONFIG_SECRET` | unset | Required to create/decrypt encrypted tokens; use a unique random secret (prefer 32+ random bytes; minimum 16 characters) |
 | `LOG_LEVEL` | `info` | Minimum deploy log detail: `debug`, `info`, `warn`, or `error` |
 | `DEBUG_MODE` | `false` | Enables concise debug diagnostics regardless of `LOG_LEVEL` |
