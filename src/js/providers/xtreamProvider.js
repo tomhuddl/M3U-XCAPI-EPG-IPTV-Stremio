@@ -203,11 +203,30 @@ async function fetchData(addonInstance) {
                 },
               };
             });
+            const summary = { count: seriesList.length, durationMs: Date.now() - seriesFetchStartedAt };
+            if (seriesList.length) {
+              addonInstance.log?.info?.("Xtream series loaded", summary);
+            } else {
+              addonInstance.log?.warn?.("Xtream get_series returned an empty list", summary);
+            }
           } else {
+            addonInstance.log?.warn?.("Xtream get_series returned a non-list response", {
+              responseType: seriesList === null ? "null" : typeof seriesList,
+              durationMs: Date.now() - seriesFetchStartedAt,
+            });
           }
         } else {
+          addonInstance.log?.warn?.("Xtream get_series returned an HTTP error", {
+            status: seriesResp.status,
+            durationMs: Date.now() - seriesFetchStartedAt,
+          });
         }
-      } catch (e) {
+      } catch (error) {
+        addonInstance.log?.warn?.("Xtream get_series request failed", {
+          name: error?.name || "Error",
+          code: typeof error?.code === "string" ? error.code : null,
+          durationMs: Date.now() - seriesFetchStartedAt,
+        });
       }
     }
   }

@@ -145,6 +145,119 @@ app.post("/encrypt", (req, res) => {
 
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
 
+// Count Xtream series from Railway without returning the full catalogue to the browser.
+app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
+  if (!PREFETCH_ENABLED) {
+    return res.status(403).json({ ok: false, error: "Server preflight is disabled" });
+  }
+  if (activePrefetches >= MAX_ACTIVE_PREFETCHES) {
+    res.setHeader("Retry-After", "5");
+    return res.status(503).json({ ok: false, error: "Preflight capacity reached; retry shortly" });
+  }
+
+  let config;
+  try {
+    const input = req.body || {};
+    config = validateConfig({
+      provider: "xtream",
+      xtreamUrl: input.xtreamUrl,
+      xtreamUsername: input.xtreamUsername,
+      xtreamPassword: input.xtreamPassword,
+    });
+  } catch {
+    return res.status(400).json({ ok: false, error: "Invalid Xtream connection settings" });
+  }
+
+  activePrefetches += 1;
+  const startedAt = Date.now();
+  try {
+    const url = new URL(config.xtreamUrl.replace(/\/+$/, "") + "/player_api.php");
+    url.searchParams.set("username", config.xtreamUsername);
+    url.searchParams.set("password", config.xtreamPassword);
+    url.searchParams.set("action", "get_series");
+
+    const response = await safeFetch(url.toString(), {
+      timeout: 35000,
+      headers: { "User-Agent": "IPTV-Stremio-Addon series preflight/1.0" },
+    });
+    if (!response.ok) {
+      if (response.body) response.body.destroy();
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned an HTTP error",
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    if (!response.body) {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned an empty response",
+        durationMs: Date.now() - startedAt,
+      });
+    }
+
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of response.body) {
+      bytes += chunk.length;
+      if (bytes > PREFETCH_MAX_BYTES) {
+        response.body.destroy();
+        return res.status(413).json({
+          ok: false,
+          error: "Xtream series response exceeds the server preflight size limit",
+          bytes,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+      chunks.push(chunk);
+    }
+
+    let series;
+    try {
+      const body = Buffer.concat(chunks, bytes).toString("utf8").replace(/^\uFEFF/, "");
+      series = JSON.parse(body);
+    } catch {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API returned invalid JSON",
+        bytes,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    if (!Array.isArray(series)) {
+      return res.status(502).json({
+        ok: false,
+        error: "Xtream series API response was not a list",
+        bytes,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+
+    res.json({
+      ok: true,
+      seriesCount: series.length,
+      bytes,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    const timedOut = /abort|timeout/i.test(String(error?.name || "")) ||
+      /timed out/i.test(String(error?.message || ""));
+    const code = typeof error?.code === "string" ? error.code.slice(0, 40) : null;
+    res.status(502).json({
+      ok: false,
+      error: timedOut
+        ? "Railway timed out while fetching Xtream series"
+        : "Railway could not fetch Xtream series",
+      code,
+      durationMs: Date.now() - startedAt,
+    });
+  } finally {
+    activePrefetches = Math.max(0, activePrefetches - 1);
+  }
+});
+
+
 // Stream-count XMLTV programmes without retaining the feed in memory.
 app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   if (!PREFETCH_ENABLED) {
