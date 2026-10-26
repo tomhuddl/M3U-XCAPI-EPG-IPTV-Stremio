@@ -138,7 +138,9 @@ class PersistentSeriesInfoCache {
         });
         this.prune();
         this.dirty = true;
-        this.scheduleWrite();
+        // Await the atomic disk write so a freshly fetched episode list is saved
+        // before the request completes.
+        await this.flush();
     }
 
     async retainSeries(seriesIds) {
@@ -175,6 +177,10 @@ class PersistentSeriesInfoCache {
 
     async flush() {
         if (!this.enabled) return;
+        if (this.writeTimer) {
+            clearTimeout(this.writeTimer);
+            this.writeTimer = null;
+        }
         await this.init();
         if (this.writePromise) {
             await this.writePromise;

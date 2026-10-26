@@ -18,6 +18,11 @@ const OMDB_MISSING_DATA_RETRY_MS = parsePositiveInteger(
     60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
 );
 
+const CATALOG_METADATA_FAILURE_RETRY_MS = parsePositiveInteger(
+    process.env.CATALOG_METADATA_FAILURE_RETRY_MS, 12 * 60 * 60 * 1000,
+    60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
+);
+
 function omdbMetadataNeedsRefresh(value) {
     if (!value || !value.imdbId) return false;
     if (value.imdbRating && value.runtime) return false;
@@ -134,6 +139,11 @@ function catalogMetadataNeedsRefresh(value) {
     const checkedAt = Number(value.missingMetadataCheckedAt) ||
         Number(value.metadataCheckedAt) || 0;
     return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+}
+
+function catalogMetadataRefreshAttemptIsDue(value) {
+    const attemptedAt = Number(value?.metadataRefreshAttemptedAt) || 0;
+    return !attemptedAt || Date.now() - attemptedAt >= CATALOG_METADATA_FAILURE_RETRY_MS;
 }
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
@@ -1883,11 +1893,14 @@ class M3UEPGAddon {
             const cachedValue = persisted?.value || cached;
             const metadataTimestamp = Number(cachedValue?.metadataCheckedAt) ||
                 Number(persisted?.savedAt) || 0;
-            const refreshDue = !(Number(cachedValue?.metadataVersion) >= 3) ||
+            const normalRefreshDue = catalogMetadataRefreshAttemptIsDue(cachedValue) && (
+                !(Number(cachedValue?.metadataVersion) >= 3) ||
                 (cachedValue?._tmdbId && !cachedValue?.imdbId && cachedValue?.imdbIdChecked !== true) ||
+                Date.now() - metadataTimestamp >= refreshInterval
+            );
+            const refreshDue = normalRefreshDue ||
                 omdbMetadataNeedsRefresh(cachedValue) ||
-                catalogMetadataNeedsRefresh(cachedValue) ||
-                Date.now() - metadataTimestamp >= refreshInterval;
+                catalogMetadataNeedsRefresh(cachedValue);
             if (!refreshDue) return cached;
             // Due entries fall through to the shared in-flight refresh below.
         }
@@ -1920,10 +1933,12 @@ class M3UEPGAddon {
                 60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
             );
             const persistedIsUsable = persisted?.value && isUsablePreview(persisted.value);
-            const normalMetadataRefreshDue = !persistedIsUsable ||
+            const normalMetadataRefreshDue = catalogMetadataRefreshAttemptIsDue(persisted?.value) && (
+                !persistedIsUsable ||
                 persisted.value.metadataVersion < 3 ||
                 (persisted.value._tmdbId && !persisted.value.imdbId && persisted.value.imdbIdChecked !== true) ||
-                Date.now() - (Number(persisted.value.metadataCheckedAt) || persisted.savedAt) >= metadataRefreshInterval;
+                Date.now() - (Number(persisted.value.metadataCheckedAt) || persisted.savedAt) >= metadataRefreshInterval
+            );
             const persistedIsDue = persistedIsUsable &&
                 (normalMetadataRefreshDue ||
                     omdbMetadataNeedsRefresh(persisted.value) || catalogMetadataNeedsRefresh(persisted.value));
@@ -1967,6 +1982,7 @@ class M3UEPGAddon {
                 // incomplete record can trigger a lookup on every request.
                 const retained = {
                     ...persisted.value,
+                    ...(normalMetadataRefreshDue ? { metadataRefreshAttemptedAt: Date.now() } : {}),
                     missingMetadataCheckedAt: Date.now()
                 };
                 const saved = await this.persistCatalogMetaIfCurrent(key, retained);
