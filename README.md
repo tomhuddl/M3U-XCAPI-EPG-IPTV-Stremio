@@ -255,6 +255,7 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `CATALOG_METADATA_FAILURE_RETRY_MS` | 43200000 (12h) | Delay before retrying a failed normal refresh of complete metadata |
 | `CATALOG_META_STALE_RETENTION_MS` | `2592000000` (30d) | How long last-good enhanced metadata may be retained as a fallback |
 | `CATALOG_PREFETCH_REFRESH_MS` | `43200000` (12h) | How often the full catalogue warm-up rechecks metadata completeness; per-item metadata retains its own freshness window |
+| `CATALOG_PREFETCH_LOG_MISSING_SERIES` | `false` | Temporarily log series IDs, titles, and missing fields for incomplete metadata warm-ups |
 | `OMDB_MISSING_DATA_RETRY_MS` | 43200000 (12h) | Retry interval for items with missing key metadata fields across provider/TMDb/OMDb |
 | `PROVIDER_REMOVAL_GUARD_MIN_ITEMS` | 10 | Minimum deleted items for the configurable large-drop safeguard |
 | `PROVIDER_REMOVAL_GUARD_PERCENT` | 25 | Percentage removed for the configurable large-drop safeguard |
@@ -399,7 +400,7 @@ curl "$HOST/$TOKEN/meta/series/iptv_series_<id>.json" | jq '.meta.videos[0]'
 | Errors only | `LOG_LEVEL=error` |
 | Per-token debug | Check “Enable Debug Logging” in UI |
 
-Routine cache writes, metadata lookup diagnostics and warm-up progress are hidden at the default level. Set `LOG_LEVEL=debug` to see unresolved series IDs, titles and missing metadata fields after a series warm-up. Raise it temporarily when troubleshooting; remove credentials and tokens before sharing logs.
+Routine cache writes, metadata lookup diagnostics and warm-up progress are hidden at the default level. To list only unresolved series IDs, titles and missing fields, set `CATALOG_PREFETCH_LOG_MISSING_SERIES=true` and keep `LOG_LEVEL=info`. `LOG_LEVEL=debug` enables all diagnostic detail. Remove credentials and tokens before sharing logs.
 
 ---
 

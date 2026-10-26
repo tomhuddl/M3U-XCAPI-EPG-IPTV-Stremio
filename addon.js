@@ -25,6 +25,9 @@ const CATALOG_METADATA_FAILURE_RETRY_MS = parsePositiveInteger(
     60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000
 );
 
+const CATALOG_PREFETCH_LOG_MISSING_SERIES =
+    (process.env.CATALOG_PREFETCH_LOG_MISSING_SERIES || '').toLowerCase() === 'true';
+
 function omdbMetadataNeedsRefresh(value) {
     if (!value || !value.imdbId) return false;
     if (value.imdbRating && value.runtime) return false;
@@ -1792,9 +1795,17 @@ class M3UEPGAddon {
                 this.log.debug('Series metadata still incomplete after warm-up', {
                     total: missingMetadata,
                     logged: incompleteSeriesDetails.length,
-                    truncated: missingMetadata > incompleteSeriesDetails.length,
-                    series: incompleteSeriesDetails
+                    truncated: missingMetadata > incompleteSeriesDetails.length
                 });
+                if (CATALOG_PREFETCH_LOG_MISSING_SERIES) {
+                    for (const detail of incompleteSeriesDetails) {
+                        this.log.info('Series metadata incomplete', {
+                            id: detail.id,
+                            name: detail.name,
+                            missing: detail.missing.join(', ')
+                        });
+                    }
+                }
             }
 
             const omdbCatalogueSummary = {
@@ -2300,13 +2311,13 @@ async function createAddon(config) {
     const cacheKey = createCacheKey(config);
     const debugFlag = !!config.debug || DEBUG_ENV;
     if (debugFlag) {
-        console.log('[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
+        logAt('debug', '[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
     } else {
         logAt('debug', `[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
     }
 
     if (CACHE_ENABLED && buildPromiseCache.has(cacheKey)) {
-        if (debugFlag) console.log('[DEBUG] Reusing in-progress addon build');
+        if (debugFlag) logAt('debug', '[DEBUG] Reusing in-progress addon build');
         return buildPromiseCache.get(cacheKey);
     }
 
@@ -2480,7 +2491,7 @@ async function createAddon(config) {
                     });
 
                     if (addonInstance.config.debug) {
-                        console.log('[DEBUG] EPG guide catalog', {
+                        logAt('debug', '[DEBUG] EPG guide catalog', {
                             date: extra.date,
                             channels: metasDetailed.length,
                             scheduledChannels: metasDetailed.filter(m => m.videos.length > 0).length,
@@ -2555,7 +2566,7 @@ async function createAddon(config) {
 
                 const responseBuildMs = Date.now() - responseBuildStartedAt;
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Catalog handler', {
+                    logAt('debug', '[DEBUG] Catalog handler', {
                         type: args.type,
                         id: args.id,
                         genre: extra.genre,
@@ -2589,14 +2600,14 @@ async function createAddon(config) {
                     const stream = addonInstance.getStream(id);
                     if (!stream) return { streams: [] };
                     if (addonInstance.config.debug) {
-                        console.log('[DEBUG] Series Episode Stream request', { id, target: safeStreamTarget(stream.url) });
+                        logAt('debug', '[DEBUG] Series Episode Stream request', { id, target: safeStreamTarget(stream.url) });
                     }
                     return { streams: [stream] };
                 }
                 const stream = addonInstance.getStream(id);
                 if (!stream) return { streams: [] };
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Stream request', { id, target: safeStreamTarget(stream.url) });
+                    logAt('debug', '[DEBUG] Stream request', { id, target: safeStreamTarget(stream.url) });
                 }
                 return { streams: [stream] };
             } catch (e) {
@@ -2669,14 +2680,14 @@ async function createAddon(config) {
                 };
 
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Meta handler called', { type, id, seriesCount: addonInstance.series.length });
+                    logAt('debug', '[DEBUG] Meta handler called', { type, id, seriesCount: addonInstance.series.length });
                 }
                 if (type === 'series' || id.startsWith('iptv_series_')) {
                     const meta = exposeNativeImdbRating(
                         await addonInstance.getDetailedMetaAsync(id, 'series')
                     );
                     if (addonInstance.config.debug) {
-                        console.log('[DEBUG] Series meta result', { id, found: !!meta, videos: meta?.videos?.length });
+                        logAt('debug', '[DEBUG] Series meta result', { id, found: !!meta, videos: meta?.videos?.length });
                     }
                     if (!meta) {
                         // Fallback: Try to find in series list and return basic meta without episodes
@@ -2689,7 +2700,7 @@ async function createAddon(config) {
                                 videos: []
                             };
                             if (addonInstance.config.debug) {
-                                console.log('[DEBUG] Series meta fallback used', { id, name: seriesItem.name });
+                                logAt('debug', '[DEBUG] Series meta fallback used', { id, name: seriesItem.name });
                             }
                             return { meta: fallbackMeta };
                         }
@@ -2727,7 +2738,7 @@ async function createAddon(config) {
                     }
                 }
                 if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Meta request', { id, type, found: !!meta });
+                    logAt('debug', '[DEBUG] Meta request', { id, type, found: !!meta });
                 }
                 return { meta };
             } catch (e) {

@@ -14,16 +14,34 @@ function isDebugEnabled(forceDebug = false) {
     return isEnabled("debug", forceDebug);
 }
 
+function formatLogArg(value) {
+    if (typeof value === "string") return value;
+    if (value instanceof Error) {
+        return JSON.stringify({ name: value.name, message: value.message });
+    }
+    if (typeof value === "bigint") return value.toString();
+    try {
+        const formatted = JSON.stringify(value);
+        return formatted === undefined ? String(value) : formatted;
+    } catch {
+        return "[unserializable]";
+    }
+}
+
+function writeLog(level, args, prefix = null) {
+    const method = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+    const values = prefix ? [prefix, ...args] : args;
+    method(values.map(formatLogArg).join(" "));
+}
+
 function emit(level, args, forceDebug = false) {
     if (!isEnabled(level, forceDebug)) return;
-    const method = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
-    method(`[${level.toUpperCase()}]`, ...args);
+    writeLog(level, args, `[${level.toUpperCase()}]`);
 }
 
 function logAt(level, ...args) {
     if (!isEnabled(level)) return;
-    const method = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
-    method(...args);
+    writeLog(level, args);
 }
 
 function createLogger(forceDebug = false) {
