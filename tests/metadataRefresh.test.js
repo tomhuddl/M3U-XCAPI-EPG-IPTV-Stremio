@@ -3,6 +3,7 @@ const { M3UEPGAddon } = require("../addon");
 const tmdbMetadata = require("../src/js/tmdbMetadata");
 const omdbMetadata = require("../src/js/omdbMetadata");
 const PersistentSeriesInfoCache = require("../persistentSeriesInfoCache");
+const LRUCache = require("../lruCache");
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function deferred() {
@@ -551,6 +552,84 @@ async function testCompletePreviewRetainedAfterProviderFallbackRetriesAfterFailu
     }
 }
 
+async function testWarmupDoesNotCountEvictedPersistentPreviewsAsMissing() {
+    const values = Array.from({ length: 50 }, (_, index) => preview("movie", {
+        id: "iptv_vod_" + (index + 1), name: "Movie " + (index + 1)
+    }));
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = values.map(({ id, name, type }) => ({ id, name, type }));
+    addon.catalogMetaCache = new LRUCache({ max: 50, ttl: 60000 });
+    addon.persistentCatalogMetaCache = memoryMetadataStore(values);
+    const warnings = [];
+    const summaries = [];
+    addon.log = { debug() {}, error() {}, warn: (message, details) => warnings.push({ message, details }),
+        info: (message, details) => summaries.push({ message, details }) };
+    addon.enrichCatalogMetaItems = async batch => {
+        for (const item of batch) addon.catalogMetaCache.set(item.id, values.find(value => value.id === item.id));
+        // Model a fast series scan evicting the first 49 completed movie cards
+        // while the final movie lookup keeps this batch open.
+        for (let index = 0; index < 50; index++) addon.catalogMetaCache.set("other-series-" + index, { name: "Other" });
+        const last = values[values.length - 1];
+        addon.catalogMetaCache.set(last.id, last);
+    };
+    addon.startContinuousCatalogPrefetch("movie", 50, 3);
+    await addon.catalogPrefetchJobs.get("movie");
+    assert.deepStrictEqual(warnings, [], "LRU eviction must not turn 49 stored previews into failed lookups");
+    const summary = summaries.find(entry => entry.message === "Persistent catalogue metadata scan complete");
+    assert.ok(summary);
+    assert.strictEqual(summary.details.incompleteItems, 0);
+    assert.deepStrictEqual(summary.details.missingFieldCounts, {});
+}
+
+async function testWarmupRetainsBatchResultsWhenPersistenceIsDisabled() {
+    const values = Array.from({ length: 50 }, (_, index) => preview("movie", {
+        id: "iptv_vod_" + (index + 1), name: "Movie " + (index + 1)
+    }));
+    const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.movies = values.map(({ id, name, type }) => ({ id, name, type }));
+    addon.catalogMetaCache = new LRUCache({ max: 50, ttl: 60000 });
+    addon.persistentCatalogMetaCache = { get: async () => null, set: async () => {}, flush: async () => {} };
+    const warnings = [];
+    addon.log = { debug() {}, info() {}, error() {}, warn: (message, details) => warnings.push({ message, details }) };
+    const lastStarted = deferred();
+    const lastResponse = deferred();
+    addon.getCatalogMetaAsync = async id => {
+        if (id === values[values.length - 1].id) { lastStarted.resolve(); await lastResponse.promise; }
+        return values.find(value => value.id === id);
+    };
+    let batchResults;
+    const enrich = addon.enrichCatalogMetaItems.bind(addon);
+    addon.enrichCatalogMetaItems = async (...args) => { batchResults = await enrich(...args); return batchResults; };
+    addon.startContinuousCatalogPrefetch("movie", 50, 3);
+    const job = addon.catalogPrefetchJobs.get("movie");
+    try {
+        await lastStarted.promise;
+        await new Promise(resolve => setImmediate(resolve));
+        for (let index = 0; index < 50; index++) addon.catalogMetaCache.set("other-series-" + index, { name: "Other" });
+    } finally {
+        lastResponse.resolve();
+    }
+    await job;
+    assert.ok(batchResults instanceof Map, "enrichment must return stable previews for the requested page");
+    assert.strictEqual(batchResults.size, 50);
+    for (const value of values) assert.strictEqual(batchResults.get(value.id).description, value.description);
+    assert.deepStrictEqual(warnings, [], "evicted successful results remain complete without disk persistence");
+}
+
+async function testCachedPagePreviewsSurviveConcurrentEviction() {
+    const value = preview("movie");
+    const { addon, item } = addonFor("movie", value);
+    addon.catalogMetaCache = new LRUCache({ max: 1, ttl: 60000 });
+    addon.catalogMetaCache.set(item.id, value);
+    addon.getCatalogMetaAsync = async () => { throw new Error("a cached page should not need a lookup"); };
+    const pending = addon.enrichCatalogMetaItems([item]);
+    addon.catalogMetaCache.set("another-title", { name: "Other" });
+    const results = await pending;
+    assert.ok(results instanceof Map);
+    assert.strictEqual(results.get(item.id).description, value.description,
+        "the requested page must retain metadata even if another catalogue evicts its LRU entry");
+}
+
 module.exports = [
     testPartialMetadataRefreshRetainsKnownMovieAndSeriesFields,
     testSparsePreviewDescriptionSurvivesMetadataRefresh,
@@ -568,5 +647,8 @@ module.exports = [
     testChangedSeriesDetailsPruningKeepsOnlyCurrentGenerationReplacement,
     testSavedSeriesFallbackRetriesSoonAfterProviderRecovery,
     testWarmupRespectsFailedSchemaAndImdbLookupBackoff,
-    testCompletePreviewRetainedAfterProviderFallbackRetriesAfterFailureBackoff
+    testCompletePreviewRetainedAfterProviderFallbackRetriesAfterFailureBackoff,
+    testWarmupDoesNotCountEvictedPersistentPreviewsAsMissing,
+    testWarmupRetainsBatchResultsWhenPersistenceIsDisabled,
+    testCachedPagePreviewsSurviveConcurrentEviction
 ];

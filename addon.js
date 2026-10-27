@@ -1961,13 +1961,15 @@ class M3UEPGAddon {
     }
 
     async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false) {
-        const startedAt = Date.now();
+        // Keep this page's previews until its caller has rendered or counted them.
+        // A concurrent catalogue scan can evict entries from the shared LRU while
+        // the slowest lookup in this page is still running.
+        const previews = new Map();
         const candidates = items.filter(item => {
             if (!item || (item.type !== 'movie' && item.type !== 'series')) return false;
-            // A scheduled warm-up must revisit cached items when the metadata schema
-            // or IMDb enrichment state has changed; ordinary foreground enrichment
-            // continues to skip items already present in the LRU.
-            return forceRefresh || this.catalogMetaCache.get(item.id) === undefined;
+            const cached = this.catalogMetaCache.get(item.id);
+            if (cached !== undefined) previews.set(String(item.id), cached);
+            return forceRefresh || cached === undefined;
         });
         let nextIndex = 0;
         const worker = async () => {
@@ -1986,7 +1988,7 @@ class M3UEPGAddon {
                         if (isMetadataValuePresent('poster', fallbackPreview.poster)) preview.poster = fallbackPreview.poster;
                     }
                     if (!isMetadataValuePresent('genres', preview.genres)) {
-                        fallbackPreview = this.generateMetaPreview(item);
+                        fallbackPreview = fallbackPreview || this.generateMetaPreview(item);
                         preview.genres = fallbackPreview.genres?.length
                             ? fallbackPreview.genres
                             : (providerGenre ? [providerGenre] : []);
@@ -1998,6 +2000,7 @@ class M3UEPGAddon {
                         }
                     }
                     this.cacheCatalogMetaPreview(item.id, preview, true, providerLastUpdate);
+                    previews.set(String(item.id), this.catalogMetaCache.get(item.id) || preview);
                 } catch (error) {
                     this.log.warn('Foreground catalogue metadata enrichment failed', { itemId: item.id, errorName: error?.name || 'Error' });
                 }
@@ -2005,6 +2008,7 @@ class M3UEPGAddon {
         };
         const workerCount = Math.min(Math.max(1, concurrency), candidates.length);
         await Promise.all(Array.from({ length: workerCount }, () => worker()));
+        return previews;
     }
 
     queueCatalogMetaEnrichment(item) {
@@ -2264,14 +2268,19 @@ class M3UEPGAddon {
                 // Force the warm-up through the metadata refresh path even when an old
                 // preview is already in the LRU. Refreshed values must also replace
                 // the persistent preview, not merely update memory.
-                await this.enrichCatalogMetaItems(batch, concurrency, true);
+                const batchPreviews = await this.enrichCatalogMetaItems(batch, concurrency, true);
                 if (!isCurrentGeneration()) return;
                 processed += batch.length;
-                // A warm-up only counts as complete if every item has a usable card
-                // preview in the cache. Missing lookups must be retried later rather
-                // than permanently recording a false-success completion marker.
+                // Count accepted page results or saved previews, since another
+                // media scan may evict this batch from the shared memory LRU.
+                // A genuinely missing preview still remains due for a later retry.
                 for (const item of batch) {
-                    const cached = this.catalogMetaCache.get(item.id);
+                    let cached = this.catalogMetaCache.get(item.id) || batchPreviews?.get?.(String(item.id));
+                    if (!cached) {
+                        const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                        if (!isCurrentGeneration()) return;
+                        cached = saved?.value;
+                    }
                     const lookupDiagnostic = this.catalogMetaLookupDiagnostics.get(String(item.id));
                     if (type === 'series' && lookupDiagnostic?.providerFallback) {
                         providerFallbacks++;
@@ -3113,8 +3122,9 @@ async function createAddon(config) {
                 const genreMetaConcurrency = parsePositiveInteger(
                     process.env.CATALOG_GENRE_META_CONCURRENCY, 16, 1, 16
                 );
+                let pagePreviews;
                 if (page.length && (args.type === 'movie' || args.type === 'series')) {
-                    await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
+                    pagePreviews = await addonInstance.enrichCatalogMetaItems(page, genreMetaConcurrency);
                 }
 
                 // One background job per media type warms the complete, unfiltered
@@ -3142,7 +3152,7 @@ async function createAddon(config) {
                     }
                     if (i.type !== 'movie' && i.type !== 'series') return meta;
 
-                    const cached = addonInstance.catalogMetaCache.get(i.id);
+                    const cached = addonInstance.catalogMetaCache.get(i.id) || pagePreviews?.get?.(String(i.id));
                     if (cached) return {
                         ...meta,
                         ...cached,
