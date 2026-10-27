@@ -82,6 +82,7 @@ async function fetchData(addonInstance) {
     addonInstance.directSeriesEpisodeIndex = new Map(); // reset
     addonInstance.directSeriesEpisodeById = new Map(); // reset exact episode lookup index
     addonInstance.epgData = {};
+    addonInstance.epgRefreshFailed = false;
 
     // Fetch playlist
     let playlistText;
@@ -180,11 +181,13 @@ async function fetchData(addonInstance) {
                     headers: { 'User-Agent': 'Stremio M3U/EPG Addon (directProvider/epg)' }
                 });
                 if (!epgResp || !epgResp.ok || !epgResp.body) {
+                    addonInstance.epgRefreshFailed = true;
                     if (epgResp?.body) epgResp.body.destroy();
                     return null;
                 }
                 return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
             } catch {
+                addonInstance.epgRefreshFailed = true;
                 return null;
             } finally {
                 clearTimeout(timeout);

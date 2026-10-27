@@ -134,9 +134,10 @@ class PersistentCatalogMetaCache {
         };
     }
 
-    async set(key, value) {
+    async set(key, value, canStore = null) {
         if (!this.enabled || !value || typeof value !== "object") return;
         await this.init();
+        if (typeof canStore === "function" && !canStore()) return;
         const normalizedKey = String(key);
         const entry = { savedAt: Date.now(), value };
         this.entries.set(normalizedKey, entry);

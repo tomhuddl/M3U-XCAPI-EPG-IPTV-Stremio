@@ -57,11 +57,12 @@ class LRUCache {
         return entry.value;
     }
 
-    set(key, value) {
+    set(key, value, ttl = this.ttl) {
+        const entryTtl = Number.isFinite(ttl) && ttl >= 0 ? ttl : this.ttl;
         const existing = this.map.get(key);
         if (existing && existing.value === value) {
             this.map.delete(key);
-            existing.expires = this.ttl > 0 ? this._now() + this.ttl : null;
+            existing.expires = entryTtl > 0 ? this._now() + entryTtl : null;
             this.map.set(key, existing);
             return;
         }
@@ -71,7 +72,7 @@ class LRUCache {
         this.map.set(key, {
             value,
             weight,
-            expires: this.ttl > 0 ? this._now() + this.ttl : null,
+            expires: entryTtl > 0 ? this._now() + entryTtl : null,
         });
         this.totalWeight += weight;
 
