@@ -135,9 +135,10 @@ class PersistentSeriesInfoCache {
         };
     }
 
-    async set(seriesId, value, providerLastUpdate) {
+    async set(seriesId, value, providerLastUpdate, canStore = null) {
         if (!this.enabled || !value || typeof value !== "object" || !Array.isArray(value.videos)) return;
         await this.init();
+        if (typeof canStore === "function" && !canStore()) return;
         const key = String(seriesId);
         const entry = {
             savedAt: Date.now(),
@@ -153,13 +154,16 @@ class PersistentSeriesInfoCache {
         this.scheduleWrite();
     }
 
-    async retainSeries(seriesIds) {
+    async retainSeries(seriesIds, options = {}) {
         if (!this.enabled) return;
         await this.init();
         const keep = new Set(Array.from(seriesIds || [], value => String(value)));
+        const invalidated = new Set(Array.from(options.invalidatedSeriesIds || [], value => String(value)));
+        const currentGeneration = Number(options.providerLastUpdate) || 0;
         let changed = false;
-        for (const key of this.entries.keys()) {
-            if (!keep.has(key)) {
+        for (const [key, entry] of this.entries) {
+            const changedIdentity = invalidated.has(key) && entry.providerLastUpdate !== currentGeneration;
+            if (!keep.has(key) || changedIdentity) {
                 this.entries.delete(key);
                 this.journal.mark(key, null);
                 changed = true;

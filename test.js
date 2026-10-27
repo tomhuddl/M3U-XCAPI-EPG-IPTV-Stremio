@@ -706,7 +706,7 @@ async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval(
     addon.enrichCatalogMetaItems = async batch => {
         enriched.push(...batch.map(item => item.id));
         for (const item of batch) {
-            addon.cacheCatalogMetaPreview(item.id, { name: item.name, description: "Cached preview" });
+            addon.cacheCatalogMetaPreview(item.id, { name: item.name, type: item.type, description: "Cached preview", metadataVersion: 3, metadataCheckedAt: Date.now(), missingMetadataCheckedAt: Date.now() });
         }
     };
 
@@ -735,7 +735,7 @@ async function testCataloguePrefetchSkipsWarmCatalogueAfterRestart() {
     let enrichmentCalls = 0;
     addon.persistentCatalogMetaCache = {
         get: async key => key === "__catalog_prefetch_status__:movie"
-            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 3 }, fresh: true }
+            ? { value: { completedAt, catalogueFingerprint: fingerprint, version: 4 }, fresh: true }
             : key === "movie-1"
                 ? { value: {
                     name: "Movie 1",
@@ -801,6 +801,7 @@ async function testCataloguePrefetchBacksOffAfterIncompleteWarmup() {
 
 async function testConcurrentSeriesInfoLookupsAreDeduplicated() {
     const addon = new M3UEPGAddon({ provider: "direct" });
+    addon.series = [{ id: "iptv_series_series-1", series_id: "series-1", name: "Series 1", type: "series" }];
     let calls = 0;
     const originalFetchSeriesInfo = require("./src/js/providers/directProvider").fetchSeriesInfo;
     const providerModule = require("./src/js/providers/directProvider");
@@ -837,6 +838,7 @@ async function testMovieTmdbMissIsCached() {
         }
     };
     const item = { id: "iptv_vod_123", name: "Test movie", type: "movie" };
+    addon.movies = [item];
     const results = await Promise.all([
         addon.resolveMovieTmdbId(item.id, item, providerModule),
         addon.resolveMovieTmdbId(item.id, item, providerModule),
@@ -1024,6 +1026,8 @@ async function main() {
         testLruInvalidSettingsFallback,
         testPublicAndPrivateAddressClassification,
         testPrivateDestinationsAreRejected,
+        ...require("./tests/providerRefresh.test"),
+        ...require("./tests/metadataRefresh.test"),
     ];
 
     for (const test of tests) {

@@ -35,6 +35,7 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
             : { programmes: 0, textChars: 0 };
         if (!Number.isSafeInteger(budget.programmes) || budget.programmes < 0) budget.programmes = 0;
         if (!Number.isSafeInteger(budget.textChars) || budget.textChars < 0) budget.textChars = 0;
+        let rootSeen = false;
         let settled = false;
         const xml = sax.createStream(true, { trim: false, normalize: false });
 
@@ -46,7 +47,16 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
         };
 
         xml.on('opentag', (tag) => {
+            if (settled) return;
             const name = tag.name.toLowerCase();
+            if (!rootSeen) {
+                rootSeen = true;
+                if (name !== 'tv') {
+                    finish(new Error('Invalid XMLTV data: expected a tv root element'));
+                    readable.destroy();
+                    return;
+                }
+            }
             if (name === 'programme') {
                 const attrs = tag.attributes || {};
                 const channel = attrs.channel;
@@ -128,7 +138,9 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
             if (readable && typeof readable.destroy === 'function') readable.destroy();
             finish(new Error('Invalid XMLTV data: ' + error.message));
         });
-        xml.on('end', () => finish());
+        xml.on('end', () => finish(rootSeen
+            ? null
+            : new Error('Invalid XMLTV data: expected a tv root element')));
         readable.on('data', (chunk) => {
             bytesRead += chunk.length;
             if (bytesRead > MAX_EPG_BYTES) {

@@ -24,6 +24,21 @@ async function mapWithConcurrency(items, concurrency, mapper) {
     return results;
 }
 
+function assertCatalogueIdentifiers(items, idField, label) {
+  for (const item of items) {
+    const identifier = item && typeof item === "object" && !Array.isArray(item)
+      ? item[idField] : null;
+    const validIdentifier = typeof identifier === "number"
+      ? Number.isSafeInteger(identifier) && identifier > 0
+      : typeof identifier === "string" && /^\d+$/.test(identifier) && /[1-9]/.test(identifier);
+    if (!validIdentifier) {
+      const error = new Error(`Xtream ${label} returned a record without a valid ${idField}`);
+      error.code = "XTREAM_INVALID_CATALOGUE";
+      throw error;
+    }
+  }
+}
+
 async function fetchData(addonInstance) {
   const { config } = addonInstance;
   const {
@@ -42,6 +57,7 @@ async function fetchData(addonInstance) {
   addonInstance.movies = [];
   if (config.includeSeries !== false) addonInstance.series = [];
   addonInstance.epgData = {};
+  addonInstance.epgRefreshFailed = false;
 
   if (xtreamUseM3U) {
     // M3U plus mode (series heuristic limited)
@@ -105,6 +121,10 @@ async function fetchData(addonInstance) {
     if (!vodResp.ok) throw new Error("Xtream VOD streams fetch failed");
     const live = await liveResp.json();
     const vod = await vodResp.json();
+    if (!Array.isArray(live)) throw new Error("Xtream live streams returned a non-list response");
+    if (!Array.isArray(vod)) throw new Error("Xtream VOD streams returned a non-list response");
+    assertCatalogueIdentifiers(live, "stream_id", "live streams");
+    assertCatalogueIdentifiers(vod, "stream_id", "VOD streams");
 
     let liveCatMap = {};
     let vodCatMap = {};
@@ -135,7 +155,7 @@ async function fetchData(addonInstance) {
       /* ignore */
     }
 
-    addonInstance.channels = (Array.isArray(live) ? live : []).map((s) => {
+    addonInstance.channels = live.map((s) => {
       const cat =
         liveCatMap[s.category_id] || s.category_name ||
         (s.category_id != null ? String(s.category_id) : "") || "Live";
@@ -155,7 +175,7 @@ async function fetchData(addonInstance) {
       };
     });
 
-    addonInstance.movies = (Array.isArray(vod) ? vod : []).map((s) => {
+    addonInstance.movies = vod.map((s) => {
       const cat = vodCatMap[s.category_id] || s.category_name || "Movies";
       return {
         id: `iptv_vod_${s.stream_id}`,
@@ -203,6 +223,7 @@ async function fetchData(addonInstance) {
         if (seriesResp.ok) {
           const seriesList = await seriesResp.json();
           if (Array.isArray(seriesList)) {
+            assertCatalogueIdentifiers(seriesList, "series_id", "get_series");
             addonInstance.series = seriesList.map((s) => {
               const cat =
                 seriesCatMap[s.category_id] || s.category_name || "Series";
@@ -229,23 +250,23 @@ async function fetchData(addonInstance) {
               addonInstance.log?.warn?.("Xtream get_series returned an empty list", summary);
             }
           } else {
-            addonInstance.log?.warn?.("Xtream get_series returned a non-list response", {
-              responseType: seriesList === null ? "null" : typeof seriesList,
-              durationMs: Date.now() - seriesFetchStartedAt,
-            });
+            throw new Error("Xtream get_series returned a non-list response");
           }
         } else {
-          addonInstance.log?.warn?.("Xtream get_series returned an HTTP error", {
-            status: seriesResp.status,
-            durationMs: Date.now() - seriesFetchStartedAt,
-          });
+          const error = new Error("Xtream series list fetch failed");
+          error.status = seriesResp.status;
+          throw error;
         }
       } catch (error) {
         addonInstance.log?.warn?.("Xtream get_series request failed", {
           name: error?.name || "Error",
           code: typeof error?.code === "string" ? error.code : null,
+          ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
           durationMs: Date.now() - seriesFetchStartedAt,
         });
+        // A failed section is not an observed empty list. Preserve the complete
+        // provider snapshot instead of confirming removals after upstream failures.
+        throw error;
       }
     }
   }
@@ -265,12 +286,14 @@ async function fetchData(addonInstance) {
     const parsedSources = await mapWithConcurrency(epgSources, getEpgFetchConcurrency(), async sourceUrl => {
       try {
         const epgResp = await fetch(sourceUrl, { timeout: 120000 });
-        if (!epgResp.ok || !epgResp.body) {
-          if (epgResp.body) epgResp.body.destroy();
+        if (!epgResp || !epgResp.ok || !epgResp.body) {
+          addonInstance.epgRefreshFailed = true;
+          if (epgResp?.body) epgResp.body.destroy();
           return null;
         }
         return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
       } catch {
+        addonInstance.epgRefreshFailed = true;
         return null;
       }
     });
