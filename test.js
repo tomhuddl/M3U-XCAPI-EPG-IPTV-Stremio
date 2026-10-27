@@ -50,6 +50,67 @@ function testCatalogueQueryResultCacheIsBoundedAndPreservesPagination() {
         "empty normalized searches should not be cached as ordinary queries");
 }
 
+function testBuildGenresNormalizesNumericXtreamCategories() {
+    const manifest = {
+        catalogs: [
+            { id: "iptv_channels", genres: [] },
+            { id: "iptv_movies", genres: [] },
+            { id: "iptv_series", genres: [] }
+        ],
+        behaviorHints: {}
+    };
+    const addon = new M3UEPGAddon({ provider: "xtream" }, manifest);
+    addon.channels = [
+        { category: 14 },
+        { category: " News ", attributes: { "group-title": "Ignored fallback" } },
+        { category: null, attributes: { "group-title": " Sports " } },
+        { category: { unexpected: true }, attributes: { "group-title": " Other " } }
+    ];
+    addon.movies = [{ category: 27 }];
+    addon.series = [{ category: null, attributes: { "group-title": " Drama " } }];
+    addon.epgData = {};
+
+    assert.doesNotThrow(() => addon.buildGenresInManifest());
+    assert.deepStrictEqual(manifest.catalogs[0].genres, ["All Channels", "14", "News", "Sports", "Other"]);
+    assert.deepStrictEqual(manifest.catalogs[1].genres, ["27"]);
+    assert.deepStrictEqual(manifest.catalogs[2].genres, ["Drama"]);
+}
+
+async function testFailedGenreBuildDoesNotPersistProviderRefresh() {
+    const provider = require("./src/js/providers/directProvider");
+    const originalFetchData = provider.fetchData;
+    const manifest = { catalogs: [], behaviorHints: {} };
+    const addon = new M3UEPGAddon({
+        provider: "direct",
+        m3uUrl: "https://example.com/refresh-rollback-test.m3u"
+    }, manifest);
+    const previousChannels = [{ id: "old-channel", category: "Old" }];
+    const previousLastUpdate = Date.now() - addon.updateInterval - 1000;
+    addon.channels = previousChannels;
+    addon.lastUpdate = previousLastUpdate;
+    let persisted = false;
+    addon.log = { error() {} };
+    addon.pruneRemovedCatalogState = async () => {};
+    addon.saveToCache = async () => { persisted = true; };
+    addon.buildGenresInManifest = () => { throw new TypeError("simulated genre build failure"); };
+
+    provider.fetchData = async refreshed => {
+        refreshed.channels = [{ id: "new-channel", category: "New" }];
+        refreshed.movies = [];
+        refreshed.series = [];
+        refreshed.epgData = {};
+    };
+    try {
+        await addon.updateData(true);
+    } finally {
+        provider.fetchData = originalFetchData;
+    }
+
+    assert.strictEqual(persisted, false, "a refresh that fails genre building must not save its new provider snapshot");
+    assert.strictEqual(addon.channels, previousChannels, "the last-known-good in-memory catalogue must be restored");
+    assert.strictEqual(addon.lastUpdate, previousLastUpdate, "a failed refresh must leave its prior timestamp intact");
+}
+
 function testDirectEpisodeLookupUsesExactIndex() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     const staleEpisode = { id: "iptv_series_ep_stale", title: "Old episode" };
@@ -930,6 +991,8 @@ async function main() {
         testNormalizedSearchMatcherAgreesWithPublicMatcher,
         testSearchRejectsTypoOnlyMatches,
         testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
+        testBuildGenresNormalizesNumericXtreamCategories,
+        testFailedGenreBuildDoesNotPersistProviderRefresh,
         // Keep search, cache, and prefetch regression checks ahead of metadata mapping checks.
         testScheduledProgramsCacheParsedTimestamps,
         testScheduledProgramsIndexReturnsOnlyOverlappingPrograms,

@@ -840,40 +840,30 @@ class M3UEPGAddon {
             catalog.genres = groups;
         }
 
+        function getGenres(items) {
+            const normalize = value => {
+                if (typeof value === 'string') return value.trim();
+                if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+                return '';
+            };
+            return [...new Set((Array.isArray(items) ? items : [])
+                .map(item => normalize(item?.category) || normalize(item?.attributes?.['group-title']))
+                .filter(Boolean))];
+        }
+
         if (tvCatalog) {
-            const groups = [
-                ...new Set(
-                    this.channels
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ];
+            const groups = getGenres(this.channels);
             if (!groups.includes('All Channels')) groups.unshift('All Channels');
             setGenresOnCatalog(tvCatalog, groups);
         }
 
         if (movieCatalog) {
-            const movieGroups = [
-                ...new Set(
-                    this.movies
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ];
+            const movieGroups = getGenres(this.movies);
             setGenresOnCatalog(movieCatalog, movieGroups);
         }
 
         if (seriesCatalog) {
-            const seriesGroups = [
-                ...new Set(
-                    this.series
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ];
+            const seriesGroups = getGenres(this.series);
             setGenresOnCatalog(seriesCatalog, seriesGroups);
         }
 
@@ -1472,6 +1462,9 @@ class M3UEPGAddon {
             this.lastUpdate = Date.now();
             providerRefreshState.set(this.cacheKey, this.lastUpdate);
 
+            // Build user-facing catalogue metadata before saving the refreshed
+            // snapshot. If this fails, the previous persistent snapshot stays intact.
+            this.buildGenresInManifest();
             await this.pruneRemovedCatalogState(previous);
             if (CACHE_ENABLED) await this.saveToCache();
             else {
@@ -1493,7 +1486,6 @@ class M3UEPGAddon {
                     });
                 }
             }
-            this.buildGenresInManifest();
             this.log.info('Provider data refresh complete', {
                 channels: this.channels.length,
                 movies: this.movies.length,
@@ -1516,7 +1508,14 @@ class M3UEPGAddon {
             this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
             this.pendingRemovalCandidates = previous.pendingRemovalCandidates;
             providerRefreshState.set(this.cacheKey, previous.lastUpdate || 0);
-            this.log.error('[UPDATE] Failed; retaining last-known-good data:', error && error.name ? error.name : 'Error');
+            this.log.error('[UPDATE] Failed; retaining last-known-good data:', {
+                name: error?.name || 'Error',
+                message: String(error?.message || 'No error message')
+                    .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted URL]')
+                    .replace(/((?:username|password|token|api[_-]?key)=)[^&\s]+/gi, '$1[redacted]')
+                    .slice(0, 240),
+                code: typeof error?.code === 'string' ? error.code : null
+            });
         }
     }
     startScheduledRefresh() {
