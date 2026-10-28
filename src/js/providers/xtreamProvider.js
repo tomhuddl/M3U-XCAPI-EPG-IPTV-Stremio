@@ -5,7 +5,7 @@
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
-const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../../seriesRuntime");
+const { parseRuntimeMinutes } = require("../../../seriesRuntime");
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -461,32 +461,26 @@ async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
   return tmdbId;
 }
 
-async function fetchSeriesRuntimeSummary(addonInstance, seriesId) {
+async function fetchSeriesRuntimeInfo(addonInstance, seriesId) {
   if (!seriesId || !hasSeriesCredentials(addonInstance)) return null;
   const { payload } = await requestSeriesPayload(addonInstance, seriesId);
   const groups = payload?.episodes;
   if (!groups || typeof groups !== "object" || (Array.isArray(groups) && groups.length > 0)) return null;
-  const runtimes = [];
-  for (const [seasonKey, episodes] of Object.entries(groups)) {
-    if (!Array.isArray(episodes)) return null;
-    for (const episode of episodes) {
-      if (!episode || typeof episode !== "object" || Array.isArray(episode)) return null;
-      const runtimeMinutes = episodeRuntimeMinutes(episode);
-      if (runtimeMinutes === null) continue;
-      runtimes.push({
-        id: episode.id,
+  const episodes = [];
+  for (const [seasonKey, rows] of Object.entries(groups)) {
+    if (!Array.isArray(rows)) return null;
+    for (const episode of rows) {
+      if (!episode || typeof episode !== "object" || Array.isArray(episode) || episode.id == null || String(episode.id).trim() === "") return null;
+      episodes.push({
+        id: "iptv_series_ep_" + episode.id,
         season: Number.parseInt(episode.season ?? seasonKey, 10),
         episode: Number.parseInt(episode.episode_num ?? episode.episode ?? 0, 10),
-        runtimeMinutes
+        runtimeMinutes: episodeRuntimeMinutes(episode)
       });
     }
   }
-  const average = averageEpisodeRuntime(runtimes);
-  return {
-    ...(average || { episodeCount: 0, totalMinutes: 0 }),
-    source: "provider-episodes",
-    complete: true
-  };
+  const info = payload.info && typeof payload.info === "object" ? payload.info : {};
+  return { episodes, tmdbId: normalizeTmdbId(info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id), fetchedAt: Date.now() };
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
@@ -571,6 +565,6 @@ module.exports = {
   fetchMovieInfo,
   fetchSeriesInfo,
   fetchSeriesTmdbId,
-  fetchSeriesRuntimeSummary,
+  fetchSeriesRuntimeInfo,
   normalizeTmdbId,
 };

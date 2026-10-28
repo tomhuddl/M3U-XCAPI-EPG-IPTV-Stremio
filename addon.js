@@ -13,7 +13,7 @@ const PersistentSeriesInfoCache = require("./persistentSeriesInfoCache");
 const cleanupPersistentCacheFiles = require("./persistentCacheMaintenance");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
-const { parseRuntimeMinutes, averageEpisodeRuntime } = require("./seriesRuntime");
+const { parseRuntimeMinutes, providerEpisodes, providerEpisodeFingerprint, averageProviderEpisodes } = require("./seriesRuntime");
 
 // Retry incomplete OMDb data independently of the longer metadata refresh interval.
 // Missing ratings/runtime are retried at most once per configured interval.
@@ -214,7 +214,10 @@ function mergeCatalogMetadataPreservingKnownFields(previous, refreshed) {
     // two sources happen to report the same minute value.
     if (providerFallback && Object.prototype.hasOwnProperty.call(fresh, 'runtimeAverage') &&
         parseRuntimeMinutes(old.runtime) !== null) {
-        const lowerPriority = old.runtimeAverage?.source === 'tmdb-episodes' &&
+        const sameScope = (old.runtimeAverage?.version === 1 && fresh.runtimeAverage?.version === 1) ||
+            (old.runtimeAverage?.version === 2 && fresh.runtimeAverage?.version === 2 &&
+                old.runtimeAverage?.episodeFingerprint === fresh.runtimeAverage?.episodeFingerprint);
+        const lowerPriority = sameScope && ['tmdb-episodes', 'mixed-episodes'].includes(old.runtimeAverage?.source) &&
             fresh.runtimeAverage?.source === 'provider-episodes';
         const acceptedUpdate = hasDerivedSeriesRuntime(old) && !lowerPriority &&
             (hasDerivedSeriesRuntime(fresh) ||
@@ -230,42 +233,66 @@ function mergeCatalogMetadataPreservingKnownFields(previous, refreshed) {
 }
 
 function hasDerivedSeriesRuntime(value) {
-    return value?.type === 'series' && value.runtimeAverage?.version === 1 &&
+    return value?.type === 'series' && [1, 2].includes(value.runtimeAverage?.version) &&
         parseRuntimeMinutes(value.runtime) !== null && value.runtimeAverage.runtime === value.runtime;
 }
 
-function seriesRuntimeAverageNeedsRefresh(value) {
+function providerRuntimeScopeIsValid(average) {
+    return average?.version === 2 && average.scope === 'provider-episodes' &&
+        typeof average.episodeFingerprint === 'string' && /^[a-f0-9]{64}$/.test(average.episodeFingerprint);
+}
+
+function seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate = null) {
     if (value?.type !== 'series') return false;
     if (parseRuntimeMinutes(value.runtime) !== null && !hasDerivedSeriesRuntime(value)) return false;
     const average = value.runtimeAverage;
-    if (average?.version !== 1) return true;
-    if (average.complete === false && !Number(average.attemptedAt)) return true;
+    const attemptedGeneration = Number(average?.attemptProviderLastUpdate ?? average?.providerLastUpdate);
+    if (providerLastUpdate !== null && attemptedGeneration !== Number(providerLastUpdate)) return true;
+    if (!providerRuntimeScopeIsValid(average)) {
+        const attemptedAt = Number(average?.scopeMigrationAttemptedAt) || 0;
+        return !attemptedAt || Date.now() - attemptedAt >= OMDB_MISSING_DATA_RETRY_MS;
+    }
     const checkedAt = Number(average.attemptedAt) || Number(average.checkedAt) || 0;
     return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
 }
 
+function providerRuntimeRecord(result, tmdbId, providerLastUpdate, now = Date.now()) {
+    return {
+        version: 2, scope: 'provider-episodes', runtime: result.runtime, source: result.source,
+        episodeFingerprint: result.episodeFingerprint, providerEpisodeCount: result.providerEpisodeCount,
+        episodeCount: result.episodeCount, totalMinutes: result.totalMinutes,
+        tmdbEpisodeCount: result.tmdbEpisodeCount || 0, providerDurationCount: result.providerDurationCount || 0,
+        missingDurationCount: result.missingDurationCount || 0,
+        complete: result.complete === true, checkedAt: now, attemptedAt: now,
+        tmdbId: tmdbId ? String(tmdbId) : null, providerLastUpdate, attemptProviderLastUpdate: providerLastUpdate,
+        ...(Array.isArray(result.seasons) ? { seasons: result.seasons } : {})
+    };
+}
+
 function createSeriesRuntimeSummary() {
     return {
-        seriesLevel: 0, tmdbEpisodeAverage: 0, providerEpisodeAverage: 0,
+        seriesLevel: 0, tmdbEpisodeAverage: 0, providerEpisodeAverage: 0, mixedEpisodeAverage: 0, legacyScope: 0,
         missing: 0, retainedAfterFailedRefresh: 0, retryDue: 0, missingRetryDeferred: 0
     };
 }
 
-function countSeriesRuntime(summary, value) {
+function countSeriesRuntime(summary, value, providerLastUpdate = null) {
     const present = parseRuntimeMinutes(value?.runtime) !== null;
     const derived = hasDerivedSeriesRuntime(value);
     if (!present) summary.missing++;
     else if (derived && value.runtimeAverage.source === 'tmdb-episodes') summary.tmdbEpisodeAverage++;
     else if (derived && value.runtimeAverage.source === 'provider-episodes') summary.providerEpisodeAverage++;
+    else if (derived && value.runtimeAverage.source === 'mixed-episodes') summary.mixedEpisodeAverage++;
     else summary.seriesLevel++;
+    if (derived && !providerRuntimeScopeIsValid(value.runtimeAverage)) summary.legacyScope++;
     if (derived && Number(value.runtimeAverage.attemptedAt) > Number(value.runtimeAverage.checkedAt)) {
         summary.retainedAfterFailedRefresh++;
     }
-    if (!value || seriesRuntimeAverageNeedsRefresh(value)) summary.retryDue++;
+    if (!value || seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate)) summary.retryDue++;
     else if (!present) summary.missingRetryDeferred++;
 }
 
-function getCatalogMetadataWarmupState(value) {
+function getCatalogMetadataWarmupState(value, providerLastUpdate = null) {
     const missingFields = value ? missingCatalogMetadataFields(value) : ['preview'];
     const nameMissing = !String(value?.name || '').trim();
     const metadataVersionOld = Boolean(value) && !(Number(value.metadataVersion) >= 3);
@@ -275,7 +302,7 @@ function getCatalogMetadataWarmupState(value) {
     const incomplete = !value || nameMissing || metadataVersionOld || imdbIdLookupPending || missingFields.length > 0;
     const retryDue = !value || nameMissing ||
         ((metadataVersionOld || imdbIdLookupPending) && catalogMetadataRefreshAttemptIsDue(value)) ||
-        omdbRetryDue || catalogRetryDue || seriesRuntimeAverageNeedsRefresh(value);
+        omdbRetryDue || catalogRetryDue || seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate);
     return { missingFields, incomplete, retryDue };
 }
 
@@ -1906,87 +1933,74 @@ class M3UEPGAddon {
         const id = String(seriesItem?.id || '');
         if (!id || !this.isCatalogItemCurrent(id, providerLastUpdate)) return preview;
         const current = this.catalogMetaCache.get(id) || preview;
-        if (!seriesRuntimeAverageNeedsRefresh(current)) return current;
+        if (!seriesRuntimeAverageNeedsRefresh(current, providerLastUpdate)) return current;
         const key = providerLastUpdate + ':' + id;
         if (this.seriesRuntimeInFlight.has(key)) return this.seriesRuntimeInFlight.get(key);
         const task = (async () => {
-            const tmdbId = current?._tmdbId || seriesItem.tmdbId || null;
             const previous = current?.runtimeAverage;
+            let tmdbId = current?._tmdbId || seriesItem.tmdbId || null;
             let result = null;
             try {
-                if (tmdbId) {
-                    result = await tmdbMetadata.getSeriesRuntimeMetadata(tmdbId, {
-                        previous, refresh: Boolean(previous?.version === 1)
-                    });
+                const seriesKey = getProviderSeriesKey(seriesItem);
+                let info = this.seriesInfoCache.get(seriesKey);
+                if (!info || info.fetchError || Number(info.fetchedAt) < Number(providerLastUpdate)) {
+                    info = null;
+                    if (this.providerName === 'xtream') {
+                        const saved = await this.persistentSeriesInfoCache.get(seriesKey, providerLastUpdate);
+                        if (saved?.fresh && !saved.value.fetchError) info = saved.value;
+                    }
                 }
                 if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                const previousTmdbAverage = hasDerivedSeriesRuntime(current) && previous.source === 'tmdb-episodes';
-                if ((!result?.runtime || result.complete !== true) && !previousTmdbAverage) {
-                    const seriesKey = getProviderSeriesKey(seriesItem);
-                    let info = this.seriesInfoCache.get(seriesKey);
-                    if (!info || Number(info.fetchedAt) < Number(providerLastUpdate)) {
-                        info = null;
-                        if (this.providerName === 'xtream') {
-                            const saved = await this.persistentSeriesInfoCache.get(seriesKey, providerLastUpdate);
-                            if (saved?.fresh) info = saved.value;
-                        }
-                    }
-                    if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                    let providerAverage = info && !info.fetchError ? averageEpisodeRuntime(info.videos) : null;
-                    if (!providerAverage && this.providerName === 'direct') {
-                        const directInfo = await this.ensureSeriesInfo(seriesKey);
-                        providerAverage = directInfo && !directInfo.fetchError ? averageEpisodeRuntime(directInfo.videos) : null;
-                    }
-                    if (providerAverage) {
-                        result = { ...providerAverage, source: 'provider-episodes', complete: true };
-                    } else if (this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+                if (!info) {
+                    if (this.providerName === 'direct') info = await this.ensureSeriesInfo(seriesKey);
+                    else if (this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
                         const provider = require('./src/js/providers/xtreamProvider.js');
-                        const providerResult = await provider.fetchSeriesRuntimeSummary(this, seriesKey);
-                        if (providerResult?.runtime) result = providerResult;
+                        info = await provider.fetchSeriesRuntimeInfo(this, seriesKey);
+                    }
+                }
+                if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
+                const episodes = info && !info.fetchError ? (info.episodes || info.videos) : null;
+                if (Array.isArray(episodes)) {
+                    tmdbId = tmdbId || info.tmdbId || null;
+                    result = await tmdbMetadata.getSeriesRuntimeMetadata(tmdbId, {
+                        episodes, previous, refresh: Boolean(previous)
+                    });
+                    if (result && result.source !== 'tmdb-series') {
+                        result = { ...result, scope: 'provider-episodes',
+                            episodeFingerprint: providerEpisodeFingerprint(episodes),
+                            providerEpisodeCount: providerEpisodes(episodes).length };
                     }
                 }
             } catch {
-                // A failed estimate must never erase a previously saved runtime.
+                // A failed lookup must not erase the last saved runtime.
             }
             if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
             const latest = this.catalogMetaCache.get(id) || current;
             if (parseRuntimeMinutes(latest.runtime) !== null && !hasDerivedSeriesRuntime(latest)) return latest;
             if (tmdbId && latest._tmdbId && String(tmdbId) !== String(latest._tmdbId)) return latest;
+            const samePopulation = latest.runtimeAverage?.version === 2 && latest.runtimeAverage.scope === 'provider-episodes' &&
+                latest.runtimeAverage.episodeFingerprint === result?.episodeFingerprint;
             const now = Date.now();
             let updated;
-            if (parseRuntimeMinutes(result?.runtime) !== null && result.complete === true) {
-                updated = {
-                    ...latest,
-                    runtime: result.runtime,
-                    runtimeAverage: result.source === 'tmdb-series' ? null : {
-                        version: 1, runtime: result.runtime, source: result.source,
-                        episodeCount: result.episodeCount, totalMinutes: result.totalMinutes,
-                        complete: true, checkedAt: now, attemptedAt: now,
-                        tmdbId: tmdbId ? String(tmdbId) : null, providerLastUpdate,
-                        ...(Array.isArray(result.seasons) ? { seasons: result.seasons } : {})
-                    }
-                };
+            if (parseRuntimeMinutes(result?.runtime) !== null && (result.complete === true || !samePopulation)) {
+                updated = { ...latest, runtime: result.runtime,
+                    runtimeAverage: result.source === 'tmdb-series' ? null : providerRuntimeRecord(result, tmdbId, providerLastUpdate, now) };
             } else {
-                updated = {
-                    ...latest,
-                    runtimeAverage: {
-                        ...(latest.runtimeAverage || {}), version: 1,
-                        checkedAt: Number(latest.runtimeAverage?.checkedAt) || 0,
-                        attemptedAt: now,
-                        complete: latest.runtimeAverage?.complete === true,
-                        tmdbId: tmdbId ? String(tmdbId) : null,
-                        ...(Array.isArray(result?.seasons) ? { seasons: result.seasons } : {})
-                    }
-                };
+                updated = { ...latest, runtimeAverage: {
+                    ...(latest.runtimeAverage || {}), version: latest.runtimeAverage?.version || 1,
+                    checkedAt: Number(latest.runtimeAverage?.checkedAt) || 0,
+                    attemptedAt: now, attemptProviderLastUpdate: providerLastUpdate,
+                    ...(!providerRuntimeScopeIsValid(latest.runtimeAverage) ? { scopeMigrationAttemptedAt: now } : {}),
+                    complete: latest.runtimeAverage?.complete === true,
+                    ...(samePopulation && Array.isArray(result?.seasons) ? { seasons: result.seasons } : {}),
+                    tmdbId: tmdbId ? String(tmdbId) : null
+                } };
             }
             return this.persistCatalogMetaIfCurrent(id, updated, providerLastUpdate);
         })();
         this.seriesRuntimeInFlight.set(key, task);
-        try {
-            return await task;
-        } finally {
-            if (this.seriesRuntimeInFlight.get(key) === task) this.seriesRuntimeInFlight.delete(key);
-        }
+        try { return await task; }
+        finally { if (this.seriesRuntimeInFlight.get(key) === task) this.seriesRuntimeInFlight.delete(key); }
     }
 
     async getSeriesDetailRuntime(seriesItem, tmdb, omdb, info, seasonResults, providerLastUpdate = this.lastUpdate) {
@@ -2003,46 +2017,33 @@ class M3UEPGAddon {
             .find(value => parseRuntimeMinutes(value) !== null);
         if (official) return { runtime: official, runtimeAverage: null };
         if (parseRuntimeMinutes(saved?.runtime) !== null && !derived) return { runtime: saved.runtime };
-        const bySeason = new Map(seasonResults.filter(([, episodes]) => Array.isArray(episodes)));
-        const tmdbAverage = averageEpisodeRuntime([...bySeason.values()].flat());
-        const providerAverage = info && !info.fetchError ? averageEpisodeRuntime(info.videos) : null;
-        const average = tmdbAverage || providerAverage;
-        const source = tmdbAverage ? 'tmdb-episodes' : 'provider-episodes';
-        const required = (tmdb?.runtimeSeasons || []).filter(season => season.episodeCount !== 0);
-        const seasonIsComplete = expected => {
-            const episodes = bySeason.get(expected.season);
-            if (!Array.isArray(episodes)) return false;
-            if (expected.episodeCount == null) return true;
-            const numbers = new Set(episodes.map(episode => Number(episode?.episode))
-                .filter(number => Number.isSafeInteger(number) && number > 0));
-            return numbers.size >= expected.episodeCount;
-        };
-        const complete = tmdbAverage
-            ? required.length > 0 && required.every(seasonIsComplete)
-            : Boolean(providerAverage && !info?.fetchError);
-        if (derived && (!complete || (!tmdbAverage && saved.runtimeAverage.source === 'tmdb-episodes'))) {
-            return { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage };
-        }
-        if (!average) return derived ? { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage } : {};
+        const retained = () => derived ? { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage } : {};
+        if (!info || info.fetchError || !Array.isArray(info.videos)) return retained();
+        const average = averageProviderEpisodes(info.videos, seasonResults);
+        if (!average.runtime) return retained();
+        const tmdbId = seriesItem.tmdbId || saved?._tmdbId || info.tmdbId || null;
+        const complete = !tmdbId || average.unresolvedEpisodeCount === 0;
+        const samePopulation = derived && saved.runtimeAverage.version === 2 &&
+            saved.runtimeAverage.scope === 'provider-episodes' && saved.runtimeAverage.episodeFingerprint === average.episodeFingerprint;
+        const lowerPriority = samePopulation && ['tmdb-episodes', 'mixed-episodes'].includes(saved.runtimeAverage.source) &&
+            average.source === 'provider-episodes';
+        if (samePopulation && (!complete || lowerPriority)) return retained();
         const now = Date.now();
-        const seasons = tmdbAverage ? [...bySeason].map(([season, episodes]) => {
-            const summary = averageEpisodeRuntime(episodes);
-            const expected = required.find(entry => entry.season === season);
-            return {
-                season, episodeCount: expected?.episodeCount ?? episodes.length,
-                runtimeCount: summary?.episodeCount || 0, totalMinutes: summary?.totalMinutes || 0,
-                checkedAt: now, complete: expected ? seasonIsComplete(expected) : true
-            };
-        }) : undefined;
-        return {
-            runtime: average.runtime,
-            runtimeAverage: {
-                ...average, version: 1, source, complete, checkedAt: now,
-                attemptedAt: complete ? now : 0,
-                tmdbId: seriesItem.tmdbId || saved?._tmdbId || null, providerLastUpdate,
-                ...(seasons ? { seasons } : {})
-            }
-        };
+        const groups = new Map();
+        for (const episode of providerEpisodes(info.videos)) {
+            const season = episode.episode === null ? null : episode.season;
+            if (!groups.has(season)) groups.set(season, []);
+            groups.get(season).push(episode);
+        }
+        const seasons = [...groups].map(([season, episodes]) => {
+            const summary = averageProviderEpisodes(episodes, seasonResults);
+            return { season, episodeFingerprint: summary.episodeFingerprint, episodeCount: episodes.length,
+                runtimeCount: summary.episodeCount, totalMinutes: summary.totalMinutes,
+                tmdbEpisodeCount: summary.tmdbEpisodeCount, providerDurationCount: summary.providerDurationCount,
+                checkedAt: now, complete: !tmdbId || summary.unresolvedEpisodeCount === 0 };
+        });
+        return { runtime: average.runtime,
+            runtimeAverage: providerRuntimeRecord({ ...average, complete, seasons }, tmdbId, providerLastUpdate, now) };
     }
 
     async buildSeriesMeta(seriesItem) {
@@ -2210,7 +2211,7 @@ class M3UEPGAddon {
             // An in-memory hit must still wait for a due missing-field retry or
             // an already-running refresh, just like a preview loaded from disk.
             return forceRefresh || cached === undefined || metadataPending || runtimePending ||
-                getCatalogMetadataWarmupState(cached).retryDue || catalogMetadataNormalRefreshIsDue(cached);
+                getCatalogMetadataWarmupState(cached, this.lastUpdate).retryDue || catalogMetadataNormalRefreshIsDue(cached);
         });
         let nextIndex = 0;
         const worker = async () => {
@@ -2438,6 +2439,7 @@ class M3UEPGAddon {
         const isCurrentGeneration = () => Number(this.lastUpdate || 0) === providerLastUpdate;
         if (!Array.isArray(items) || !items.length) return;
         const catalogueFingerprint = crypto.createHash('sha256')
+            .update(type === 'series' ? 'provider-runtime-v2:' + providerLastUpdate + '\n' : '')
             .update(items.map(item => String(item?.id || '')).join('\n'))
             .digest('hex');
         const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
@@ -2472,8 +2474,8 @@ class M3UEPGAddon {
                 for (const item of items) {
                     const saved = await this.persistentCatalogMetaCache.get(String(item.id));
                     if (!isCurrentGeneration()) return;
-                    const state = getCatalogMetadataWarmupState(saved?.value);
-                    if (seriesRuntime) countSeriesRuntime(seriesRuntime, saved?.value);
+                    const state = getCatalogMetadataWarmupState(saved?.value, providerLastUpdate);
+                    if (seriesRuntime) countSeriesRuntime(seriesRuntime, saved?.value, providerLastUpdate);
                     if (state.incomplete) {
                         cachedIncompleteItems++;
                         for (const field of state.missingFields) {
@@ -2539,7 +2541,7 @@ class M3UEPGAddon {
                         const reason = lookupDiagnostic.reason || 'unknown';
                         providerFallbackReasons[reason] = (providerFallbackReasons[reason] || 0) + 1;
                     }
-                    const state = getCatalogMetadataWarmupState(cached);
+                    const state = getCatalogMetadataWarmupState(cached, providerLastUpdate);
                     if (state.incomplete) {
                         incompleteItems++;
                         for (const field of state.missingFields) {
@@ -2585,7 +2587,7 @@ class M3UEPGAddon {
             for (const item of items) {
                 const saved = await this.persistentCatalogMetaCache.get(String(item.id));
                 const value = saved?.value;
-                if (seriesRuntime) countSeriesRuntime(seriesRuntime, value);
+                if (seriesRuntime) countSeriesRuntime(seriesRuntime, value, providerLastUpdate);
                 if (!value) {
                     omdbCatalogueSummary.missingPersistentPreview++;
                     continue;
