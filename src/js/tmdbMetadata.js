@@ -1,5 +1,6 @@
 const { safeFetch } = require("../../urlSafety");
 const LRUCache = require("../../lruCache");
+const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../seriesRuntime");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
@@ -15,6 +16,10 @@ const negativeCache = new LRUCache({
   ttl: parsePositiveInteger(process.env.TMDB_NEGATIVE_CACHE_TTL_MS, 5 * 60 * 1000, 1000, 60 * 60 * 1000),
 });
 const pending = new Map();
+const runtimePending = new Map();
+const SERIES_DETAILS_QUERY = "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null";
+const COMPLETE_SEASON_RUNTIME_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const PARTIAL_SEASON_RUNTIME_TTL_MS = parsePositiveInteger(process.env.OMDB_MISSING_DATA_RETRY_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
 const MAX_MAIN_CAST = 4;
 
 function parsePositiveInteger(value, fallback, min, max) {
@@ -332,7 +337,7 @@ async function getSeriesCatalogMetadata(tmdbId, options = {}) {
   }
   // Append images alongside aggregate credits so Discover receives the
   // transparent title logo without an extra request for each series.
-  const details = await request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null", options);
+  const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, options);
   const metadata = mapSeriesMetadata(details, details?.aggregate_credits, null, details?.images);
   if (metadata) {
     recordLookupDiagnostic(diagnostics, { reason: "tmdb_match_found", tmdbId: id });
@@ -387,6 +392,15 @@ function mapSeriesMetadata(details, credits, videos, images) {
     year,
     releaseInfo,
     runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
+    runtimeSeasons: Array.isArray(details.seasons)
+      ? [...new Map(details.seasons.filter(season =>
+          Number.isSafeInteger(season?.season_number) && season.season_number >= 0 && season.season_number <= 1000
+        ).map(season => [season.season_number, {
+          season: season.season_number,
+          episodeCount: Number.isSafeInteger(season.episode_count) && season.episode_count >= 0
+            ? season.episode_count : null
+        }])).values()].sort((a, b) => a.season - b.season)
+      : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     cast,
     links: metadataLinks(details, credits, "tv"),
@@ -401,7 +415,7 @@ async function getSeriesMetadata(tmdbId) {
   // Only trailers need a separate request; the shared request cache deduplicates it
   // when another detail request for the same series is already in progress.
   const [details, videos] = await Promise.all([
-    request("/tv/" + id + "?language=en-GB&append_to_response=aggregate_credits,images&include_image_language=en,null"),
+    request("/tv/" + id + SERIES_DETAILS_QUERY),
     request("/tv/" + id + "/videos?language=en-GB"),
   ]);
   return mapSeriesMetadata(details, details?.aggregate_credits, videos, details?.images);
@@ -423,12 +437,130 @@ function mapSeasonEpisodes(data, season) {
   })).filter(episode => Number.isSafeInteger(episode.episode) && episode.episode > 0);
 }
 
-async function getSeasonEpisodes(tmdbId, seasonNumber) {
+async function getSeasonEpisodes(tmdbId, seasonNumber, options = {}) {
   const id = validTmdbId(tmdbId);
   const season = Number(seasonNumber);
-  if (!id || !Number.isSafeInteger(season) || season < 0 || season > 100) return null;
-  const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB");
+  if (!id || !Number.isSafeInteger(season) || season < 0 || season > 1000) return null;
+  const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB", options);
   return mapSeasonEpisodes(data, season);
+}
+
+function validSeasonRuntimeSummary(value, now) {
+  return value && Number.isSafeInteger(value.season) && value.season >= 0 && value.season <= 1000 &&
+    Number.isSafeInteger(value.episodeCount) && value.episodeCount >= 0 &&
+    Number.isSafeInteger(value.runtimeCount) && value.runtimeCount >= 0 &&
+    Number.isFinite(value.totalMinutes) && value.totalMinutes >= 0 &&
+    value.totalMinutes <= value.runtimeCount * 24 * 60 &&
+    (value.runtimeCount > 0 ? value.totalMinutes > 0 : value.totalMinutes === 0) &&
+    Number.isFinite(value.checkedAt) && value.checkedAt > 0 && value.checkedAt <= now;
+}
+
+async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false } = {}) {
+  const id = validTmdbId(tmdbId);
+  if (!id || !tmdbConfigured()) return null;
+  const pendingKey = id + (refresh ? ":refresh" : ":cached");
+  if (runtimePending.has(pendingKey)) return runtimePending.get(pendingKey);
+  const task = (async () => {
+    // Share the existing series-details response with catalogue/detail requests.
+    // Persistent callers retain only the small per-season totals returned below.
+    const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, { refresh });
+    if (!details || !nonEmpty(details.name)) return null;
+    const officialRuntime = Array.isArray(details.episode_run_time)
+      ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;
+    if (officialRuntime != null) {
+      return { runtime: officialRuntime + " min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: [] };
+    }
+
+    const now = Date.now();
+    const priorSeasons = new Map();
+    if ((!previous?.tmdbId || String(previous.tmdbId) === id) && Array.isArray(previous?.seasons)) {
+      for (const summary of previous.seasons) {
+        if (validSeasonRuntimeSummary(summary, now)) priorSeasons.set(summary.season, summary);
+      }
+    }
+    const listedSeasons = new Map();
+    let validListing = Array.isArray(details.seasons);
+    for (const entry of Array.isArray(details.seasons) ? details.seasons : []) {
+      const season = entry?.season_number;
+      if (!Number.isSafeInteger(season) || season < 0 || season > 1000) {
+        validListing = false;
+        continue;
+      }
+      const episodeCount = Number.isSafeInteger(entry.episode_count) && entry.episode_count >= 0
+        ? entry.episode_count : null;
+      listedSeasons.set(season, { season, episodeCount });
+    }
+    if (Number(details.number_of_episodes) > 0 && listedSeasons.size === 0) validListing = false;
+    const seasons = [...listedSeasons.values()].sort((a, b) => a.season - b.season);
+    const summaries = new Array(seasons.length);
+    let nextSeason = 0;
+    const worker = async () => {
+      while (nextSeason < seasons.length) {
+        const index = nextSeason++;
+        const { season, episodeCount } = seasons[index];
+        const saved = priorSeasons.get(season);
+        const durationTtl = saved?.runtimeCount >= saved?.episodeCount
+          ? COMPLETE_SEASON_RUNTIME_TTL_MS : PARTIAL_SEASON_RUNTIME_TTL_MS;
+        if (saved?.complete === true && episodeCount !== null && saved.episodeCount === episodeCount &&
+            now - saved.checkedAt < durationTtl) {
+          summaries[index] = { ...saved };
+          continue;
+        }
+        if (episodeCount === 0) {
+          summaries[index] = { season, episodeCount: 0, runtimeCount: 0, totalMinutes: 0, checkedAt: now, complete: true };
+          continue;
+        }
+        // Use the same cached endpoint as getSeasonEpisodes, but do not build
+        // thumbnails, credits or full episode metadata for a runtime-only pass.
+        const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB", {
+          refresh: Boolean(refresh || saved)
+        });
+        if (!data || !Array.isArray(data.episodes)) {
+          summaries[index] = saved ? { ...saved, complete: false } : {
+            season, episodeCount: episodeCount ?? 0, runtimeCount: 0,
+            totalMinutes: 0, checkedAt: now, complete: false
+          };
+          continue;
+        }
+        const episodes = data.episodes.filter(episode => episode && typeof episode === "object" &&
+          Number.isSafeInteger(episode.episode_number) && episode.episode_number >= 0);
+        const average = averageEpisodeRuntime(episodes.map(episode => ({
+          id: episode.id,
+          season: Number.isSafeInteger(episode.season_number) && episode.season_number >= 0 ? episode.season_number : season,
+          episode: episode.episode_number,
+          runtime: episode.runtime
+        })));
+        const uniqueEpisodeCount = new Set(episodes.map(episode => episode.episode_number)).size;
+        const complete = episodes.length === data.episodes.length &&
+          (episodeCount === null || uniqueEpisodeCount >= episodeCount);
+        summaries[index] = !complete && saved ? { ...saved, complete: false } : {
+          season,
+          episodeCount: episodeCount ?? episodes.length,
+          runtimeCount: average?.episodeCount || 0,
+          totalMinutes: average?.totalMinutes || 0,
+          checkedAt: now,
+          complete
+        };
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, seasons.length) }, () => worker()));
+    const episodeCount = summaries.reduce((total, summary) => total + summary.runtimeCount, 0);
+    const totalMinutes = summaries.reduce((total, summary) => total + summary.totalMinutes, 0);
+    return {
+      ...(episodeCount ? { runtime: Math.max(1, Math.round(totalMinutes / episodeCount)) + " min" } : {}),
+      source: "tmdb-episodes",
+      episodeCount,
+      totalMinutes,
+      complete: validListing && summaries.every(summary => summary.complete),
+      seasons: summaries
+    };
+  })();
+  runtimePending.set(pendingKey, task);
+  try {
+    return await task;
+  } finally {
+    if (runtimePending.get(pendingKey) === task) runtimePending.delete(pendingKey);
+  }
 }
 
 function stripEmpty(value) {
@@ -445,6 +577,7 @@ module.exports = {
   getMovieCatalogMetadata,
   getSeriesCatalogMetadata,
   getSeasonEpisodes,
+  getSeriesRuntimeMetadata,
   getDiagnostics,
   mapMovieMetadata,
   mapSeriesMetadata,

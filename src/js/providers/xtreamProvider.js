@@ -5,6 +5,7 @@
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
+const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../../seriesRuntime");
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -347,8 +348,96 @@ async function fetchMovieInfo(addonInstance, streamId) {
   }
 }
 
+// Share only in-flight raw responses. A full detail request, an ID-only lookup
+// and an average-runtime backfill may ask for the same series simultaneously.
+// Once they settle, no raw episode payload remains in this map.
+const seriesRequests = new WeakMap();
+
+function providerRequestDiagnostic(error) {
+  const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
+    ? error.code : undefined;
+  return {
+    reason: "provider_request_error",
+    source: "xtream_get_series_info",
+    errorName: error?.name || "Error",
+    ...(errorCode ? { errorCode } : {})
+  };
+}
+
+function requestSeriesPayload(addonInstance, seriesId) {
+  let inFlight = seriesRequests.get(addonInstance);
+  if (!inFlight) {
+    inFlight = new Map();
+    seriesRequests.set(addonInstance, inFlight);
+  }
+  const key = String(Number(addonInstance.lastUpdate) || 0) + ":" + String(seriesId);
+  if (inFlight.has(key)) return inFlight.get(key);
+  const task = (async () => {
+    const { config } = addonInstance;
+    const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+    try {
+      const response = await fetch(
+        `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+        { timeout: 25000, reuseConnection: true },
+      );
+      if (!response.ok) {
+        if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+        return { diagnostic: {
+          reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
+        } };
+      }
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        return { diagnostic: {
+          reason: "provider_invalid_json", source: "xtream_get_series_info",
+          errorName: error?.name || "SyntaxError"
+        } };
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return { diagnostic: { reason: "provider_invalid_response", source: "xtream_get_series_info" } };
+      }
+      return { payload };
+    } catch (error) {
+      return { diagnostic: providerRequestDiagnostic(error) };
+    }
+  })();
+  inFlight.set(key, task);
+  task.finally(() => {
+    if (inFlight.get(key) === task) inFlight.delete(key);
+  });
+  return task;
+}
+
+function hasSeriesCredentials(addonInstance) {
+  const config = addonInstance?.config;
+  return Boolean(config?.xtreamUrl && config?.xtreamUsername && config?.xtreamPassword);
+}
+
+function episodeRuntimeMinutes(episode) {
+  const info = episode?.info && typeof episode.info === "object" ? episode.info : {};
+  for (const value of [info.duration_secs, episode?.duration_secs]) {
+    const seconds = typeof value === "number" || (typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim()))
+      ? Number(value) : NaN;
+    const minutes = parseRuntimeMinutes(seconds / 60);
+    if (minutes !== null) return minutes;
+  }
+  for (const value of [info.duration, episode?.duration]) {
+    // Xtream's unlabelled numeric duration is ambiguous; use its explicit seconds
+    // field or a clock/minute string instead of guessing the unit.
+    if (typeof value !== "string" || !/[:a-z]/i.test(value)) continue;
+    const minutes = parseRuntimeMinutes(value);
+    if (minutes !== null) return minutes;
+  }
+  for (const value of [info.runtime, episode?.runtime]) {
+    const minutes = parseRuntimeMinutes(value);
+    if (minutes !== null) return minutes;
+  }
+  return null;
+}
+
 async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
-  const { config } = addonInstance;
   const report = details => {
     if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details);
   };
@@ -356,151 +445,114 @@ async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
     report({ reason: "provider_series_id_missing", source: "xtream_get_series_info" });
     return null;
   }
-  if (!config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) {
+  if (!hasSeriesCredentials(addonInstance)) {
     report({ reason: "provider_credentials_missing", source: "xtream_get_series_info" });
     return null;
   }
-  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
-  try {
-    // Discover only needs the series TMDb ID. Avoid constructing and sorting every
-    // episode object when a catalogue listing omitted that ID.
-    const response = await fetch(
-      `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
-      { timeout: 25000 },
-    );
-    if (!response.ok) {
-      if (response.body && typeof response.body.destroy === "function") response.body.destroy();
-      report({
-        reason: "provider_http_error",
-        source: "xtream_get_series_info",
-        httpStatus: response.status
+  const { payload, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
+  if (!payload) { report(diagnostic); return null; }
+  const info = payload.info && typeof payload.info === "object" ? payload.info : {};
+  const rawTmdbId = info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id || null;
+  const tmdbId = normalizeTmdbId(rawTmdbId);
+  report({
+    reason: tmdbId ? "provider_tmdb_id_found" : rawTmdbId ? "provider_tmdb_id_invalid" : "provider_tmdb_id_missing",
+    source: "xtream_get_series_info"
+  });
+  return tmdbId;
+}
+
+async function fetchSeriesRuntimeSummary(addonInstance, seriesId) {
+  if (!seriesId || !hasSeriesCredentials(addonInstance)) return null;
+  const { payload } = await requestSeriesPayload(addonInstance, seriesId);
+  const groups = payload?.episodes;
+  if (!groups || typeof groups !== "object" || (Array.isArray(groups) && groups.length > 0)) return null;
+  const runtimes = [];
+  for (const [seasonKey, episodes] of Object.entries(groups)) {
+    if (!Array.isArray(episodes)) return null;
+    for (const episode of episodes) {
+      if (!episode || typeof episode !== "object" || Array.isArray(episode)) return null;
+      const runtimeMinutes = episodeRuntimeMinutes(episode);
+      if (runtimeMinutes === null) continue;
+      runtimes.push({
+        id: episode.id,
+        season: Number.parseInt(episode.season ?? seasonKey, 10),
+        episode: Number.parseInt(episode.episode_num ?? episode.episode ?? 0, 10),
+        runtimeMinutes
       });
-      return null;
     }
-    let payload;
-    try {
-      payload = await response.json();
-    } catch (error) {
-      report({
-        reason: "provider_invalid_json",
-        source: "xtream_get_series_info",
-        errorName: error && error.name ? error.name : "SyntaxError"
-      });
-      return null;
-    }
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      report({ reason: "provider_invalid_response", source: "xtream_get_series_info" });
-      return null;
-    }
-    const info = payload.info && typeof payload.info === "object" ? payload.info : {};
-    const rawTmdbId = info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id || null;
-    const tmdbId = normalizeTmdbId(rawTmdbId);
-    report({
-      reason: tmdbId
-        ? "provider_tmdb_id_found"
-        : rawTmdbId ? "provider_tmdb_id_invalid" : "provider_tmdb_id_missing",
-      source: "xtream_get_series_info"
-    });
-    return tmdbId;
-  } catch (error) {
-    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
-      ? error.code
-      : undefined;
-    report({
-      reason: "provider_request_error",
-      source: "xtream_get_series_info",
-      errorName: error && error.name ? error.name : "Error",
-      ...(errorCode ? { errorCode } : {})
-    });
-    return null;
   }
+  const average = averageEpisodeRuntime(runtimes);
+  return {
+    ...(average || { episodeCount: 0, totalMinutes: 0 }),
+    source: "provider-episodes",
+    complete: true
+  };
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
-  // For xtream JSON API only
+  // For Xtream JSON API only. Episode runtime remains in the persistent detail
+  // record so later average calculations can reuse it without another request.
   const { config } = addonInstance;
-  if (!seriesId) return { videos: [] };
-  if (
-    !config ||
-    !config.xtreamUrl ||
-    !config.xtreamUsername ||
-    !config.xtreamPassword
-  )
-    return { videos: [] };
-
-  const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
-  const startedAt = Date.now();
+  if (!seriesId || !hasSeriesCredentials(addonInstance)) return { videos: [] };
   try {
-    const infoResp = await fetch(
-      `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
-      { timeout: 25000 },
-    );
-    if (!infoResp.ok) {
-      return { videos: [], fetchError: `HTTP ${infoResp.status}`, fetchedAt: Date.now() };
+    const { payload: infoJson, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
+    if (!infoJson) {
+      return {
+        videos: [],
+        fetchError: diagnostic?.httpStatus ? `HTTP ${diagnostic.httpStatus}` : "Provider request failed",
+        ...(diagnostic?.errorName ? { errorName: diagnostic.errorName } : {}),
+        ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
+        fetchedAt: Date.now()
+      };
     }
-    const infoJson = await infoResp.json();
     const videos = [];
     const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
     const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
     const tmdbId = normalizeTmdbId(rawTmdbId);
-    // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
     const episodesObj = infoJson.episodes || {};
-    Object.keys(episodesObj).forEach((seasonKey) => {
-      const seasonEpisodes = episodesObj[seasonKey];
-      if (Array.isArray(seasonEpisodes)) {
-        for (const ep of seasonEpisodes) {
-          const epId = ep.id;
-          const container = ep.container_extension || "mp4";
-          const url = `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
-          // Convert released date to ISO 8601 format
-          let releasedRaw = ep.releasedate || ep.added || null;
-          let releasedISO = null;
-          if (releasedRaw) {
-            releasedRaw = String(releasedRaw).trim();
-            // Unix timestamp (all digits)
-            if (/^\d{9,13}$/.test(releasedRaw)) {
-              const ts =
-                releasedRaw.length <= 10
-                  ? parseInt(releasedRaw, 10) * 1000
-                  : parseInt(releasedRaw, 10);
-              const d = new Date(ts);
-              if (!isNaN(d.getTime())) releasedISO = d.toISOString();
-            } else {
-              // Try parsing as date string
-              const d = new Date(releasedRaw);
-              if (!isNaN(d.getTime())) releasedISO = d.toISOString();
-            }
+    for (const [seasonKey, seasonEpisodes] of Object.entries(episodesObj)) {
+      if (!Array.isArray(seasonEpisodes)) continue;
+      for (const ep of seasonEpisodes) {
+        const epId = ep.id;
+        const container = ep.container_extension || "mp4";
+        const url = `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
+        const runtimeMinutes = episodeRuntimeMinutes(ep);
+        let releasedRaw = ep.releasedate || ep.added || null;
+        let releasedISO = null;
+        if (releasedRaw) {
+          releasedRaw = String(releasedRaw).trim();
+          if (/^\d{9,13}$/.test(releasedRaw)) {
+            const ts = releasedRaw.length <= 10 ? Number.parseInt(releasedRaw, 10) * 1000 : Number.parseInt(releasedRaw, 10);
+            const date = new Date(ts);
+            if (!Number.isNaN(date.getTime())) releasedISO = date.toISOString();
+          } else {
+            const date = new Date(releasedRaw);
+            if (!Number.isNaN(date.getTime())) releasedISO = date.toISOString();
           }
-
-          videos.push({
-            id: `iptv_series_ep_${epId}`,
-            title: ep.title || `Episode ${ep.episode_num}`,
-            season: parseInt(ep.season || seasonKey, 10),
-            episode: parseInt(ep.episode_num || ep.episode || 0, 10),
-            released: releasedISO,
-            thumbnail:
-              ep.info?.movie_image ||
-              ep.info?.episode_image ||
-              ep.info?.cover_big ||
-              null,
-            url,
-            stream_id: epId,
-          });
         }
+        videos.push({
+          id: `iptv_series_ep_${epId}`,
+          title: ep.title || `Episode ${ep.episode_num}`,
+          season: Number.parseInt(ep.season ?? seasonKey, 10),
+          episode: Number.parseInt(ep.episode_num ?? ep.episode ?? 0, 10),
+          released: releasedISO,
+          thumbnail: ep.info?.movie_image || ep.info?.episode_image || ep.info?.cover_big || null,
+          ...(runtimeMinutes !== null ? {
+            runtime: Math.max(1, Math.round(runtimeMinutes)) + " min",
+            runtimeMinutes
+          } : {}),
+          url,
+          stream_id: epId
+        });
       }
-    });
-    // Sort by season then episode
+    }
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
     return { videos, tmdbId, fetchedAt: Date.now() };
   } catch (error) {
-    const errorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,32}$/.test(error.code)
-      ? error.code
-      : undefined;
+    const diagnostic = providerRequestDiagnostic(error);
     return {
-      videos: [],
-      fetchError: "Provider request failed",
-      errorName: error?.name || "Error",
-      ...(errorCode ? { errorCode } : {}),
+      videos: [], fetchError: "Provider request failed", errorName: diagnostic.errorName,
+      ...(diagnostic.errorCode ? { errorCode: diagnostic.errorCode } : {}),
       fetchedAt: Date.now()
     };
   }
@@ -519,5 +571,6 @@ module.exports = {
   fetchMovieInfo,
   fetchSeriesInfo,
   fetchSeriesTmdbId,
+  fetchSeriesRuntimeSummary,
   normalizeTmdbId,
 };

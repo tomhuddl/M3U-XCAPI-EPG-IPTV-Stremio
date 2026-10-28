@@ -5,6 +5,7 @@
 
 const { safeFetch: fetch } = require('../../../urlSafety');
 const { parseEPGStream } = require('../epgStreamParser');
+const { parseRuntimeMinutes } = require('../../../seriesRuntime');
 const crypto = require('crypto');
 
 function hash(str) {
@@ -142,6 +143,11 @@ async function fetchData(addonInstance) {
 
             const episodeId = `iptv_series_ep_${hash(seriesId + ep.url + se.season + '_' + se.episode)}`;
 
+            const seconds = typeof ep.duration === 'number' ||
+                (typeof ep.duration === 'string' && /^\d+(?:\.\d+)?$/.test(ep.duration.trim()))
+                ? Number(ep.duration) : NaN;
+            const runtimeMinutes = parseRuntimeMinutes(seconds / 60);
+
             episodesMap.get(seriesId).push({
                 id: episodeId,
                 title: ep.name,
@@ -149,6 +155,10 @@ async function fetchData(addonInstance) {
                 episode: se.episode,
                 released: null,
                 thumbnail: ep.logo || ep.attributes?.['tvg-logo'] || null,
+                ...(runtimeMinutes !== null ? {
+                    runtime: Math.max(1, Math.round(runtimeMinutes)) + ' min',
+                    runtimeMinutes
+                } : {}),
                 url: ep.url,
                 stream_id: episodeId
             });

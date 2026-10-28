@@ -1027,7 +1027,9 @@ async function main() {
         testPublicAndPrivateAddressClassification,
         testPrivateDestinationsAreRejected,
         ...require("./tests/providerRefresh.test"),
+        ...require("./tests/manifestRefresh.test"),
         ...require("./tests/metadataRefresh.test"),
+        ...require("./tests/seriesRuntime.test"),
     ];
 
     for (const test of tests) {
