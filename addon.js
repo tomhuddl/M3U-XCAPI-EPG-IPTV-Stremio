@@ -14,6 +14,7 @@ const cleanupPersistentCacheFiles = require("./persistentCacheMaintenance");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
 const { parseRuntimeMinutes, averageEpisodeRuntime, isEligibleRuntimeEpisode } = require("./seriesRuntime");
+const seriesCooloff = require('./seriesMetadataCooloff');
 
 // Retry incomplete OMDb data independently of the longer metadata refresh interval.
 // Missing ratings/runtime are retried at most once per configured interval.
@@ -748,6 +749,7 @@ class M3UEPGAddon {
         // At most one full-catalogue warm-up per media type. Search requests must not
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
+        this.providerMetadataWait = null;
         this.catalogPrefetchLastCompleted = new Map();
         // Remember which ordered catalogue the in-memory completion applies to, so
         // provider catalogue changes can trigger a new warm-up before the daily interval.
@@ -848,6 +850,7 @@ class M3UEPGAddon {
     async dispose() {
         if (this.disposePromise) return this.disposePromise;
         this.disposed = true;
+        this.providerMetadataWait?.();
         if (this.refreshTimer) {
             clearInterval(this.refreshTimer);
             this.refreshTimer = null;
@@ -1294,6 +1297,7 @@ class M3UEPGAddon {
                 setLookup(details);
                 return tmdbId;
             } catch (error) {
+                if (seriesCooloff.isCooloff(error)) throw error;
                 if (!isCurrent()) return staleLookup();
                 const details = {
                     reason: 'provider_tmdb_id_lookup_error',
@@ -1362,17 +1366,20 @@ class M3UEPGAddon {
                     if (!isCurrent()) return null;
                     // A failed provider request is not a valid empty series.
                     if (info?.fetchError) {
-                        this.log.warn('Series info request failed; retaining saved details when available', {
+                        const rateLimited = info.fetchError === 'HTTP 429';
+                        const retryTtl = rateLimited && Number(info.retryAt) > Date.now()
+                            ? Math.max(1000, Number(info.retryAt) - Date.now()) : SERIES_INFO_FAILURE_RETRY_MS;
+                        if (!rateLimited) this.log.warn('Series info request failed; retaining saved details when available', {
                             seriesId: normalizedSeriesId,
                             status: /^HTTP \d{3}$/i.test(String(info.fetchError)) ? String(info.fetchError) : undefined,
                             errorName: info.errorName || 'Error',
                             errorCode: info.errorCode
                         });
                         if (persisted?.value) {
-                            this.cacheSeriesInfo(normalizedSeriesId, persisted.value, SERIES_INFO_FAILURE_RETRY_MS);
+                            this.cacheSeriesInfo(normalizedSeriesId, persisted.value, retryTtl);
                             return persisted.value;
                         }
-                        this.cacheSeriesInfo(normalizedSeriesId, info, SERIES_INFO_FAILURE_RETRY_MS);
+                        this.cacheSeriesInfo(normalizedSeriesId, info, retryTtl);
                         return info;
                     }
                     this.cacheSeriesInfo(normalizedSeriesId, info);
@@ -1404,6 +1411,7 @@ class M3UEPGAddon {
     }
 
     async pruneRemovedCatalogState(previous) {
+        this.providerMetadataWait?.();
         const currentMovieIds = new Set(this.movies.map(item => String(item?.id || '')).filter(Boolean));
         const currentSeriesIds = new Set(this.series.map(item => String(item?.id || '')).filter(Boolean));
         const currentCatalogIds = new Set([...currentMovieIds, ...currentSeriesIds]);
@@ -1965,7 +1973,8 @@ class M3UEPGAddon {
                         if (providerResult?.runtime) result = providerResult;
                     }
                 }
-            } catch {
+            } catch (error) {
+                if (seriesCooloff.isCooloff(error)) throw error;
                 // A failed estimate must never erase a previously saved runtime.
             }
             if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
@@ -2218,7 +2227,7 @@ class M3UEPGAddon {
         return detailedMeta;
     }
 
-    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false) {
+    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false, deferredItems = null) {
         // Keep this page's previews until its caller has rendered or counted them.
         // A concurrent catalogue scan can evict entries from the shared LRU while
         // the slowest lookup in this page is still running.
@@ -2238,9 +2247,10 @@ class M3UEPGAddon {
         let nextIndex = 0;
         const worker = async () => {
             while (nextIndex < candidates.length) {
+                if (this.disposed) break;
                 const item = candidates[nextIndex++];
+                const providerLastUpdate = Number(this.lastUpdate) || 0;
                 try {
-                    const providerLastUpdate = Number(this.lastUpdate) || 0;
                     let detailed = await this.getCatalogMetaAsync(item.id, item.type);
                     // Complete runtime enrichment for the requested page before it
                     // is returned; join an existing background calculation when present.
@@ -2271,6 +2281,15 @@ class M3UEPGAddon {
                     this.cacheCatalogMetaPreview(item.id, preview, true, providerLastUpdate);
                     previews.set(String(item.id), this.catalogMetaCache.get(item.id) || preview);
                 } catch (error) {
+                    if (seriesCooloff.isCooloff(error)) {
+                        if (!this.isCatalogItemCurrent(item.id, providerLastUpdate)) continue;
+                        deferredItems?.set(item, error.retryAt);
+                        const saved = this.catalogMetaCache.get(item.id) ||
+                            (await this.persistentCatalogMetaCache.get(String(item.id)))?.value;
+                        if (!this.isCatalogItemCurrent(item.id, providerLastUpdate)) continue;
+                        previews.set(String(item.id), saved || this.generateMetaPreview(item));
+                        continue;
+                    }
                     this.log.warn('Foreground catalogue metadata enrichment failed', { itemId: item.id, errorName: error?.name || 'Error' });
                 }
             }
@@ -2444,6 +2463,28 @@ class M3UEPGAddon {
         }
     }
 
+    waitForProviderMetadataCooloff(retryAt, isCurrent) {
+        if (this.disposed || !isCurrent()) return Promise.resolve(false);
+        return new Promise(resolve => {
+            let timer;
+            const finish = ready => {
+                clearTimeout(timer);
+                if (this.providerMetadataWait === cancel) this.providerMetadataWait = null;
+                resolve(ready);
+            };
+            const cancel = () => finish(false);
+            const tick = () => {
+                if (this.disposed || !isCurrent()) return finish(false);
+                const remaining = retryAt - Date.now();
+                if (remaining <= 0) return finish(true);
+                timer = setTimeout(tick, Math.min(remaining, 2147483647));
+                timer.unref?.();
+            };
+            this.providerMetadataWait = cancel;
+            tick();
+        });
+    }
+
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
         if (this.disposed) return;
         if (type !== 'movie' && type !== 'series') return;
@@ -2470,6 +2511,7 @@ class M3UEPGAddon {
         this.log.debug('Starting catalogue metadata warm-up check', {
             type, total: items.length, pageSize, concurrency
         });
+        let hadProviderDeferrals = false;
         const job = (async () => {
             const startedAt = Date.now();
             const statusKey = '__catalog_prefetch_status__:' + type;
@@ -2536,6 +2578,38 @@ class M3UEPGAddon {
             let providerFallbacks = 0;
             let nextProgressPercent = 25;
             const providerFallbackReasons = {};
+            const deferredItems = new Map();
+            const countedStates = new Map();
+            const adjustCounts = (entry, direction) => {
+                if (!entry) return;
+                if (entry.reason) {
+                    providerFallbacks += direction;
+                    providerFallbackReasons[entry.reason] = (providerFallbackReasons[entry.reason] || 0) + direction;
+                    if (!providerFallbackReasons[entry.reason]) delete providerFallbackReasons[entry.reason];
+                }
+                if (entry.state.incomplete) {
+                    incompleteItems += direction;
+                    for (const field of entry.state.missingFields) {
+                        missingFieldCounts[field] = (missingFieldCounts[field] || 0) + direction;
+                        if (!missingFieldCounts[field]) delete missingFieldCounts[field];
+                    }
+                }
+                if (entry.state.retryDue) retryDueItems += direction;
+            };
+            const countBatch = async (batch, previews) => {
+                for (const item of batch) {
+                    let cached = this.catalogMetaCache.get(item.id) || previews?.get?.(String(item.id));
+                    if (!cached) cached = (await this.persistentCatalogMetaCache.get(String(item.id)))?.value;
+                    if (!isCurrentGeneration()) return;
+                    const lookup = this.catalogMetaLookupDiagnostics.get(String(item.id));
+                    const entry = { state: getCatalogMetadataWarmupState(cached),
+                        reason: type === 'series' && lookup?.providerFallback ? lookup.reason || 'unknown' : null };
+                    adjustCounts(countedStates.get(item), -1);
+                    adjustCounts(entry, 1);
+                    if (deferredItems.has(item)) countedStates.set(item, entry);
+                    else countedStates.delete(item);
+                }
+            };
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 if (this.disposed || !isCurrentGeneration()) return;
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
@@ -2543,34 +2617,15 @@ class M3UEPGAddon {
                 // Force the warm-up through the metadata refresh path even when an old
                 // preview is already in the LRU. Refreshed values must also replace
                 // the persistent preview, not merely update memory.
-                const batchPreviews = await this.enrichCatalogMetaItems(batch, concurrency, true);
+                const batchPreviews = await seriesCooloff.background(() =>
+                    this.enrichCatalogMetaItems(batch, concurrency, true, deferredItems));
+                if (deferredItems.size) hadProviderDeferrals = true;
                 if (!isCurrentGeneration()) return;
                 processed += batch.length;
                 // Count accepted page results or saved previews, since another
                 // media scan may evict this batch from the shared memory LRU.
                 // A genuinely missing preview still remains due for a later retry.
-                for (const item of batch) {
-                    let cached = this.catalogMetaCache.get(item.id) || batchPreviews?.get?.(String(item.id));
-                    if (!cached) {
-                        const saved = await this.persistentCatalogMetaCache.get(String(item.id));
-                        if (!isCurrentGeneration()) return;
-                        cached = saved?.value;
-                    }
-                    const lookupDiagnostic = this.catalogMetaLookupDiagnostics.get(String(item.id));
-                    if (type === 'series' && lookupDiagnostic?.providerFallback) {
-                        providerFallbacks++;
-                        const reason = lookupDiagnostic.reason || 'unknown';
-                        providerFallbackReasons[reason] = (providerFallbackReasons[reason] || 0) + 1;
-                    }
-                    const state = getCatalogMetadataWarmupState(cached);
-                    if (state.incomplete) {
-                        incompleteItems++;
-                        for (const field of state.missingFields) {
-                            missingFieldCounts[field] = (missingFieldCounts[field] || 0) + 1;
-                        }
-                    }
-                    if (state.retryDue) retryDueItems++;
-                }
+                await countBatch(batch, batchPreviews);
 
                 const progressPercent = Math.floor((processed * 100) / items.length);
                 if (progressPercent >= nextProgressPercent) {
@@ -2587,6 +2642,32 @@ class M3UEPGAddon {
                         });
                         nextProgressPercent = milestone + 25;
                     }
+                }
+            }
+
+            // Finish the normal/TMDb scan first. Only titles whose provider
+            // request was never sent are retried here, without restarting the
+            // catalogue or assigning them a false twelve-hour failure backoff.
+            while (deferredItems.size) {
+                if (this.disposed || !isCurrentGeneration()) return;
+                hadProviderDeferrals = true;
+                const state = seriesCooloff.getState(this);
+                const retryAt = Math.max(state?.backgroundRetryAt || 0, Math.min(...deferredItems.values()));
+                this.log.info('Catalogue metadata waiting for deferred Xtream lookups', {
+                    type, processed, total: items.length, deferredItems: deferredItems.size,
+                    resumeAt: new Date(retryAt).toISOString()
+                });
+                if (!(await this.waitForProviderMetadataCooloff(retryAt, isCurrentGeneration))) return;
+                if ((seriesCooloff.getState(this)?.backgroundRetryAt || 0) > Date.now()) continue;
+                const ready = [...deferredItems].filter(([, deadline]) => deadline <= Date.now()).map(([item]) => item);
+                for (let offset = 0; offset < ready.length; offset += pageSize) {
+                    if (this.disposed || !isCurrentGeneration()) return;
+                    const batch = ready.slice(offset, offset + pageSize);
+                    for (const item of batch) deferredItems.delete(item);
+                    const previews = await seriesCooloff.background(() =>
+                        this.enrichCatalogMetaItems(batch, concurrency, true, deferredItems));
+                    if (!isCurrentGeneration()) return;
+                    await countBatch(batch, previews);
                 }
             }
 
@@ -2697,6 +2778,10 @@ class M3UEPGAddon {
         }).finally(() => {
             if (this.catalogPrefetchJobs.get(type) === job) {
                 this.catalogPrefetchJobs.delete(type);
+            }
+            if (hadProviderDeferrals && !this.disposed && !isCurrentGeneration()) {
+                this.catalogPrefetchRetryAfter.delete(type);
+                this.startContinuousCatalogPrefetch(type, pageSize, concurrency);
             }
         });
     }
@@ -2842,6 +2927,12 @@ class M3UEPGAddon {
         try {
             const result = await task;
             return this.isCatalogItemCurrent(key, providerLastUpdate) ? result : null;
+        } catch (error) {
+            if (!seriesCooloff.isCooloff(error) || seriesCooloff.isBackground()) throw error;
+            const saved = this.catalogMetaCache.get(key) || (await this.persistentCatalogMetaCache.get(key))?.value;
+            if (!this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
+            const item = findCatalogueItemById(type === 'series' ? this.series : this.movies, key);
+            return saved || (item ? this.generateMetaPreview(item) : null);
         } finally {
             if (this.catalogMetaInFlight.get(pendingKey) === task) {
                 this.catalogMetaInFlight.delete(pendingKey);

@@ -69,6 +69,7 @@ async function withTmdbRuntimeResult(result, run) {
 }
 
 async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false) {
+    const restoreCooloff = moduleName.includes('xtreamProvider') ? require('./seriesCooloffTestHelper')() : () => {};
     const safety = require("../urlSafety");
     const modulePath = require.resolve(moduleName);
     const originalFetch = safety.safeFetch;
@@ -78,6 +79,7 @@ async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false)
     if (withKey) process.env.TMDB_API_KEY = "runtime-tests-only-key";
     delete require.cache[modulePath];
     try { await run(require(modulePath)); } finally {
+        restoreCooloff();
         safety.safeFetch = originalFetch;
         delete require.cache[modulePath];
         if (originalModule) require.cache[modulePath] = originalModule;
@@ -1076,7 +1078,7 @@ async function testSeriesXtream429LoggingIsSharedAndDoesNotBlockOtherSeries() {
     const logs = await captureSeries429Logs(async () => {
         await withFreshFetchModule('../src/js/providers/xtreamProvider', async () => {
             calls++; await new Promise(setImmediate);
-            return { ok: false, status: 429, headers: { get: () => '30' } };
+            return { ok: false, status: 429, headers: { get: () => null } };
         }, async provider => {
             const addon = { config: { xtreamUrl: 'https://example.com', xtreamUsername: 'secret-user', xtreamPassword: 'secret-password' } };
             await Promise.all([provider.fetchSeriesInfo(addon, '3'), provider.fetchSeriesTmdbId(addon, '3'), provider.fetchSeriesRuntimeSummary(addon, '3')]);
@@ -1084,8 +1086,8 @@ async function testSeriesXtream429LoggingIsSharedAndDoesNotBlockOtherSeries() {
         });
     });
     assert.strictEqual(calls, 2, 'logging must not introduce a cooldown or suppress requests');
-    assert.deepStrictEqual(logs.map(entry => entry.seriesId), ['3', '4']);
-    assert.ok(logs.every(entry => entry.source === 'xtream' && entry.operation === 'get_series_info' && entry.retryAfterSeconds === 30));
+    assert.deepStrictEqual(logs.map(entry => entry.seriesId), ['3'], 'subsequent 429 warnings in the same cool-off are summarised');
+    assert.ok(logs.every(entry => entry.source === 'xtream' && entry.operation === 'get_series_info'));
     assert.ok(!JSON.stringify(logs).includes('secret-'));
 }
 

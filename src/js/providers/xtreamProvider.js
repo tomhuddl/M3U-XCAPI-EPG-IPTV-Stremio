@@ -7,6 +7,7 @@ const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
 const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../../seriesRuntime");
 const logSeriesMetadata429 = require("../../../seriesMetadataLog");
+const seriesCooloff = require("../../../seriesMetadataCooloff");
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -375,6 +376,8 @@ function requestSeriesPayload(addonInstance, seriesId) {
   }
   const key = String(Number(addonInstance.lastUpdate) || 0) + ":" + String(seriesId);
   if (inFlight.has(key)) return inFlight.get(key);
+  const recentFailure = seriesCooloff.guard(addonInstance, seriesId);
+  if (recentFailure) return Promise.resolve(recentFailure);
   const task = (async () => {
     const { config } = addonInstance;
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
@@ -384,8 +387,8 @@ function requestSeriesPayload(addonInstance, seriesId) {
         { timeout: 25000, reuseConnection: true },
       );
       if (!response.ok) {
-        logSeriesMetadata429('xtream', 'get_series_info', { seriesId }, response);
         if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+        if (response.status === 429) return seriesCooloff.record429(addonInstance, seriesId, response);
         return { diagnostic: {
           reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
         } };
@@ -507,6 +510,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         fetchError: diagnostic?.httpStatus ? `HTTP ${diagnostic.httpStatus}` : "Provider request failed",
         ...(diagnostic?.errorName ? { errorName: diagnostic.errorName } : {}),
         ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
+        ...(diagnostic?.retryAt ? { retryAt: diagnostic.retryAt } : {}),
         fetchedAt: Date.now()
       };
     }
@@ -554,6 +558,10 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
     return { videos, tmdbId, fetchedAt: Date.now() };
   } catch (error) {
+    if (seriesCooloff.isCooloff(error)) {
+      if (seriesCooloff.isBackground()) throw error;
+      return { videos: [], fetchError: 'HTTP 429', retryAt: error.retryAt, fetchedAt: Date.now() };
+    }
     const diagnostic = providerRequestDiagnostic(error);
     return {
       videos: [], fetchError: "Provider request failed", errorName: diagnostic.errorName,

@@ -1030,6 +1030,7 @@ async function main() {
         ...require("./tests/manifestRefresh.test"),
         ...require("./tests/metadataRefresh.test"),
         ...require("./tests/seriesRuntime.test"),
+        ...require("./tests/seriesMetadataCooloff.test"),
     ];
 
     for (const test of tests) {

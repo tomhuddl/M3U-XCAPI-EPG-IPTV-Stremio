@@ -216,7 +216,17 @@ The existing catalogue metadata volume stores `runtimeAverage`: its source, disp
 
 With `LOG_LEVEL=debug` or `DEBUG_MODE=true`, the existing catalogue diagnostics and saved-scan summary include a compact `seriesRuntime` object: `seriesLevel` counts source-supplied runtimes, `tmdbEpisodeAverage` and `providerEpisodeAverage` count derived values, `missing` counts unavailable runtimes, `retainedAfterFailedRefresh` counts saved averages kept after an unsuccessful retry, `retryDue` counts runtime checks due now, and `missingRetryDeferred` counts absent runtimes waiting for their retry interval. These are catalogue totals, not per-episode progress messages.
 
-Actual HTTP 429 responses for series requests log `[WARN] Series metadata request returned HTTP 429` with `source` (`xtream`, `tmdb` or `omdb`), operation, status, safe series/TMDb/IMDb identifiers and a provider retry delay when supplied. This includes series catalogue/ID/detail/episode requests, TMDb series/season/video metadata and OMDb series rating/runtime lookups. It is diagnostic logging only and adds no cooldown or request suppression; credentials, API keys and request URLs are omitted.
+Actual HTTP 429 responses for series requests log `[WARN] Series metadata request returned HTTP 429` with `source` (`xtream`, `tmdb` or `omdb`), operation, status, safe series/TMDb/IMDb identifiers and a provider retry delay when supplied. This includes series catalogue/ID/detail/episode requests, TMDb series/season/video metadata and OMDb series rating/runtime lookups. Xtream `get_series_info` warnings are consolidated during the targeted cool-off described below; credentials, API keys and request URLs are omitted.
+
+### Targeted Xtream series cool-offs
+
+A recent HTTP 429 from `get_series_info` is reused across metadata-ID, runtime and episode-detail lookups for the same series and provider account. The default short result cache lasts 60 seconds, or the provider's supplied `Retry-After` delay. This avoids immediately sending a second rejected request for the same series. Positive payloads and unrelated failures retain their existing cache behaviour.
+
+Background Xtream series-info lookups pause for 60 seconds after the first limit, increasing to 120, 240 and at most 300 seconds after subsequent recovery windows are limited again. A longer provider `Retry-After` is respected. Multiple already-active failures in one window do not multiply its recovery delay. This pause does not add a fixed spacing queue or block interactive lookups for other series. An explicit provider `Retry-After` does apply to new series-info requests for that account, including interactive ones; saved episode lists are still used where available.
+
+The normal catalogue/TMDb scan continues while provider lookups are deferred. Only those deferred titles are retried after the cool-off, from an in-memory checkpoint, without restarting the whole scan. A request that was never sent does not acquire a false 12-hour failure backoff. The durable completion marker waits for deferred work to be attempted. Disposal and provider-generation changes cancel obsolete waits. Actual failures retain the existing 12-hour retry policy, and successful runtime averages retain the 14-day full-refresh policy.
+
+The first rejection in a window is logged along with the background retry time; a compact subsequent summary reports actual 429 responses, reused results and deferred lookups. State is bounded, held in process memory and isolated by provider account. TMDb/OMDb requests, TMDb JSON handling, other Xtream endpoints and direct media playback are unchanged. No new Railway settings or persistent volume files are required.
 
 ### Metadata source priority
 
