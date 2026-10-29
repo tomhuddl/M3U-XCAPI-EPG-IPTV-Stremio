@@ -297,34 +297,6 @@ async function testLateSeriesDetailsCannotRepopulateANewerProviderGeneration() {
     }
 }
 
-async function testLateSeriesTmdbLookupCannotOverwriteTheNewProviderGeneration() {
-    const provider = require("../src/js/providers/xtreamProvider");
-    const original = provider.fetchSeriesTmdbId;
-    const addon = new M3UEPGAddon({ provider: "xtream" });
-    addon.series = [{ id: "iptv_series_3", series_id: "3", type: "series", name: "Example" }];
-    addon.lastUpdate = 1000;
-    addon.persistentSeriesInfoCache = { get: async () => null };
-    const started = deferred();
-    const oldResponse = deferred();
-    let requests = 0;
-    provider.fetchSeriesTmdbId = async () => {
-        if (++requests === 1) { started.resolve(); return oldResponse.promise; }
-        return "456";
-    };
-    try {
-        const oldLookup = addon.ensureSeriesTmdbId("3");
-        await started.promise;
-        addon.lastUpdate = 1001;
-        assert.strictEqual(await addon.ensureSeriesTmdbId("3"), "456");
-        oldResponse.resolve("123");
-        assert.strictEqual(await oldLookup, null);
-        assert.strictEqual(addon.seriesInfoCache.get("series-tmdb-id:3"), "456");
-    } finally {
-        provider.fetchSeriesTmdbId = original;
-        oldResponse.resolve(null);
-    }
-}
-
 async function testProviderRefreshInvalidatesChangedSameIdTitles() {
     const provider = require("../src/js/providers/directProvider");
     const original = provider.fetchData;
@@ -643,7 +615,6 @@ module.exports = [
     testWarmupReportsIncompleteMetadataSeparatelyFromDeferredRetries,
     testProviderRefreshInvalidatesChangedSameIdTitles,
     testLateSeriesDetailsCannotRepopulateANewerProviderGeneration,
-    testLateSeriesTmdbLookupCannotOverwriteTheNewProviderGeneration,
     testChangedSeriesDetailsPruningKeepsOnlyCurrentGenerationReplacement,
     testSavedSeriesFallbackRetriesSoonAfterProviderRecovery,
     testWarmupRespectsFailedSchemaAndImdbLookupBackoff,

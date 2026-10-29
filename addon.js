@@ -2,7 +2,7 @@
 // Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
 require('dotenv').config({ quiet: true });
 
-const { createLogger, isDebugEnabled, logAt } = require('./logger');
+const { createLogger, logAt } = require('./logger');
 
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
@@ -14,7 +14,6 @@ const cleanupPersistentCacheFiles = require("./persistentCacheMaintenance");
 const tmdbMetadata = require("./src/js/tmdbMetadata");
 const omdbMetadata = require("./src/js/omdbMetadata");
 const { parseRuntimeMinutes, averageEpisodeRuntime, isEligibleRuntimeEpisode } = require("./seriesRuntime");
-const seriesCooloff = require('./seriesMetadataCooloff');
 
 // Retry incomplete OMDb data independently of the longer metadata refresh interval.
 // Missing ratings/runtime are retried at most once per configured interval.
@@ -182,6 +181,8 @@ function isMetadataValuePresent(field, value) {
 }
 
 function mergeCatalogMetadataPreservingKnownFields(previous, refreshed) {
+    previous = withoutProviderEpisodeAverage(previous);
+    refreshed = withoutProviderEpisodeAverage(refreshed);
     const fresh = refreshed && typeof refreshed === 'object' && !Array.isArray(refreshed)
         ? refreshed
         : {};
@@ -215,9 +216,7 @@ function mergeCatalogMetadataPreservingKnownFields(previous, refreshed) {
     // two sources happen to report the same minute value.
     if (providerFallback && Object.prototype.hasOwnProperty.call(fresh, 'runtimeAverage') &&
         parseRuntimeMinutes(old.runtime) !== null) {
-        const lowerPriority = old.runtimeAverage?.source === 'tmdb-episodes' &&
-            fresh.runtimeAverage?.source === 'provider-episodes';
-        const acceptedUpdate = hasDerivedSeriesRuntime(old) && !lowerPriority &&
+        const acceptedUpdate = hasDerivedSeriesRuntime(old) &&
             (hasDerivedSeriesRuntime(fresh) ||
                 (fresh.runtimeAverage === null && parseRuntimeMinutes(fresh.runtime) !== null));
         if (acceptedUpdate) {
@@ -237,8 +236,22 @@ function hasDerivedSeriesRuntime(value) {
         parseRuntimeMinutes(value.runtime) !== null && value.runtimeAverage.runtime === value.runtime;
 }
 
+function withoutProviderEpisodeAverage(value) {
+    if (value?.type !== 'series' ||
+        !['provider-episodes', 'mixed-episodes'].includes(value.runtimeAverage?.source)) return value;
+    const clean = { ...value };
+    if (value.runtimeAverage.runtime === value.runtime) delete clean.runtime;
+    delete clean.runtimeAverage;
+    return clean;
+}
+
+function validSeriesRuntime(...values) {
+    return values.find(value => parseRuntimeMinutes(value) !== null);
+}
+
 function seriesRuntimeAverageNeedsRefresh(value) {
     if (value?.type !== 'series') return false;
+    if (withoutProviderEpisodeAverage(value) !== value) return true;
     if (parseRuntimeMinutes(value.runtime) !== null && !hasDerivedSeriesRuntime(value)) return false;
     const average = value.runtimeAverage;
     if (![1, 2].includes(average?.version)) return true;
@@ -259,27 +272,6 @@ function seriesRuntimeAverageNeedsRefresh(value) {
     );
     const timestamp = retryMissing ? attemptedAt || checkedAt : checkedAt;
     return !timestamp || Date.now() - timestamp >= interval;
-}
-
-function createSeriesRuntimeSummary() {
-    return {
-        seriesLevel: 0, tmdbEpisodeAverage: 0, providerEpisodeAverage: 0,
-        missing: 0, retainedAfterFailedRefresh: 0, retryDue: 0, missingRetryDeferred: 0
-    };
-}
-
-function countSeriesRuntime(summary, value) {
-    const present = parseRuntimeMinutes(value?.runtime) !== null;
-    const derived = hasDerivedSeriesRuntime(value);
-    if (!present) summary.missing++;
-    else if (derived && value.runtimeAverage.source === 'tmdb-episodes') summary.tmdbEpisodeAverage++;
-    else if (derived && value.runtimeAverage.source === 'provider-episodes') summary.providerEpisodeAverage++;
-    else summary.seriesLevel++;
-    if (derived && Number(value.runtimeAverage.attemptedAt) > Number(value.runtimeAverage.checkedAt)) {
-        summary.retainedAfterFailedRefresh++;
-    }
-    if (!value || seriesRuntimeAverageNeedsRefresh(value)) summary.retryDue++;
-    else if (!present) summary.missingRetryDeferred++;
 }
 
 function getCatalogMetadataWarmupState(value) {
@@ -548,7 +540,6 @@ function matchesNormalizedSearchText(q, text) {
     return createNormalizedSearchMatcher(q)(text);
 }
 
-const DEBUG_ENV = isDebugEnabled();
 function makeLogger(cfgDebug) {
     return createLogger(!!cfgDebug);
 }
@@ -668,15 +659,6 @@ function stableStringify(obj) {
     return JSON.stringify(obj);
 }
 
-function safeStreamTarget(value) {
-    try {
-        const parsed = new URL(value);
-        return parsed.protocol + '//' + parsed.host;
-    } catch {
-        return '[invalid URL]';
-    }
-}
-
 function createCacheKey(config) {
     const minimal = {
         provider: config.provider,
@@ -733,7 +715,6 @@ class M3UEPGAddon {
         );
         // Keep a small parallel diagnostic cache without consuming slots from the
         // bounded series-info LRU.
-        this.seriesTmdbLookupDiagnostics = new Map();
         // Coalesce overlapping Xtream ID and series-info lookups started by parallel
         // Discover workers, avoiding duplicate provider API round-trips.
         this.providerInfoInFlight = new Map();
@@ -749,7 +730,6 @@ class M3UEPGAddon {
         // At most one full-catalogue warm-up per media type. Search requests must not
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
-        this.providerMetadataWait = null;
         this.catalogPrefetchLastCompleted = new Map();
         // Remember which ordered catalogue the in-memory completion applies to, so
         // provider catalogue changes can trigger a new warm-up before the daily interval.
@@ -763,7 +743,6 @@ class M3UEPGAddon {
         this.catalogMetaInFlight = new Map();
         this.seriesRuntimeInFlight = new Map();
         // Retain compact lookup-failure reasons for the warm-up summary.
-        this.catalogMetaLookupDiagnostics = new Map();
         // Track asynchronous disk writes so a completed pre-warm can flush every
         // metadata preview before its durable completion marker is written.
         this.catalogMetaPersistWrites = new Set();
@@ -799,11 +778,6 @@ class M3UEPGAddon {
         if (typeof this.config.includeSeries === 'undefined')
             this.config.includeSeries = true;
 
-        this.log.debug('Addon instance created', {
-            provider: this.providerName,
-            epgOffsetHours: this.config.epgOffsetHours,
-            includeSeries: this.config.includeSeries
-        });
     }
 
     estimateMemoryBytes() {
@@ -850,7 +824,6 @@ class M3UEPGAddon {
     async dispose() {
         if (this.disposePromise) return this.disposePromise;
         this.disposed = true;
-        this.providerMetadataWait?.();
         if (this.refreshTimer) {
             clearInterval(this.refreshTimer);
             this.refreshTimer = null;
@@ -896,7 +869,6 @@ class M3UEPGAddon {
             cached = await this.persistentAddonDataCache.load();
             if (cached) {
                 if (CACHE_ENABLED) dataCache.set(cacheKey, cached);
-                this.log.info('Loaded provider catalogue and EPG from persistent storage');
             }
         }
         if (cached) {
@@ -937,7 +909,7 @@ class M3UEPGAddon {
 
             const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
             providerRefreshState.set(this.cacheKey, Math.max(sharedLastUpdate, Number(this.lastUpdate) || 0));
-            this.log.debug('Cache hit for data', {
+            this.log.info('Loaded saved provider catalogue and EPG', {
                 channels: this.channels.length,
                 movies: this.movies.length,
                 series: this.series.length,
@@ -968,8 +940,7 @@ class M3UEPGAddon {
             this.log.warn('Redis provider snapshot save failed', error?.name || 'Error');
         }
         try {
-            const persisted = await this.persistentAddonDataCache.save(entry);
-            if (persisted) this.log.debug('Persisted provider catalogue and EPG snapshot');
+            await this.persistentAddonDataCache.save(entry);
         } catch (error) {
             // The in-memory/Redis copy remains usable; a disk write failure must not
             // interrupt a successful provider refresh or replace the last-good file.
@@ -978,7 +949,6 @@ class M3UEPGAddon {
                 syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
             });
         }
-        this.log.debug('Saved data to cache');
     }
 
     buildGenresInManifest() {
@@ -1033,15 +1003,9 @@ class M3UEPGAddon {
         this.manifestRef.behaviorHints.epgProvider = Object.values(this.epgData || {}).some(
             programmes => Array.isArray(programmes) && programmes.length > 0
         );
-        this.log.debug('Catalog genres built', {
-            tvGenres: tvCatalog?.genres?.length || 0,
-            movieGenres: movieCatalog?.genres?.length || 0,
-            seriesGenres: seriesCatalog?.genres?.length || 0
-        });
     }
 
     parseM3U(content) {
-        const startTs = Date.now();
         const lines = content.split('\n');
         const items = [];
         let currentItem = null;
@@ -1084,8 +1048,6 @@ class M3UEPGAddon {
                 currentItem = null;
             }
         }
-        const ms = Date.now() - startTs;
-        this.log.debug('M3U parsed', { lines: lines.length, items: items.length, ms });
         return items;
     }
 
@@ -1211,114 +1173,6 @@ class M3UEPGAddon {
             this.series.some(item => getProviderSeriesKey(item) === String(seriesId));
     }
 
-    async ensureSeriesTmdbId(seriesId, lookupDiagnostics = null, forceRefresh = false) {
-        const setLookup = details => {
-            if (lookupDiagnostics && details && typeof details === 'object') Object.assign(lookupDiagnostics, details);
-        };
-        if (!seriesId) {
-            setLookup({ reason: 'provider_series_id_missing', source: 'provider_lookup' });
-            return null;
-        }
-        const normalizedSeriesId = String(seriesId);
-        const providerLastUpdate = Number(this.lastUpdate) || 0;
-        const isCurrent = () => this.isProviderSeriesCurrent(normalizedSeriesId, providerLastUpdate);
-        const staleLookup = () => {
-            setLookup({ reason: 'provider_catalogue_changed', source: 'provider_lookup' });
-            return null;
-        };
-        if (!isCurrent()) return staleLookup();
-        const cacheKey = 'series-tmdb-id:' + normalizedSeriesId;
-        const cacheLookup = details => {
-            if (!isCurrent()) return;
-            this.seriesTmdbLookupDiagnostics.delete(normalizedSeriesId);
-            this.seriesTmdbLookupDiagnostics.set(normalizedSeriesId, details);
-            while (this.seriesTmdbLookupDiagnostics.size > 100) {
-                this.seriesTmdbLookupDiagnostics.delete(this.seriesTmdbLookupDiagnostics.keys().next().value);
-            }
-        };
-        const cached = this.seriesInfoCache.get(cacheKey);
-        if (!forceRefresh && cached !== undefined) {
-            setLookup(this.seriesTmdbLookupDiagnostics.get(normalizedSeriesId) || {
-                reason: cached ? 'provider_tmdb_id_cached' : 'provider_tmdb_id_cached_unknown',
-                source: 'memory_cache'
-            });
-            return cached;
-        }
-        if (!forceRefresh && this.providerName === 'xtream') {
-            const persisted = await this.persistentSeriesInfoCache.get(normalizedSeriesId, providerLastUpdate);
-            if (!isCurrent()) return staleLookup();
-            if (persisted?.fresh) {
-                const tmdbId = persisted.value.tmdbId || null;
-                const details = {
-                    reason: tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_missing',
-                    source: 'persistent_provider_cache'
-                };
-                this.cacheSeriesInfo(normalizedSeriesId, persisted.value);
-                this.seriesInfoCache.set(cacheKey, tmdbId);
-                cacheLookup(details);
-                setLookup(details);
-                return tmdbId;
-            }
-        }
-        const pendingKey = 'series-tmdb-id:' + providerLastUpdate + ':' + normalizedSeriesId;
-        const pending = this.providerInfoInFlight.get(pendingKey);
-        if (pending) {
-            const tmdbId = await pending;
-            if (!isCurrent()) return staleLookup();
-            setLookup(this.seriesTmdbLookupDiagnostics.get(normalizedSeriesId) || {
-                reason: tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_lookup_in_flight',
-                source: 'provider_lookup'
-            });
-            return tmdbId;
-        }
-        const task = (async () => {
-            const details = { source: 'provider_lookup' };
-            try {
-                const providerModule = require('./src/js/providers/' + this.providerName + 'Provider.js');
-                let tmdbId = null;
-                if (typeof providerModule.fetchSeriesTmdbId === 'function') {
-                    tmdbId = await providerModule.fetchSeriesTmdbId(this, seriesId, details);
-                } else {
-                    const info = await this.ensureSeriesInfo(seriesId);
-                    tmdbId = info?.tmdbId || null;
-                    if (info?.fetchError) {
-                        details.reason = 'provider_series_info_request_error';
-                        const status = String(info.fetchError).match(/\bHTTP\s+(\d{3})\b/i);
-                        if (status) details.httpStatus = Number(status[1]);
-                    } else {
-                        details.reason = tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_missing';
-                    }
-                }
-                if (!isCurrent()) return staleLookup();
-                if (!details.reason) details.reason = tmdbId ? 'provider_tmdb_id_found' : 'provider_tmdb_id_missing';
-                tmdbId = tmdbId || null;
-                this.seriesInfoCache.set(cacheKey, tmdbId);
-                cacheLookup(details);
-                setLookup(details);
-                return tmdbId;
-            } catch (error) {
-                if (seriesCooloff.isCooloff(error)) throw error;
-                if (!isCurrent()) return staleLookup();
-                const details = {
-                    reason: 'provider_tmdb_id_lookup_error',
-                    source: 'provider_lookup',
-                    errorName: error?.name || 'Error'
-                };
-                this.log.warn('Series TMDb ID lookup failed', seriesId, details.errorName);
-                this.seriesInfoCache.set(cacheKey, null);
-                cacheLookup(details);
-                setLookup(details);
-                return null;
-            }
-        })();
-        this.providerInfoInFlight.set(pendingKey, task);
-        try {
-            return await task;
-        } finally {
-            if (this.providerInfoInFlight.get(pendingKey) === task) this.providerInfoInFlight.delete(pendingKey);
-        }
-    }
-
     cacheSeriesInfo(seriesId, info, ttl = CACHE_TTL_MS) {
         this.seriesInfoCache.set(seriesId, info, ttl);
         if (Array.isArray(info?.videos)) {
@@ -1366,20 +1220,12 @@ class M3UEPGAddon {
                     if (!isCurrent()) return null;
                     // A failed provider request is not a valid empty series.
                     if (info?.fetchError) {
-                        const rateLimited = info.fetchError === 'HTTP 429';
-                        const retryTtl = rateLimited && Number(info.retryAt) > Date.now()
-                            ? Math.max(1000, Number(info.retryAt) - Date.now()) : SERIES_INFO_FAILURE_RETRY_MS;
-                        if (!rateLimited) this.log.warn('Series info request failed; retaining saved details when available', {
-                            seriesId: normalizedSeriesId,
-                            status: /^HTTP \d{3}$/i.test(String(info.fetchError)) ? String(info.fetchError) : undefined,
-                            errorName: info.errorName || 'Error',
-                            errorCode: info.errorCode
-                        });
                         if (persisted?.value) {
-                            this.cacheSeriesInfo(normalizedSeriesId, persisted.value, retryTtl);
+                            this.cacheSeriesInfo(normalizedSeriesId, persisted.value, SERIES_INFO_FAILURE_RETRY_MS);
                             return persisted.value;
                         }
-                        this.cacheSeriesInfo(normalizedSeriesId, info, retryTtl);
+                        this.log.warn('Series episode list unavailable', { seriesId: normalizedSeriesId });
+                        this.cacheSeriesInfo(normalizedSeriesId, info, SERIES_INFO_FAILURE_RETRY_MS);
                         return info;
                     }
                     this.cacheSeriesInfo(normalizedSeriesId, info);
@@ -1411,7 +1257,6 @@ class M3UEPGAddon {
     }
 
     async pruneRemovedCatalogState(previous) {
-        this.providerMetadataWait?.();
         const currentMovieIds = new Set(this.movies.map(item => String(item?.id || '')).filter(Boolean));
         const currentSeriesIds = new Set(this.series.map(item => String(item?.id || '')).filter(Boolean));
         const currentCatalogIds = new Set([...currentMovieIds, ...currentSeriesIds]);
@@ -1497,21 +1342,16 @@ class M3UEPGAddon {
         for (const id of this.catalogMetaStaleFallbacks) {
             if (!currentCatalogIds.has(String(id)) || changedCatalogIds.has(String(id))) this.catalogMetaStaleFallbacks.delete(id);
         }
-        for (const id of this.catalogMetaLookupDiagnostics.keys()) {
-            if (!currentCatalogIds.has(String(id)) || changedCatalogIds.has(String(id))) this.catalogMetaLookupDiagnostics.delete(id);
-        }
         // Provider refreshes may add or remove episodes for an existing series.
         // Drop process-local episode details so the next open uses the new listing.
         // Cached stream URLs belong to the provider snapshot that just expired.
         this.seriesEpisodeCache.clear();
-        this.seriesTmdbLookupDiagnostics.clear();
         const seriesKeysToInvalidate = new Set([
             ...(Array.isArray(previous.series) ? previous.series : []).map(getProviderSeriesKey),
             ...this.series.map(getProviderSeriesKey)
         ].filter(Boolean));
         for (const seriesKey of seriesKeysToInvalidate) {
             this.seriesInfoCache.delete(seriesKey);
-            this.seriesInfoCache.delete('series-tmdb-id:' + seriesKey);
         }
 
         try {
@@ -1866,11 +1706,11 @@ class M3UEPGAddon {
         // Check the in-memory catalogue first, then the persistent catalogue cache.
         // This prevents detail opens after a Railway restart from querying OMDb when
         // the enriched rating/runtime are already saved on disk.
-        let preview = itemId ? this.catalogMetaCache.get(itemId) : null;
+        let preview = withoutProviderEpisodeAverage(itemId ? this.catalogMetaCache.get(itemId) : null);
         if (!preview && itemId) {
             const persisted = await this.persistentCatalogMetaCache.get(String(itemId));
             if (persisted?.value && this.isCatalogItemCurrent(String(itemId), providerLastUpdate)) {
-                preview = this.catalogMetaCache.get(String(itemId)) || persisted.value;
+                preview = withoutProviderEpisodeAverage(this.catalogMetaCache.get(String(itemId)) || persisted.value);
                 this.catalogMetaCache.set(String(itemId), preview);
             }
         }
@@ -1890,9 +1730,9 @@ class M3UEPGAddon {
             // Incomplete metadata is retried only after the shared 12-hour interval.
             // A failed/partial refresh keeps any previously saved rating/runtime.
             const refreshed = await omdbMetadata.getByImdbId(imdbId, {
-                refreshIncomplete: true, mediaType: String(itemId || '').startsWith('iptv_series_') ? 'series' : 'movie'
+                refreshIncomplete: true
             });
-            const latestPreview = this.catalogMetaCache.get(String(itemId));
+            const latestPreview = withoutProviderEpisodeAverage(this.catalogMetaCache.get(String(itemId)));
             const sameIdentity = (!latestPreview?.imdbId || String(latestPreview.imdbId) === String(imdbId)) &&
                 !(preview._tmdbId && latestPreview?._tmdbId &&
                     String(preview._tmdbId) !== String(latestPreview._tmdbId));
@@ -1925,20 +1765,18 @@ class M3UEPGAddon {
 
         // No matching enriched preview: use the OMDb module cache first, which
         // avoids a request on ordinary opens when this process has seen the title.
-        return omdbMetadata.getByImdbId(imdbId, {
-            mediaType: String(itemId || '').startsWith('iptv_series_') ? 'series' : 'movie'
-        });
+        return omdbMetadata.getByImdbId(imdbId);
     }
 
     async ensureSeriesRuntimeAverage(seriesItem, preview, providerLastUpdate = this.lastUpdate) {
         const id = String(seriesItem?.id || '');
         if (!id || !this.isCatalogItemCurrent(id, providerLastUpdate)) return preview;
-        const current = this.catalogMetaCache.get(id) || preview;
+        const current = withoutProviderEpisodeAverage(this.catalogMetaCache.get(id) || preview);
         if (!seriesRuntimeAverageNeedsRefresh(current)) return current;
         const key = providerLastUpdate + ':' + id;
         if (this.seriesRuntimeInFlight.has(key)) return this.seriesRuntimeInFlight.get(key);
         const task = (async () => {
-            const tmdbId = current?._tmdbId || seriesItem.tmdbId || null;
+            const tmdbId = seriesItem.tmdbId || null;
             const previous = current?.runtimeAverage;
             let result = null;
             try {
@@ -1948,37 +1786,11 @@ class M3UEPGAddon {
                     });
                 }
                 if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                const previousTmdbAverage = hasDerivedSeriesRuntime(current) && previous.source === 'tmdb-episodes';
-                if ((!result?.runtime || result.complete !== true) && !previousTmdbAverage) {
-                    const seriesKey = getProviderSeriesKey(seriesItem);
-                    let info = this.seriesInfoCache.get(seriesKey);
-                    if (!info || Number(info.fetchedAt) < Number(providerLastUpdate)) {
-                        info = null;
-                        if (this.providerName === 'xtream') {
-                            const saved = await this.persistentSeriesInfoCache.get(seriesKey, providerLastUpdate);
-                            if (saved?.fresh) info = saved.value;
-                        }
-                    }
-                    if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                    let providerAverage = info && !info.fetchError ? averageEpisodeRuntime(info.videos) : null;
-                    if (!providerAverage && this.providerName === 'direct') {
-                        const directInfo = await this.ensureSeriesInfo(seriesKey);
-                        providerAverage = directInfo && !directInfo.fetchError ? averageEpisodeRuntime(directInfo.videos) : null;
-                    }
-                    if (providerAverage) {
-                        result = { ...providerAverage, source: 'provider-episodes', complete: true };
-                    } else if (this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
-                        const provider = require('./src/js/providers/xtreamProvider.js');
-                        const providerResult = await provider.fetchSeriesRuntimeSummary(this, seriesKey);
-                        if (providerResult?.runtime) result = providerResult;
-                    }
-                }
-            } catch (error) {
-                if (seriesCooloff.isCooloff(error)) throw error;
+            } catch {
                 // A failed estimate must never erase a previously saved runtime.
             }
             if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-            const latest = this.catalogMetaCache.get(id) || current;
+            const latest = withoutProviderEpisodeAverage(this.catalogMetaCache.get(id) || current);
             if (parseRuntimeMinutes(latest.runtime) !== null && !hasDerivedSeriesRuntime(latest)) return latest;
             if (tmdbId && latest._tmdbId && String(tmdbId) !== String(latest._tmdbId)) return latest;
             const now = Date.now();
@@ -2019,7 +1831,7 @@ class M3UEPGAddon {
         }
     }
 
-    async getSeriesDetailRuntime(seriesItem, tmdb, omdb, info, seasonResults, providerLastUpdate = this.lastUpdate) {
+    async getSeriesDetailRuntime(seriesItem, tmdb, omdb, seasonResults, providerLastUpdate = this.lastUpdate) {
         const id = String(seriesItem.id);
         let saved = this.catalogMetaCache.get(id);
         if (!saved) {
@@ -2027,17 +1839,18 @@ class M3UEPGAddon {
             saved = this.catalogMetaCache.get(id) || persisted?.value;
         }
         if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return {};
+        saved = withoutProviderEpisodeAverage(saved);
         const derived = hasDerivedSeriesRuntime(saved);
         const official = [tmdb?.runtime, seriesItem.runtime,
             !(derived && omdb?.runtime === saved.runtime) ? omdb?.runtime : null]
             .find(value => parseRuntimeMinutes(value) !== null);
         if (official) return { runtime: official, runtimeAverage: null };
         if (parseRuntimeMinutes(saved?.runtime) !== null && !derived) return { runtime: saved.runtime };
+        if (derived && !seriesRuntimeAverageNeedsRefresh(saved)) {
+            return { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage };
+        }
         const bySeason = new Map(seasonResults.filter(([season, episodes]) => Number(season) > 0 && Array.isArray(episodes)));
-        const tmdbAverage = averageEpisodeRuntime([...bySeason.values()].flat());
-        const providerAverage = info && !info.fetchError ? averageEpisodeRuntime(info.videos) : null;
-        const average = tmdbAverage || providerAverage;
-        const source = tmdbAverage ? 'tmdb-episodes' : 'provider-episodes';
+        const average = averageEpisodeRuntime([...bySeason.values()].flat());
         const required = (tmdb?.runtimeSeasons || []).filter(season => season.episodeCount !== 0);
         const seasonIsComplete = expected => {
             const episodes = bySeason.get(expected.season);
@@ -2047,15 +1860,16 @@ class M3UEPGAddon {
                 .filter(number => Number.isSafeInteger(number) && number > 0));
             return numbers.size >= expected.episodeCount;
         };
-        const complete = tmdbAverage
-            ? required.length > 0 && required.every(seasonIsComplete)
-            : Boolean(providerAverage && !info?.fetchError);
-        if (derived && (!complete || (!tmdbAverage && saved.runtimeAverage.source === 'tmdb-episodes'))) {
-            return { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage };
+        const complete = Boolean(average && required.length > 0 && required.every(seasonIsComplete));
+        if (!complete) {
+            // Detail pages may fetch only seasons present in the provider. An
+            // average must use all regular TMDb seasons, just like catalogue cards.
+            const refreshed = await this.ensureSeriesRuntimeAverage(seriesItem,
+                saved || { id, type: 'series' }, providerLastUpdate);
+            return refreshed ? { runtime: refreshed.runtime, runtimeAverage: refreshed.runtimeAverage } : {};
         }
-        if (!average) return derived ? { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage } : {};
         const now = Date.now();
-        const seasons = tmdbAverage ? [...bySeason].map(([season, episodes]) => {
+        const seasons = [...bySeason].map(([season, episodes]) => {
             const summary = averageEpisodeRuntime(episodes);
             const expected = required.find(entry => entry.season === season);
             return {
@@ -2065,14 +1879,14 @@ class M3UEPGAddon {
                 runtimeCount: summary?.episodeCount || 0, totalMinutes: summary?.totalMinutes || 0,
                 checkedAt: now, complete: expected ? seasonIsComplete(expected) : true
             };
-        }) : undefined;
+        });
         return {
             runtime: average.runtime,
             runtimeAverage: {
-                ...average, version: 1, policyVersion: 1, source, complete, checkedAt: now,
-                attemptedAt: complete ? now : 0,
-                tmdbId: seriesItem.tmdbId || saved?._tmdbId || null, providerLastUpdate,
-                ...(seasons ? { seasons } : {})
+                ...average, version: 1, policyVersion: 1, source: 'tmdb-episodes', complete: true, checkedAt: now,
+                attemptedAt: now,
+                tmdbId: seriesItem.tmdbId || null, providerLastUpdate,
+                seasons
             }
         };
     }
@@ -2089,8 +1903,8 @@ class M3UEPGAddon {
             ? tmdbMetadata.getSeriesMetadata(knownTmdbId)
             : Promise.resolve(null);
         const [info, initialTmdb] = await Promise.all([infoPromise, knownTmdbPromise]);
-        const tmdbId = knownTmdbId || info?.tmdbId || null;
-        const tmdb = initialTmdb || (tmdbId ? await tmdbMetadata.getSeriesMetadata(tmdbId) : null);
+        const tmdbId = knownTmdbId;
+        const tmdb = initialTmdb;
 
         const omdbPromise = tmdb?.imdbId
             ? this.getDetailOmdbMetadata(tmdb.imdbId, seriesItem.id, providerLastUpdate)
@@ -2159,7 +1973,8 @@ class M3UEPGAddon {
         });
 
         const runtimeFields = await this.getSeriesDetailRuntime(
-            seriesItem, tmdb, omdb, info, seasonResults, providerLastUpdate
+            { ...seriesItem, runtime: validSeriesRuntime(seriesItem.runtime, info?.runtime) },
+            tmdb, omdb, seasonResults, providerLastUpdate
         );
         if (!tmdb) {
             // Keep the provider episode list and any provider preview fields when
@@ -2227,7 +2042,7 @@ class M3UEPGAddon {
         return detailedMeta;
     }
 
-    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false, deferredItems = null) {
+    async enrichCatalogMetaItems(items, concurrency = 3, forceRefresh = false) {
         // Keep this page's previews until its caller has rendered or counted them.
         // A concurrent catalogue scan can evict entries from the shared LRU while
         // the slowest lookup in this page is still running.
@@ -2247,10 +2062,9 @@ class M3UEPGAddon {
         let nextIndex = 0;
         const worker = async () => {
             while (nextIndex < candidates.length) {
-                if (this.disposed) break;
                 const item = candidates[nextIndex++];
-                const providerLastUpdate = Number(this.lastUpdate) || 0;
                 try {
+                    const providerLastUpdate = Number(this.lastUpdate) || 0;
                     let detailed = await this.getCatalogMetaAsync(item.id, item.type);
                     // Complete runtime enrichment for the requested page before it
                     // is returned; join an existing background calculation when present.
@@ -2281,15 +2095,6 @@ class M3UEPGAddon {
                     this.cacheCatalogMetaPreview(item.id, preview, true, providerLastUpdate);
                     previews.set(String(item.id), this.catalogMetaCache.get(item.id) || preview);
                 } catch (error) {
-                    if (seriesCooloff.isCooloff(error)) {
-                        if (!this.isCatalogItemCurrent(item.id, providerLastUpdate)) continue;
-                        deferredItems?.set(item, error.retryAt);
-                        const saved = this.catalogMetaCache.get(item.id) ||
-                            (await this.persistentCatalogMetaCache.get(String(item.id)))?.value;
-                        if (!this.isCatalogItemCurrent(item.id, providerLastUpdate)) continue;
-                        previews.set(String(item.id), saved || this.generateMetaPreview(item));
-                        continue;
-                    }
                     this.log.warn('Foreground catalogue metadata enrichment failed', { itemId: item.id, errorName: error?.name || 'Error' });
                 }
             }
@@ -2463,28 +2268,6 @@ class M3UEPGAddon {
         }
     }
 
-    waitForProviderMetadataCooloff(retryAt, isCurrent) {
-        if (this.disposed || !isCurrent()) return Promise.resolve(false);
-        return new Promise(resolve => {
-            let timer;
-            const finish = ready => {
-                clearTimeout(timer);
-                if (this.providerMetadataWait === cancel) this.providerMetadataWait = null;
-                resolve(ready);
-            };
-            const cancel = () => finish(false);
-            const tick = () => {
-                if (this.disposed || !isCurrent()) return finish(false);
-                const remaining = retryAt - Date.now();
-                if (remaining <= 0) return finish(true);
-                timer = setTimeout(tick, Math.min(remaining, 2147483647));
-                timer.unref?.();
-            };
-            this.providerMetadataWait = cancel;
-            tick();
-        });
-    }
-
     startContinuousCatalogPrefetch(type, pageSize, concurrency) {
         if (this.disposed) return;
         if (type !== 'movie' && type !== 'series') return;
@@ -2508,10 +2291,6 @@ class M3UEPGAddon {
         if (Date.now() - lastCompleted < refreshInterval &&
             this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
 
-        this.log.debug('Starting catalogue metadata warm-up check', {
-            type, total: items.length, pageSize, concurrency
-        });
-        let hadProviderDeferrals = false;
         const job = (async () => {
             const startedAt = Date.now();
             const statusKey = '__catalog_prefetch_status__:' + type;
@@ -2531,14 +2310,12 @@ class M3UEPGAddon {
                 let cachedIncompleteItems = 0;
                 let cachedRetryDeferredItems = 0;
                 const cachedMissingFieldCounts = {};
-                const seriesRuntime = type === 'series' ? createSeriesRuntimeSummary() : null;
                 // Inspect saved previews before honoring the scan marker. Missing
                 // fields are reported separately from retries held by their backoff.
                 for (const item of items) {
                     const saved = await this.persistentCatalogMetaCache.get(String(item.id));
                     if (!isCurrentGeneration()) return;
                     const state = getCatalogMetadataWarmupState(saved?.value);
-                    if (seriesRuntime) countSeriesRuntime(seriesRuntime, saved?.value);
                     if (state.incomplete) {
                         cachedIncompleteItems++;
                         for (const field of state.missingFields) {
@@ -2555,61 +2332,22 @@ class M3UEPGAddon {
                     this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
                     this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                     this.catalogPrefetchRetryAfter.delete(type);
-                    this.log.debug('Persistent catalogue metadata scan is current', {
+                    this.log.info('Persistent catalogue metadata scan is current', {
                         type,
                         total: items.length,
                         incompleteItems: cachedIncompleteItems,
                         retriesDeferredByBackoff: cachedRetryDeferredItems,
                         missingFieldCounts: cachedMissingFieldCounts,
-                        ...(seriesRuntime ? { seriesRuntime } : {}),
                         completedAt: new Date(persistedCompletedAt).toISOString()
                     });
                     return;
                 }
-                this.log.debug('Persistent catalogue metadata has retries due', {
-                    type, total: items.length
-                });
             }
 
             let processed = 0;
             let incompleteItems = 0;
             let retryDueItems = 0;
             const missingFieldCounts = {};
-            let providerFallbacks = 0;
-            let nextProgressPercent = 25;
-            const providerFallbackReasons = {};
-            const deferredItems = new Map();
-            const countedStates = new Map();
-            const adjustCounts = (entry, direction) => {
-                if (!entry) return;
-                if (entry.reason) {
-                    providerFallbacks += direction;
-                    providerFallbackReasons[entry.reason] = (providerFallbackReasons[entry.reason] || 0) + direction;
-                    if (!providerFallbackReasons[entry.reason]) delete providerFallbackReasons[entry.reason];
-                }
-                if (entry.state.incomplete) {
-                    incompleteItems += direction;
-                    for (const field of entry.state.missingFields) {
-                        missingFieldCounts[field] = (missingFieldCounts[field] || 0) + direction;
-                        if (!missingFieldCounts[field]) delete missingFieldCounts[field];
-                    }
-                }
-                if (entry.state.retryDue) retryDueItems += direction;
-            };
-            const countBatch = async (batch, previews) => {
-                for (const item of batch) {
-                    let cached = this.catalogMetaCache.get(item.id) || previews?.get?.(String(item.id));
-                    if (!cached) cached = (await this.persistentCatalogMetaCache.get(String(item.id)))?.value;
-                    if (!isCurrentGeneration()) return;
-                    const lookup = this.catalogMetaLookupDiagnostics.get(String(item.id));
-                    const entry = { state: getCatalogMetadataWarmupState(cached),
-                        reason: type === 'series' && lookup?.providerFallback ? lookup.reason || 'unknown' : null };
-                    adjustCounts(countedStates.get(item), -1);
-                    adjustCounts(entry, 1);
-                    if (deferredItems.has(item)) countedStates.set(item, entry);
-                    else countedStates.delete(item);
-                }
-            };
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 if (this.disposed || !isCurrentGeneration()) return;
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
@@ -2617,101 +2355,29 @@ class M3UEPGAddon {
                 // Force the warm-up through the metadata refresh path even when an old
                 // preview is already in the LRU. Refreshed values must also replace
                 // the persistent preview, not merely update memory.
-                const batchPreviews = await seriesCooloff.background(() =>
-                    this.enrichCatalogMetaItems(batch, concurrency, true, deferredItems));
-                if (deferredItems.size) hadProviderDeferrals = true;
+                const batchPreviews = await this.enrichCatalogMetaItems(batch, concurrency, true);
                 if (!isCurrentGeneration()) return;
                 processed += batch.length;
                 // Count accepted page results or saved previews, since another
                 // media scan may evict this batch from the shared memory LRU.
                 // A genuinely missing preview still remains due for a later retry.
-                await countBatch(batch, batchPreviews);
-
-                const progressPercent = Math.floor((processed * 100) / items.length);
-                if (progressPercent >= nextProgressPercent) {
-                    const milestone = Math.min(75, Math.floor(progressPercent / 25) * 25);
-                    if (milestone >= nextProgressPercent) {
-                        this.log.debug('Catalogue metadata warm-up progress', {
-                            type,
-                            percent: milestone,
-                            processed,
-                            total: items.length,
-                            incompleteItems,
-                            retryDueItems,
-                            providerFallbacks
-                        });
-                        nextProgressPercent = milestone + 25;
+                for (const item of batch) {
+                    let cached = this.catalogMetaCache.get(item.id) || batchPreviews?.get?.(String(item.id));
+                    if (!cached) {
+                        const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                        if (!isCurrentGeneration()) return;
+                        cached = saved?.value;
                     }
+                    const state = getCatalogMetadataWarmupState(cached);
+                    if (state.incomplete) {
+                        incompleteItems++;
+                        for (const field of state.missingFields) {
+                            missingFieldCounts[field] = (missingFieldCounts[field] || 0) + 1;
+                        }
+                    }
+                    if (state.retryDue) retryDueItems++;
                 }
             }
-
-            // Finish the normal/TMDb scan first. Only titles whose provider
-            // request was never sent are retried here, without restarting the
-            // catalogue or assigning them a false twelve-hour failure backoff.
-            while (deferredItems.size) {
-                if (this.disposed || !isCurrentGeneration()) return;
-                hadProviderDeferrals = true;
-                const state = seriesCooloff.getState(this);
-                const retryAt = Math.max(state?.backgroundRetryAt || 0, Math.min(...deferredItems.values()));
-                this.log.info('Catalogue metadata waiting for deferred Xtream lookups', {
-                    type, processed, total: items.length, deferredItems: deferredItems.size,
-                    resumeAt: new Date(retryAt).toISOString()
-                });
-                if (!(await this.waitForProviderMetadataCooloff(retryAt, isCurrentGeneration))) return;
-                if ((seriesCooloff.getState(this)?.backgroundRetryAt || 0) > Date.now()) continue;
-                const ready = [...deferredItems].filter(([, deadline]) => deadline <= Date.now()).map(([item]) => item);
-                for (let offset = 0; offset < ready.length; offset += pageSize) {
-                    if (this.disposed || !isCurrentGeneration()) return;
-                    const batch = ready.slice(offset, offset + pageSize);
-                    for (const item of batch) deferredItems.delete(item);
-                    const previews = await seriesCooloff.background(() =>
-                        this.enrichCatalogMetaItems(batch, concurrency, true, deferredItems));
-                    if (!isCurrentGeneration()) return;
-                    await countBatch(batch, previews);
-                }
-            }
-
-            const omdbCatalogueSummary = {
-                items: items.length,
-                persistentEntries: 0,
-                missingPersistentPreview: 0,
-                withImdbId: 0,
-                withImdbRating: 0,
-                awaitingOmdbCheck: 0,
-                omdbPending: 0,
-                withoutImdbId: 0,
-                markedCheckedWithoutRating: 0
-            };
-            const seriesRuntime = type === 'series' ? createSeriesRuntimeSummary() : null;
-            // Read the persistent cache rather than catalogMetaCache (an LRU capped
-            // at 1,000 items); otherwise this report falsely labels the rest of the
-            // provider catalogue as missing.
-            for (const item of items) {
-                const saved = await this.persistentCatalogMetaCache.get(String(item.id));
-                const value = saved?.value;
-                if (seriesRuntime) countSeriesRuntime(seriesRuntime, value);
-                if (!value) {
-                    omdbCatalogueSummary.missingPersistentPreview++;
-                    continue;
-                }
-                omdbCatalogueSummary.persistentEntries++;
-                if (value.imdbId) {
-                    omdbCatalogueSummary.withImdbId++;
-                    if (value.imdbRating) omdbCatalogueSummary.withImdbRating++;
-                    if (omdbMetadataNeedsRefresh(value)) omdbCatalogueSummary.awaitingOmdbCheck++;
-                    if (!value.imdbRating && value.omdbChecked === true) omdbCatalogueSummary.markedCheckedWithoutRating++;
-                } else {
-                    omdbCatalogueSummary.withoutImdbId++;
-                }
-                if (value.omdbPending === true) omdbCatalogueSummary.omdbPending++;
-            }
-            this.log.debug('Catalogue metadata diagnostics', {
-                type,
-                ...omdbCatalogueSummary,
-                ...(seriesRuntime ? { seriesRuntime } : {}),
-                tmdb: typeof tmdbMetadata.getDiagnostics === 'function' ? tmdbMetadata.getDiagnostics() : undefined,
-                omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
-            });
 
             if (!isCurrentGeneration()) return;
             if (retryDueItems === 0) {
@@ -2743,8 +2409,6 @@ class M3UEPGAddon {
                     incompleteItems,
                     retriesDeferredByBackoff: incompleteItems - retryDueItems,
                     missingFieldCounts,
-                    providerFallbacks,
-                    providerFallbackReasons,
                     ms: Date.now() - startedAt
                 });
             } else {
@@ -2753,15 +2417,13 @@ class M3UEPGAddon {
                     5 * 60 * 1000, 24 * 60 * 60 * 1000
                 );
                 this.catalogPrefetchRetryAfter.set(type, Date.now() + retryDelay);
-                this.log.warn('Catalogue metadata retries still due after warm-up', {
+                this.log.info('Catalogue metadata scan finished with retries pending', {
                     type,
                     processed,
                     total: items.length,
                     incompleteItems,
                     retryDueItems,
                     missingFieldCounts,
-                    providerFallbacks,
-                    providerFallbackReasons,
                     retryDelay
                 });
             }
@@ -2778,10 +2440,6 @@ class M3UEPGAddon {
         }).finally(() => {
             if (this.catalogPrefetchJobs.get(type) === job) {
                 this.catalogPrefetchJobs.delete(type);
-            }
-            if (hadProviderDeferrals && !this.disposed && !isCurrentGeneration()) {
-                this.catalogPrefetchRetryAfter.delete(type);
-                this.startContinuousCatalogPrefetch(type, pageSize, concurrency);
             }
         });
     }
@@ -2872,22 +2530,14 @@ class M3UEPGAddon {
                 catalogMetadataNeedsRefresh(previousRecord);
             if (hasPreviousPreview && !metadataRefreshDue) {
                 this.catalogMetaCache.set(key, previousRecord);
-                this.catalogMetaLookupDiagnostics.delete(key);
                 return previousRecord;
             }
 
-            const lookupDiagnostics = {};
             const refreshed = await this._getCatalogMetaAsync(
                 id, type,
-                omdbMetadataNeedsRefresh(previousRecord) || catalogMetadataNeedsRefresh(previousRecord),
-                lookupDiagnostics
+                omdbMetadataNeedsRefresh(previousRecord) || catalogMetadataNeedsRefresh(previousRecord)
             );
             if (!this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
-            if (lookupDiagnostics.reason && lookupDiagnostics.reason !== 'tmdb_match_found') {
-                this.catalogMetaLookupDiagnostics.set(key, lookupDiagnostics);
-            } else {
-                this.catalogMetaLookupDiagnostics.delete(key);
-            }
             if (refreshed) {
                 // A title-details lookup may have filled gaps while this request was
                 // in flight. Merge the response into the latest preview, not the
@@ -2927,12 +2577,6 @@ class M3UEPGAddon {
         try {
             const result = await task;
             return this.isCatalogItemCurrent(key, providerLastUpdate) ? result : null;
-        } catch (error) {
-            if (!seriesCooloff.isCooloff(error) || seriesCooloff.isBackground()) throw error;
-            const saved = this.catalogMetaCache.get(key) || (await this.persistentCatalogMetaCache.get(key))?.value;
-            if (!this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
-            const item = findCatalogueItemById(type === 'series' ? this.series : this.movies, key);
-            return saved || (item ? this.generateMetaPreview(item) : null);
         } finally {
             if (this.catalogMetaInFlight.get(pendingKey) === task) {
                 this.catalogMetaInFlight.delete(pendingKey);
@@ -2940,133 +2584,30 @@ class M3UEPGAddon {
         }
     }
 
-    async _getCatalogMetaAsync(id, type, refreshIncompleteMetadata = false, lookupDiagnostics = null) {
+    async _getCatalogMetaAsync(id, type, refreshIncompleteMetadata = false) {
         // Discover cards do not need episode lists, trailers, or logo-image lookups.
         // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
         if (type === 'series' || id.startsWith('iptv_series_')) {
             const seriesItem = findCatalogueItemById(this.series, id);
-            if (!seriesItem) {
-                if (lookupDiagnostics) lookupDiagnostics.reason = 'provider_catalogue_item_not_found';
-                return null;
-            }
-            const seriesId = seriesItem.series_id || seriesItem.id.replace(/^iptv_series_/, '');
-            const providerLookup = {};
-            let tmdbId = seriesItem.tmdbId || null;
-            let idSource = tmdbId ? 'catalogue' : 'provider_lookup';
-            if (!tmdbId) {
-                tmdbId = await this.ensureSeriesTmdbId(seriesId, providerLookup);
-            }
-            let tmdbLookup = {};
-            let tmdb = await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
-                refresh: refreshIncompleteMetadata,
-                diagnostics: tmdbLookup
-            });
-            const makeProviderFallback = details => {
-                if (lookupDiagnostics) {
-                    Object.assign(lookupDiagnostics, details, { providerFallback: true });
-                }
-                const fallback = this.generateMetaPreview(seriesItem);
+            if (!seriesItem) return null;
+            const tmdbId = seriesItem.tmdbId || null;
+            const tmdb = tmdbId ? await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
+                refresh: refreshIncompleteMetadata
+            }) : null;
+            if (!tmdb) {
                 return {
-                    ...fallback,
+                    ...this.generateMetaPreview(seriesItem),
+                    runtime: validSeriesRuntime(seriesItem.runtime),
                     metadataVersion: 3,
                     _tmdbId: null,
                     imdbIdChecked: true,
                     omdbChecked: true,
                     omdbPending: false
                 };
-            };
-            const providerLookupFailed = details => [
-                'provider_http_error', 'provider_request_error', 'provider_invalid_json',
-                'provider_invalid_response', 'provider_credentials_missing',
-                'provider_tmdb_id_lookup_error', 'provider_series_info_request_error'
-            ].includes(details?.reason);
-            const compactTmdbFailure = details => ({
-                reason: details?.reason || 'tmdb_lookup_failed',
-                ...(details?.httpStatus ? { httpStatus: details.httpStatus } : {}),
-                ...(details?.errorName ? { errorName: details.errorName } : {}),
-                ...(details?.errorCode ? { errorCode: details.errorCode } : {})
-            });
-
-            // If the catalogue's supplied TMDb ID is confirmed missing, check
-            // Xtream's detailed record once for a possibly corrected ID.
-            if (!tmdb && tmdbId && idSource === 'catalogue' && tmdbLookup.reason === 'tmdb_not_found') {
-                const detailedProviderLookup = {};
-                const detailedTmdbId = await this.ensureSeriesTmdbId(seriesId, detailedProviderLookup, true);
-                if (detailedTmdbId && String(detailedTmdbId) !== String(tmdbId)) {
-                    const detailedTmdbLookup = {};
-                    const detailedTmdb = await tmdbMetadata.getSeriesCatalogMetadata(detailedTmdbId, {
-                        refresh: refreshIncompleteMetadata,
-                        diagnostics: detailedTmdbLookup
-                    });
-                    Object.assign(providerLookup, detailedProviderLookup);
-                    if (detailedTmdb) {
-                        tmdbId = detailedTmdbId;
-                        idSource = 'provider_details';
-                        tmdbLookup = detailedTmdbLookup;
-                        tmdb = detailedTmdb;
-                    } else {
-                        tmdbLookup = {
-                            ...compactTmdbFailure(detailedTmdbLookup),
-                            catalogueLookup: compactTmdbFailure({
-                                ...tmdbLookup,
-                                reason: 'tmdb_not_found'
-                            }),
-                            catalogueTmdbId: String(tmdbId)
-                        };
-                        tmdbId = detailedTmdbId;
-                        idSource = 'provider_details';
-                        Object.assign(providerLookup, detailedProviderLookup);
-                    }
-                } else {
-                    Object.assign(providerLookup, detailedProviderLookup);
-                    const reason = providerLookupFailed(detailedProviderLookup)
-                        ? 'provider_tmdb_id_lookup_failed'
-                        : detailedTmdbId
-                            ? 'provider_tmdb_id_same_as_catalogue'
-                            : detailedProviderLookup.reason === 'provider_tmdb_id_invalid'
-                                ? 'provider_tmdb_id_invalid'
-                                : 'provider_tmdb_id_missing';
-                    return makeProviderFallback({
-                        reason,
-                        tmdbId: String(tmdbId),
-                        idSource: 'catalogue',
-                        catalogueLookup: compactTmdbFailure(tmdbLookup),
-                        providerLookup: detailedProviderLookup
-                    });
-                }
-            }
-
-            // If neither source supplied a usable TMDb ID, keep a provider-backed
-            // card for this warm-up and let the normal metadata retry clock try again.
-            if (!tmdb && !tmdbId) {
-                const reason = providerLookupFailed(providerLookup)
-                    ? 'provider_tmdb_id_lookup_failed'
-                    : providerLookup.reason === 'provider_tmdb_id_invalid'
-                        ? 'provider_tmdb_id_invalid'
-                        : 'provider_tmdb_id_missing';
-                return makeProviderFallback({ reason, providerLookup });
-            }
-            if (!tmdb) {
-                return makeProviderFallback({
-                    ...compactTmdbFailure(tmdbLookup),
-                    tmdbId: String(tmdbId),
-                    idSource,
-                    ...(tmdbLookup.catalogueLookup ? { catalogueLookup: tmdbLookup.catalogueLookup } : {}),
-                    ...(tmdbLookup.catalogueTmdbId ? { catalogueTmdbId: tmdbLookup.catalogueTmdbId } : {}),
-                    ...(Object.keys(providerLookup).length ? { providerLookup } : {})
-                });
-            }
-            if (lookupDiagnostics) {
-                Object.assign(lookupDiagnostics, {
-                    reason: 'tmdb_match_found',
-                    tmdbId: String(tmdbId),
-                    idSource
-                });
             }
             const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, {
-                refreshIncomplete: refreshIncompleteMetadata, mediaType: 'series'
+                refreshIncomplete: refreshIncompleteMetadata
             }) : null;
-            if (!tmdb) return this.getDetailedMeta(id);
             return {
                 id: seriesItem.id,
                 type: 'series',
@@ -3078,8 +2619,8 @@ class M3UEPGAddon {
                 genres: tmdb.genres,
                 releaseInfo: tmdb.releaseInfo,
                 year: tmdb.year,
-                runtime: tmdb.runtime || seriesItem.runtime || omdb?.runtime,
-                ...(parseRuntimeMinutes(tmdb.runtime || seriesItem.runtime || omdb?.runtime) !== null
+                runtime: validSeriesRuntime(tmdb.runtime, seriesItem.runtime, omdb?.runtime),
+                ...(parseRuntimeMinutes(validSeriesRuntime(tmdb.runtime, seriesItem.runtime, omdb?.runtime)) !== null
                     ? { runtimeAverage: null } : {}),
                 metadataVersion: 3,
                 _tmdbId: tmdbId || null,
@@ -3289,15 +2830,7 @@ async function createAddon(config) {
 
     const cacheKey = createCacheKey(config);
     const buildKey = createInterfaceKey(config);
-    const debugFlag = !!config.debug || DEBUG_ENV;
-    if (debugFlag) {
-        logAt('debug', '[DEBUG] createAddon start', { provider: config.provider, includeSeries: config.includeSeries !== false });
-    } else {
-        logAt('debug', `[ADDON] Cache ${CACHE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
-    }
-
     if (buildPromiseCache.has(buildKey)) {
-        if (debugFlag) logAt('debug', '[DEBUG] Reusing in-progress addon build');
         return buildPromiseCache.get(buildKey);
     }
 
@@ -3547,14 +3080,12 @@ async function createAddon(config) {
                     const stream = addonInstance.getStream(id);
                     if (!stream) return { streams: [] };
                     if (addonInstance.config.debug) {
-                        logAt('debug', '[DEBUG] Series Episode Stream request', { id, target: safeStreamTarget(stream.url) });
                     }
                     return { streams: [stream] };
                 }
                 const stream = addonInstance.getStream(id);
                 if (!stream) return { streams: [] };
                 if (addonInstance.config.debug) {
-                    logAt('debug', '[DEBUG] Stream request', { id, target: safeStreamTarget(stream.url) });
                 }
                 return { streams: [stream] };
             } catch (e) {

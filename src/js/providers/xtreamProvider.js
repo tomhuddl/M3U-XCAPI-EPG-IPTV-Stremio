@@ -5,9 +5,7 @@
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
-const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../../seriesRuntime");
-const logSeriesMetadata429 = require("../../../seriesMetadataLog");
-const seriesCooloff = require("../../../seriesMetadataCooloff");
+const { parseRuntimeMinutes } = require("../../../seriesRuntime");
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -199,7 +197,6 @@ async function fetchData(addonInstance) {
     });
 
     if (config.includeSeries !== false) {
-      const seriesFetchStartedAt = Date.now();
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
           fetch(`${base}&action=get_series`, { timeout: 35000 }),
@@ -210,8 +207,6 @@ async function fetchData(addonInstance) {
           }),
         ]);
         let seriesCatMap = {};
-        logSeriesMetadata429('xtream', 'get_series', {}, seriesResp);
-        logSeriesMetadata429('xtream', 'get_series_categories', {}, seriesCatsResp);
         try {
           if (seriesCatsResp && seriesCatsResp.ok) {
             const arr = await seriesCatsResp.json();
@@ -240,6 +235,7 @@ async function fetchData(addonInstance) {
                 type: "series",
                 poster: s.cover,
                 plot: s.plot,
+                runtime: seriesLevelRuntime(s),
                 category: cat,
                 attributes: {
                   "tvg-logo": s.cover,
@@ -248,12 +244,7 @@ async function fetchData(addonInstance) {
                 },
               };
             });
-            const summary = { count: seriesList.length, durationMs: Date.now() - seriesFetchStartedAt };
-            if (seriesList.length) {
-              addonInstance.log?.info?.("Xtream series loaded", summary);
-            } else {
-              addonInstance.log?.warn?.("Xtream get_series returned an empty list", summary);
-            }
+            if (!seriesList.length) addonInstance.log?.warn?.("Xtream get_series returned an empty list");
           } else {
             throw new Error("Xtream get_series returned a non-list response");
           }
@@ -263,12 +254,6 @@ async function fetchData(addonInstance) {
           throw error;
         }
       } catch (error) {
-        addonInstance.log?.warn?.("Xtream get_series request failed", {
-          name: error?.name || "Error",
-          code: typeof error?.code === "string" ? error.code : null,
-          ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
-          durationMs: Date.now() - seriesFetchStartedAt,
-        });
         // A failed section is not an observed empty list. Preserve the complete
         // provider snapshot instead of confirming removals after upstream failures.
         throw error;
@@ -353,7 +338,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
 }
 
 // Share only in-flight raw responses. A full detail request, an ID-only lookup
-// and an average-runtime backfill may ask for the same series simultaneously.
+// may ask for the same playable episode list simultaneously.
 // Once they settle, no raw episode payload remains in this map.
 const seriesRequests = new WeakMap();
 
@@ -376,8 +361,6 @@ function requestSeriesPayload(addonInstance, seriesId) {
   }
   const key = String(Number(addonInstance.lastUpdate) || 0) + ":" + String(seriesId);
   if (inFlight.has(key)) return inFlight.get(key);
-  const recentFailure = seriesCooloff.guard(addonInstance, seriesId);
-  if (recentFailure) return Promise.resolve(recentFailure);
   const task = (async () => {
     const { config } = addonInstance;
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
@@ -388,7 +371,6 @@ function requestSeriesPayload(addonInstance, seriesId) {
       );
       if (!response.ok) {
         if (response.body && typeof response.body.destroy === "function") response.body.destroy();
-        if (response.status === 429) return seriesCooloff.record429(addonInstance, seriesId, response);
         return { diagnostic: {
           reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
         } };
@@ -444,62 +426,13 @@ function episodeRuntimeMinutes(episode) {
   return null;
 }
 
-async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
-  const report = details => {
-    if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details);
-  };
-  if (!seriesId) {
-    report({ reason: "provider_series_id_missing", source: "xtream_get_series_info" });
-    return null;
-  }
-  if (!hasSeriesCredentials(addonInstance)) {
-    report({ reason: "provider_credentials_missing", source: "xtream_get_series_info" });
-    return null;
-  }
-  const { payload, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
-  if (!payload) { report(diagnostic); return null; }
-  const info = payload.info && typeof payload.info === "object" ? payload.info : {};
-  const rawTmdbId = info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id || null;
-  const tmdbId = normalizeTmdbId(rawTmdbId);
-  report({
-    reason: tmdbId ? "provider_tmdb_id_found" : rawTmdbId ? "provider_tmdb_id_invalid" : "provider_tmdb_id_missing",
-    source: "xtream_get_series_info"
-  });
-  return tmdbId;
-}
-
-async function fetchSeriesRuntimeSummary(addonInstance, seriesId) {
-  if (!seriesId || !hasSeriesCredentials(addonInstance)) return null;
-  const { payload } = await requestSeriesPayload(addonInstance, seriesId);
-  const groups = payload?.episodes;
-  if (!groups || typeof groups !== "object" || (Array.isArray(groups) && groups.length > 0)) return null;
-  const runtimes = [];
-  for (const [seasonKey, episodes] of Object.entries(groups)) {
-    if (!Array.isArray(episodes)) return null;
-    for (const episode of episodes) {
-      if (!episode || typeof episode !== "object" || Array.isArray(episode)) return null;
-      const runtimeMinutes = episodeRuntimeMinutes(episode);
-      if (runtimeMinutes === null) continue;
-      runtimes.push({
-        id: episode.id,
-        season: Number.parseInt(episode.season ?? seasonKey, 10),
-        episode: Number.parseInt(episode.episode_num ?? episode.episode ?? 0, 10),
-        released: episode.releasedate || episode.info?.releasedate || episode.info?.air_date,
-        runtimeMinutes
-      });
-    }
-  }
-  const average = averageEpisodeRuntime(runtimes);
-  return {
-    ...(average || { episodeCount: 0, totalMinutes: 0 }),
-    source: "provider-episodes",
-    complete: true
-  };
+function seriesLevelRuntime(info) {
+  const minutes = [info?.runtime, info?.episode_run_time].map(parseRuntimeMinutes).find(value => value !== null);
+  return minutes == null ? undefined : Math.max(1, Math.round(minutes)) + " min";
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
-  // For Xtream JSON API only. Episode runtime remains in the persistent detail
-  // record so later average calculations can reuse it without another request.
+  // Fetch playable episodes on demand; individual durations are saved with details.
   const { config } = addonInstance;
   if (!seriesId || !hasSeriesCredentials(addonInstance)) return { videos: [] };
   try {
@@ -510,7 +443,6 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         fetchError: diagnostic?.httpStatus ? `HTTP ${diagnostic.httpStatus}` : "Provider request failed",
         ...(diagnostic?.errorName ? { errorName: diagnostic.errorName } : {}),
         ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
-        ...(diagnostic?.retryAt ? { retryAt: diagnostic.retryAt } : {}),
         fetchedAt: Date.now()
       };
     }
@@ -556,12 +488,8 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
       }
     }
     videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
-    return { videos, tmdbId, fetchedAt: Date.now() };
+    return { videos, tmdbId, runtime: seriesLevelRuntime(seriesInfo), fetchedAt: Date.now() };
   } catch (error) {
-    if (seriesCooloff.isCooloff(error)) {
-      if (seriesCooloff.isBackground()) throw error;
-      return { videos: [], fetchError: 'HTTP 429', retryAt: error.retryAt, fetchedAt: Date.now() };
-    }
     const diagnostic = providerRequestDiagnostic(error);
     return {
       videos: [], fetchError: "Provider request failed", errorName: diagnostic.errorName,
@@ -583,7 +511,5 @@ module.exports = {
   fetchData,
   fetchMovieInfo,
   fetchSeriesInfo,
-  fetchSeriesTmdbId,
-  fetchSeriesRuntimeSummary,
   normalizeTmdbId,
 };

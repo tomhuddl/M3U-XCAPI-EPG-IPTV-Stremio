@@ -1,5 +1,4 @@
 const { safeFetch } = require("../../urlSafety");
-const logSeriesMetadata429 = require("../../seriesMetadataLog");
 const LRUCache = require("../../lruCache");
 const { parseRuntimeMinutes, averageEpisodeRuntime, isEligibleRuntimeEpisode } = require("../../seriesRuntime");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
@@ -141,11 +140,6 @@ async function request(path, { refresh = false, diagnostics = null } = {}) {
       });
       status = response.status;
       if (!response.ok) {
-        const seriesRequest = path.match(/^\/tv\/(\d+)(?:\/season\/(\d+))?/);
-        if (seriesRequest) logSeriesMetadata429('tmdb', seriesRequest[2] ? 'season_details'
-          : path.includes('/videos') ? 'series_videos' : 'series_details', {
-            tmdbId: seriesRequest[1], ...(seriesRequest[2] ? { season: Number(seriesRequest[2]) } : {})
-          }, response);
         // Do not leave an unused upstream response body draining in the
         // background. Explicitly close it so repeated HTTP failures release
         // sockets and buffers promptly.

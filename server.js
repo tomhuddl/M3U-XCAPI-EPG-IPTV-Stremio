@@ -195,7 +195,6 @@ app.post("/encrypt", preflightRateLimit, (req, res) => {
 });
 
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
-const logSeriesMetadata429 = require('./seriesMetadataLog');
 
 // Count Xtream series from Railway without returning the full catalogue to the browser.
 app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
@@ -232,7 +231,6 @@ app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
       timeout: 35000,
       headers: { "User-Agent": "IPTV-Stremio-Addon series preflight/1.0" },
     });
-    logSeriesMetadata429('xtream', 'get_series_preflight', {}, response);
     if (!response.ok) {
       if (response.body) response.body.destroy();
       return res.status(502).json({
@@ -447,7 +445,6 @@ app.post("/api/prefetch", preflightRateLimit, async (req, res) => {
       return res.status(400).json({ error: "Invalid URL" });
     }
 
-    dlog("Prefetch start", { purpose: safePurpose });
 
     const performFetch = async () => {
       let fetched;
@@ -511,18 +508,12 @@ app.post("/api/prefetch", preflightRateLimit, async (req, res) => {
       }
 
       if (!fetched.ok) {
-        const action = currentUrl.searchParams.get('action');
-        if (currentUrl.pathname.endsWith('/player_api.php') &&
-            ['get_series', 'get_series_categories', 'get_series_info'].includes(action)) {
-          logSeriesMetadata429('xtream', action, { seriesId: currentUrl.searchParams.get('series_id') }, fetched);
-        }
         if (fetched.body) fetched.body.destroy();
         const upstream = new Error("Upstream request failed");
         upstream.statusCode = 502;
         upstream.upstreamStatus = fetched.status;
         throw upstream;
-      }
-
+    }
       const reader = fetched.body;
       if (!reader) throw new Error("Empty response body");
       const chunks = [];
@@ -556,12 +547,6 @@ app.post("/api/prefetch", preflightRateLimit, async (req, res) => {
 
       let content = Buffer.concat(chunks).toString("utf8");
       if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
-
-      dlog("Prefetch done", {
-        bytes: received,
-        truncated,
-        returnedBytes: Buffer.byteLength(content),
-      });
 
       return {
         ok: true,
@@ -707,7 +692,6 @@ app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
     }
     activeInterfaceBuilds += 1;
     try {
-      dlog("Building addon interface (cache miss)");
       iface = await createAddon(config);
       acquired = createAddon.acquireAddonInterface(iface);
       // The same config may have been evicted while another request awaited this
