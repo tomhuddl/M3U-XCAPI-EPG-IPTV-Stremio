@@ -447,7 +447,28 @@ function validSeasonRuntimeSummary(value, now) {
     Number.isFinite(value.checkedAt) && value.checkedAt > 0 && value.checkedAt <= now;
 }
 
-async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, refresh = false } = {}) {
+async function getSeriesLevelRuntime(tmdbId, options = {}) {
+  const diagnostics = options.diagnostics;
+  const id = validTmdbId(tmdbId);
+  if (!id) {
+    recordLookupDiagnostic(diagnostics, { reason: tmdbId == null ? "tmdb_id_missing" : "tmdb_id_invalid" });
+    return null;
+  }
+  if (!tmdbConfigured()) {
+    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured" });
+    return null;
+  }
+  const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, options);
+  if (!details) return null;
+  const runtime = Array.isArray(details.episode_run_time)
+    ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;
+  recordLookupDiagnostic(diagnostics, { reason: runtime == null ? "tmdb_series_runtime_missing" : "tmdb_series_runtime_found" });
+  return runtime == null ? null : {
+    runtime: runtime + " min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: []
+  };
+}
+
+async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, refresh = false, seriesLevelChecked = false } = {}) {
   if (!Array.isArray(episodes)) return null;
   const listed = providerEpisodes(episodes);
   const id = validTmdbId(tmdbId);
@@ -456,13 +477,9 @@ async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, ref
   if (runtimePending.has(pendingKey)) return runtimePending.get(pendingKey);
   const task = (async () => {
     const configured = Boolean(id && tmdbConfigured());
-    if (configured) {
-      const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, { refresh });
-      const official = Array.isArray(details?.episode_run_time)
-        ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;
-      if (official != null) {
-        return { runtime: official + " min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: [] };
-      }
+    if (configured && !seriesLevelChecked) {
+      const official = await getSeriesLevelRuntime(id, { refresh });
+      if (official) return official;
     }
     const now = Date.now();
     const prior = new Map();
@@ -494,15 +511,23 @@ async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, ref
           summaries[index] = { ...saved };
           continue;
         }
+        const diagnostic = {};
         const data = configured && season !== null
-          ? await request("/tv/" + id + "/season/" + season + "?language=en-GB", { refresh: Boolean(refresh || saved) }) : null;
+          ? await request("/tv/" + id + "/season/" + season + "?language=en-GB", {
+              refresh: Boolean(refresh || saved), diagnostics: diagnostic
+            }) : null;
+        const failure = configured && season !== null && !Array.isArray(data?.episodes)
+          ? { reason: data ? "tmdb_episode_response_invalid" : diagnostic.reason || "tmdb_episode_lookup_failed",
+              ...(Number.isInteger(diagnostic.httpStatus) ? { httpStatus: diagnostic.httpStatus } : {}),
+              ...(diagnostic.errorName ? { errorName: diagnostic.errorName } : {}),
+              ...(diagnostic.errorCode ? { errorCode: diagnostic.errorCode } : {}) } : null;
         const rows = Array.isArray(data?.episodes) ? data.episodes.filter(episode => episode && typeof episode === "object").map(episode => ({
           season: episode.season_number ?? season, episode: episode.episode_number, runtime: episode.runtime
         })) : null;
         // An old aggregate is safe only for this exact provider episode set.
         // Never reuse a total that includes removed episodes or TMDb-only extras.
         if (configured && season !== null && rows === null && samePopulation) {
-          summaries[index] = { ...saved, complete: false, tmdbLookupFailed: true };
+          summaries[index] = { ...saved, complete: false, tmdbLookupFailed: true, lookupFailure: failure };
           continue;
         }
         const average = averageProviderEpisodes(selected, rows ? [[season, rows]] : []);
@@ -512,7 +537,7 @@ async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, ref
           runtimeCount: average.episodeCount, totalMinutes: average.totalMinutes,
           tmdbEpisodeCount: average.tmdbEpisodeCount, providerDurationCount: average.providerDurationCount,
           checkedAt: now, complete: !configured || season === null || average.unresolvedEpisodeCount === 0,
-          tmdbLookupFailed: failed
+          tmdbLookupFailed: failed, ...(failure ? { lookupFailure: failure } : {})
         };
       }
     };
@@ -527,6 +552,9 @@ async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, ref
       source: tmdbEpisodeCount ? (providerDurationCount ? "mixed-episodes" : "tmdb-episodes") : "provider-episodes",
       episodeCount, totalMinutes, tmdbEpisodeCount, providerDurationCount,
       missingDurationCount: listed.length - episodeCount,
+      failedSeasonLookups: summaries.filter(season => season.tmdbLookupFailed).length,
+      ...(summaries.find(season => season.lookupFailure)?.lookupFailure
+        ? { lookupFailure: summaries.find(season => season.lookupFailure).lookupFailure } : {}),
       complete: summaries.every(season => season.complete), seasons: summaries
     };
   })();
@@ -550,6 +578,7 @@ module.exports = {
   getSeriesCatalogMetadata,
   getSeasonEpisodes,
   getSeriesRuntimeMetadata,
+  getSeriesLevelRuntime,
   getDiagnostics,
   mapMovieMetadata,
   mapSeriesMetadata,

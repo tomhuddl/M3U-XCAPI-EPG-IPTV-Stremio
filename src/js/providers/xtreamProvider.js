@@ -461,16 +461,34 @@ async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
   return tmdbId;
 }
 
-async function fetchSeriesRuntimeInfo(addonInstance, seriesId) {
-  if (!seriesId || !hasSeriesCredentials(addonInstance)) return null;
-  const { payload } = await requestSeriesPayload(addonInstance, seriesId);
-  const groups = payload?.episodes;
-  if (!groups || typeof groups !== "object" || (Array.isArray(groups) && groups.length > 0)) return null;
+async function fetchSeriesRuntimeInfo(addonInstance, seriesId, diagnostics = null) {
+  const report = details => {
+    if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details, { source: "xtream_get_series_info" });
+  };
+  if (!seriesId || !hasSeriesCredentials(addonInstance)) {
+    report({ reason: !seriesId ? "provider_series_id_missing" : "provider_credentials_missing" });
+    return null;
+  }
+  const { payload, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
+  if (!payload) { report(diagnostic || { reason: "provider_series_info_unavailable" }); return null; }
+  const groups = payload.episodes;
+  if (groups == null || typeof groups !== "object") {
+    report({ reason: groups == null ? "provider_episodes_missing" : "provider_episodes_invalid" });
+    return null;
+  }
   const episodes = [];
+  // The details parser already accepts season arrays keyed by either a JSON
+  // object or a JSON array. Runtime lookup must accept those same layouts.
   for (const [seasonKey, rows] of Object.entries(groups)) {
-    if (!Array.isArray(rows)) return null;
+    if (rows == null) continue; // Empty slots in indexed season lists contain no playable episodes.
+    if (!Array.isArray(rows)) { report({ reason: "provider_season_episodes_invalid" }); return null; }
     for (const episode of rows) {
-      if (!episode || typeof episode !== "object" || Array.isArray(episode) || episode.id == null || String(episode.id).trim() === "") return null;
+      if (!episode || typeof episode !== "object" || Array.isArray(episode)) {
+        report({ reason: "provider_episode_invalid" }); return null;
+      }
+      if (episode.id == null || String(episode.id).trim() === "") {
+        report({ reason: "provider_episode_id_missing" }); return null;
+      }
       episodes.push({
         id: "iptv_series_ep_" + episode.id,
         season: Number.parseInt(episode.season ?? seasonKey, 10),
@@ -480,6 +498,7 @@ async function fetchSeriesRuntimeInfo(addonInstance, seriesId) {
     }
   }
   const info = payload.info && typeof payload.info === "object" ? payload.info : {};
+  report({ reason: episodes.length ? "provider_episodes_loaded" : "provider_episodes_empty", episodeCount: episodes.length });
   return { episodes, tmdbId: normalizeTmdbId(info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id), fetchedAt: Date.now() };
 }
 

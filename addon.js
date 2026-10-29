@@ -249,6 +249,7 @@ function seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate = null) {
     const attemptedGeneration = Number(average?.attemptProviderLastUpdate ?? average?.providerLastUpdate);
     if (providerLastUpdate !== null && attemptedGeneration !== Number(providerLastUpdate)) return true;
     if (!providerRuntimeScopeIsValid(average)) {
+        if (average?.lookupRevision !== 1) return true;
         const attemptedAt = Number(average?.scopeMigrationAttemptedAt) || 0;
         return !attemptedAt || Date.now() - attemptedAt >= OMDB_MISSING_DATA_RETRY_MS;
     }
@@ -258,7 +259,7 @@ function seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate = null) {
 
 function providerRuntimeRecord(result, tmdbId, providerLastUpdate, now = Date.now()) {
     return {
-        version: 2, scope: 'provider-episodes', runtime: result.runtime, source: result.source,
+        version: 2, scope: 'provider-episodes', lookupRevision: 1, runtime: result.runtime, source: result.source,
         episodeFingerprint: result.episodeFingerprint, providerEpisodeCount: result.providerEpisodeCount,
         episodeCount: result.episodeCount, totalMinutes: result.totalMinutes,
         tmdbEpisodeCount: result.tmdbEpisodeCount || 0, providerDurationCount: result.providerDurationCount || 0,
@@ -267,6 +268,27 @@ function providerRuntimeRecord(result, tmdbId, providerLastUpdate, now = Date.no
         tmdbId: tmdbId ? String(tmdbId) : null, providerLastUpdate, attemptProviderLastUpdate: providerLastUpdate,
         ...(Array.isArray(result.seasons) ? { seasons: result.seasons } : {})
     };
+}
+
+function compactRuntimeFailure(reason, details = {}) {
+    details = details && typeof details === 'object' ? details : {};
+    const safeWord = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(value);
+    const failure = { reason: safeWord(reason) ? reason : 'runtime_lookup_failed' };
+    if (Number.isInteger(details.httpStatus) && details.httpStatus >= 100 && details.httpStatus <= 599) failure.httpStatus = details.httpStatus;
+    if (safeWord(details.errorName)) failure.errorName = details.errorName;
+    if (safeWord(details.errorCode)) failure.errorCode = details.errorCode;
+    return failure;
+}
+
+function runtimeFailureLabel(details) {
+    const failure = compactRuntimeFailure(details?.reason || 'not_recorded', details);
+    return failure.reason + (failure.httpStatus ? ':' + failure.httpStatus : '') +
+        (failure.errorCode ? ':' + failure.errorCode : '');
+}
+
+function countLookupReason(counts, details) {
+    const label = runtimeFailureLabel(details);
+    counts[label] = (counts[label] || 0) + 1;
 }
 
 function createSeriesRuntimeSummary() {
@@ -284,9 +306,21 @@ function countSeriesRuntime(summary, value, providerLastUpdate = null) {
     else if (derived && value.runtimeAverage.source === 'provider-episodes') summary.providerEpisodeAverage++;
     else if (derived && value.runtimeAverage.source === 'mixed-episodes') summary.mixedEpisodeAverage++;
     else summary.seriesLevel++;
-    if (derived && !providerRuntimeScopeIsValid(value.runtimeAverage)) summary.legacyScope++;
-    if (derived && Number(value.runtimeAverage.attemptedAt) > Number(value.runtimeAverage.checkedAt)) {
-        summary.retainedAfterFailedRefresh++;
+    const average = value?.runtimeAverage;
+    if (derived && !providerRuntimeScopeIsValid(average)) {
+        summary.legacyScope++;
+        summary.legacyFailureReasons ||= {};
+        countLookupReason(summary.legacyFailureReasons, average.lastFailure);
+        summary.legacyExamples ||= [];
+        if (summary.legacyExamples.length < 5) summary.legacyExamples.push({
+            id: String(value.id || ''), name: String(value.name || '').slice(0, 120),
+            runtime: value.runtime, ...compactRuntimeFailure(average.lastFailure?.reason || 'not_recorded', average.lastFailure)
+        });
+    }
+    if (derived && Number(average.attemptedAt) > Number(average.checkedAt)) summary.retainedAfterFailedRefresh++;
+    if (average?.lastFailure || Number(average?.attemptedAt) > Number(average?.checkedAt)) {
+        summary.lookupFailureReasons ||= {};
+        countLookupReason(summary.lookupFailureReasons, average?.lastFailure);
     }
     if (!value || seriesRuntimeAverageNeedsRefresh(value, providerLastUpdate)) summary.retryDue++;
     else if (!present) summary.missingRetryDeferred++;
@@ -1940,39 +1974,64 @@ class M3UEPGAddon {
             const previous = current?.runtimeAverage;
             let tmdbId = current?._tmdbId || seriesItem.tmdbId || null;
             let result = null;
+            let failure = null;
+            let probedTmdbId = null;
             try {
-                const seriesKey = getProviderSeriesKey(seriesItem);
-                let info = this.seriesInfoCache.get(seriesKey);
-                if (!info || info.fetchError || Number(info.fetchedAt) < Number(providerLastUpdate)) {
-                    info = null;
-                    if (this.providerName === 'xtream') {
-                        const saved = await this.persistentSeriesInfoCache.get(seriesKey, providerLastUpdate);
-                        if (saved?.fresh && !saved.value.fetchError) info = saved.value;
-                    }
-                }
-                if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                if (!info) {
-                    if (this.providerName === 'direct') info = await this.ensureSeriesInfo(seriesKey);
-                    else if (this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
-                        const provider = require('./src/js/providers/xtreamProvider.js');
-                        info = await provider.fetchSeriesRuntimeInfo(this, seriesKey);
-                    }
-                }
-                if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
-                const episodes = info && !info.fetchError ? (info.episodes || info.videos) : null;
-                if (Array.isArray(episodes)) {
-                    tmdbId = tmdbId || info.tmdbId || null;
-                    result = await tmdbMetadata.getSeriesRuntimeMetadata(tmdbId, {
-                        episodes, previous, refresh: Boolean(previous)
+                // A source-supplied runtime needs no episode list. Check it even
+                // when the provider's series-details request is unavailable.
+                if (tmdbId) {
+                    probedTmdbId = String(tmdbId);
+                    result = await tmdbMetadata.getSeriesLevelRuntime(tmdbId, {
+                        refresh: Boolean(previous)
                     });
-                    if (result && result.source !== 'tmdb-series') {
-                        result = { ...result, scope: 'provider-episodes',
-                            episodeFingerprint: providerEpisodeFingerprint(episodes),
-                            providerEpisodeCount: providerEpisodes(episodes).length };
+                }
+                if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
+                if (!result) {
+                    const providerDiagnostic = {};
+                    const seriesKey = getProviderSeriesKey(seriesItem);
+                    let info = this.seriesInfoCache.get(seriesKey);
+                    if (!info || info.fetchError || Number(info.fetchedAt) < Number(providerLastUpdate)) {
+                        info = null;
+                        if (this.providerName === 'xtream') {
+                            const saved = await this.persistentSeriesInfoCache.get(seriesKey, providerLastUpdate);
+                            if (saved?.fresh && !saved.value.fetchError) info = saved.value;
+                        }
+                    }
+                    if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
+                    if (!info) {
+                        if (this.providerName === 'direct') info = await this.ensureSeriesInfo(seriesKey);
+                        else if (this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
+                            const provider = require('./src/js/providers/xtreamProvider.js');
+                            info = await provider.fetchSeriesRuntimeInfo(this, seriesKey, providerDiagnostic);
+                        }
+                    }
+                    if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
+                    const episodes = info && !info.fetchError ? (info.episodes || info.videos) : null;
+                    if (Array.isArray(episodes)) {
+                        tmdbId = tmdbId || info.tmdbId || null;
+                        result = await tmdbMetadata.getSeriesRuntimeMetadata(tmdbId, {
+                            episodes, previous, refresh: Boolean(previous),
+                            seriesLevelChecked: probedTmdbId !== null && probedTmdbId === String(tmdbId)
+                        });
+                        if (result && result.source !== 'tmdb-series') {
+                            result = { ...result, scope: 'provider-episodes',
+                                episodeFingerprint: providerEpisodeFingerprint(episodes),
+                                providerEpisodeCount: providerEpisodes(episodes).length };
+                        }
+                        if (!result?.runtime || result.complete !== true) {
+                            failure = result?.lookupFailure
+                                ? compactRuntimeFailure(result.lookupFailure.reason, result.lookupFailure)
+                                : compactRuntimeFailure(!episodes.length ? 'provider_episodes_empty'
+                                    : result?.runtime ? 'episode_lookup_incomplete' : 'episode_durations_unavailable');
+                        }
+                    } else {
+                        failure = compactRuntimeFailure(providerDiagnostic.reason || 'provider_series_info_unavailable', providerDiagnostic);
                     }
                 }
-            } catch {
-                // A failed lookup must not erase the last saved runtime.
+            } catch (error) {
+                failure = compactRuntimeFailure('runtime_calculation_error', {
+                    errorName: error?.name, errorCode: error?.code
+                });
             }
             if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
             const latest = this.catalogMetaCache.get(id) || current;
@@ -1984,12 +2043,16 @@ class M3UEPGAddon {
             let updated;
             if (parseRuntimeMinutes(result?.runtime) !== null && (result.complete === true || !samePopulation)) {
                 updated = { ...latest, runtime: result.runtime,
-                    runtimeAverage: result.source === 'tmdb-series' ? null : providerRuntimeRecord(result, tmdbId, providerLastUpdate, now) };
+                    runtimeAverage: result.source === 'tmdb-series' ? null : {
+                        ...providerRuntimeRecord(result, tmdbId, providerLastUpdate, now),
+                        ...(failure ? { lastFailure: failure } : {})
+                    } };
             } else {
                 updated = { ...latest, runtimeAverage: {
                     ...(latest.runtimeAverage || {}), version: latest.runtimeAverage?.version || 1,
                     checkedAt: Number(latest.runtimeAverage?.checkedAt) || 0,
-                    attemptedAt: now, attemptProviderLastUpdate: providerLastUpdate,
+                    attemptedAt: now, attemptProviderLastUpdate: providerLastUpdate, lookupRevision: 1,
+                    lastFailure: failure || compactRuntimeFailure('runtime_lookup_failed'),
                     ...(!providerRuntimeScopeIsValid(latest.runtimeAverage) ? { scopeMigrationAttemptedAt: now } : {}),
                     complete: latest.runtimeAverage?.complete === true,
                     ...(samePopulation && Array.isArray(result?.seasons) ? { seasons: result.seasons } : {}),
@@ -2515,6 +2578,7 @@ class M3UEPGAddon {
             let providerFallbacks = 0;
             let nextProgressPercent = 25;
             const providerFallbackReasons = {};
+            const providerLookupFailureReasons = {};
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 if (this.disposed || !isCurrentGeneration()) return;
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
@@ -2540,6 +2604,10 @@ class M3UEPGAddon {
                         providerFallbacks++;
                         const reason = lookupDiagnostic.reason || 'unknown';
                         providerFallbackReasons[reason] = (providerFallbackReasons[reason] || 0) + 1;
+                        const providerLookup = lookupDiagnostic.providerLookup;
+                        if (providerLookup?.reason && /(?:error|invalid|failed|credentials_missing)/.test(providerLookup.reason)) {
+                            countLookupReason(providerLookupFailureReasons, providerLookup);
+                        }
                     }
                     const state = getCatalogMetadataWarmupState(cached, providerLastUpdate);
                     if (state.incomplete) {
@@ -2606,6 +2674,7 @@ class M3UEPGAddon {
             this.log.debug('Catalogue metadata diagnostics', {
                 type,
                 ...omdbCatalogueSummary,
+                ...(Object.keys(providerLookupFailureReasons).length ? { providerLookupFailureReasons } : {}),
                 ...(seriesRuntime ? { seriesRuntime } : {}),
                 tmdb: typeof tmdbMetadata.getDiagnostics === 'function' ? tmdbMetadata.getDiagnostics() : undefined,
                 omdb: typeof omdbMetadata.getDiagnostics === 'function' ? omdbMetadata.getDiagnostics() : undefined
@@ -2643,6 +2712,8 @@ class M3UEPGAddon {
                     missingFieldCounts,
                     providerFallbacks,
                     providerFallbackReasons,
+                    ...(seriesRuntime ? { runtimeMigrationPending: seriesRuntime.legacyScope } : {}),
+                    ...(Object.keys(providerLookupFailureReasons).length ? { providerLookupFailureReasons } : {}),
                     ms: Date.now() - startedAt
                 });
             } else {
@@ -2660,6 +2731,8 @@ class M3UEPGAddon {
                     missingFieldCounts,
                     providerFallbacks,
                     providerFallbackReasons,
+                    ...(seriesRuntime ? { runtimeMigrationPending: seriesRuntime.legacyScope } : {}),
+                    ...(Object.keys(providerLookupFailureReasons).length ? { providerLookupFailureReasons } : {}),
                     retryDelay
                 });
             }
