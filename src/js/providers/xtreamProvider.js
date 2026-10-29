@@ -6,6 +6,20 @@
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
 const { parseRuntimeMinutes } = require("../../../seriesRuntime");
+const xtreamRequests = require("../../../xtreamRequests");
+
+// Consume each JSON body inside its queue slot. Waiting for several response
+// headers before reading their bodies would otherwise deadlock a bounded queue.
+function fetchJsonResponse(addon, url, options) {
+  return xtreamRequests.request(addon, url, () => fetch(url, options), async response => {
+    if (!response.ok) {
+      response.body?.destroy?.();
+      return { ok: false, status: response.status };
+    }
+    const payload = await response.json();
+    return { ok: true, status: response.status, json: async () => payload };
+  });
+}
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -67,12 +81,16 @@ async function fetchData(addonInstance) {
       `&password=${encodeURIComponent(xtreamPassword)}` +
       `&type=m3u_plus` +
       (xtreamOutput ? `&output=${encodeURIComponent(xtreamOutput)}` : "");
-    const resp = await fetch(url, {
+    const text = await xtreamRequests.request(addonInstance, url, () => fetch(url, {
       timeout: 30000,
       headers: { "User-Agent": "Stremio M3U/EPG Addon (xtreamProvider/m3u)" },
+    }), async resp => {
+      if (!resp.ok) {
+        resp.body?.destroy?.();
+        throw new Error("Xtream M3U fetch failed");
+      }
+      return resp.text();
     });
-    if (!resp.ok) throw new Error("Xtream M3U fetch failed");
-    const text = await resp.text();
     const items = addonInstance.parseM3U(text);
 
     addonInstance.channels = items.filter((i) => i.type === "tv");
@@ -108,12 +126,12 @@ async function fetchData(addonInstance) {
     const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
     // Fetch streams + category lists in parallel to map category_id -> category_name
     const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-      fetch(`${base}&action=get_live_streams`, { timeout: 30000 }),
-      fetch(`${base}&action=get_vod_streams`, { timeout: 30000 }),
-      fetch(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
+      fetchJsonResponse(addonInstance, `${base}&action=get_live_streams`, { timeout: 30000 }),
+      fetchJsonResponse(addonInstance, `${base}&action=get_vod_streams`, { timeout: 30000 }),
+      fetchJsonResponse(addonInstance, `${base}&action=get_live_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
-      fetch(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
+      fetchJsonResponse(addonInstance, `${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
     ]);
@@ -200,8 +218,8 @@ async function fetchData(addonInstance) {
       const seriesFetchStartedAt = Date.now();
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
-          fetch(`${base}&action=get_series`, { timeout: 35000 }),
-          fetch(`${base}&action=get_series_categories`, {
+          fetchJsonResponse(addonInstance, `${base}&action=get_series`, { timeout: 35000 }),
+          fetchJsonResponse(addonInstance, `${base}&action=get_series_categories`, {
             timeout: 20000,
           }).catch((error) => {
             return null;
@@ -286,13 +304,15 @@ async function fetchData(addonInstance) {
     const retentionBudget = { programmes: 0, textChars: 0 };
     const parsedSources = await mapWithConcurrency(epgSources, getEpgFetchConcurrency(), async sourceUrl => {
       try {
-        const epgResp = await fetch(sourceUrl, { timeout: 120000 });
-        if (!epgResp || !epgResp.ok || !epgResp.body) {
-          addonInstance.epgRefreshFailed = true;
-          if (epgResp?.body) epgResp.body.destroy();
-          return null;
-        }
-        return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
+        return await xtreamRequests.request(addonInstance, sourceUrl,
+          () => fetch(sourceUrl, { timeout: 120000 }), async epgResp => {
+            if (!epgResp || !epgResp.ok || !epgResp.body) {
+              addonInstance.epgRefreshFailed = true;
+              if (epgResp?.body) epgResp.body.destroy();
+              return null;
+            }
+            return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
+          });
       } catch {
         addonInstance.epgRefreshFailed = true;
         return null;
@@ -332,7 +352,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
   if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   try {
-    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
+    const response = await fetchJsonResponse(addonInstance, `${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
       timeout: 20000,
       // Reuse a connection for this provider fallback when its validated DNS
       // addresses are unchanged; safeFetch still validates DNS on every request.
@@ -343,7 +363,8 @@ async function fetchMovieInfo(addonInstance, streamId) {
     const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
     const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;
     return { tmdbId: normalizeTmdbId(tmdbId) };
-  } catch {
+  } catch (error) {
+    if (xtreamRequests.isXtreamRateLimitError(error)) throw error;
     return null;
   }
 }
@@ -376,30 +397,33 @@ function requestSeriesPayload(addonInstance, seriesId) {
     const { config } = addonInstance;
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
     try {
-      const response = await fetch(
-        `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
-        { timeout: 25000, reuseConnection: true },
-      );
-      if (!response.ok) {
-        if (response.body && typeof response.body.destroy === "function") response.body.destroy();
-        return { diagnostic: {
-          reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
-        } };
-      }
-      let payload;
-      try {
-        payload = await response.json();
-      } catch (error) {
-        return { diagnostic: {
-          reason: "provider_invalid_json", source: "xtream_get_series_info",
-          errorName: error?.name || "SyntaxError"
-        } };
-      }
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        return { diagnostic: { reason: "provider_invalid_response", source: "xtream_get_series_info" } };
-      }
-      return { payload };
+      const url = `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`;
+      return await xtreamRequests.request(addonInstance, url,
+        () => fetch(url, { timeout: 25000, reuseConnection: true }), async response => {
+          if (!response.ok) {
+            if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+            return { diagnostic: {
+              reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
+            } };
+          }
+          let payload;
+          try {
+            payload = await response.json();
+          } catch (error) {
+            return { diagnostic: {
+              reason: "provider_invalid_json", source: "xtream_get_series_info",
+              errorName: error?.name || "SyntaxError"
+            } };
+          }
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+            return { diagnostic: { reason: "provider_invalid_response", source: "xtream_get_series_info" } };
+          }
+          return { payload };
+        });
     } catch (error) {
+      if (xtreamRequests.isXtreamRateLimitError(error)) return { diagnostic: {
+        reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: 429, retryAt: error.retryAt
+      } };
       return { diagnostic: providerRequestDiagnostic(error) };
     }
   })();
@@ -515,6 +539,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         fetchError: diagnostic?.httpStatus ? `HTTP ${diagnostic.httpStatus}` : "Provider request failed",
         ...(diagnostic?.errorName ? { errorName: diagnostic.errorName } : {}),
         ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
+        ...(diagnostic?.retryAt ? { retryAt: diagnostic.retryAt } : {}),
         fetchedAt: Date.now()
       };
     }

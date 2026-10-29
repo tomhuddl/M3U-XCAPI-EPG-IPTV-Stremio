@@ -79,6 +79,8 @@ async function withTmdbRuntimeResult(result, run) {
 }
 
 async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false) {
+    const restoreScheduler = moduleName.includes('xtreamProvider')
+        ? require('./xtreamTestScheduler')() : () => {};
     const safety = require("../urlSafety");
     const modulePath = require.resolve(moduleName);
     const originalFetch = safety.safeFetch;
@@ -88,6 +90,7 @@ async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false)
     if (withKey) process.env.TMDB_API_KEY = "runtime-tests-only-key";
     delete require.cache[modulePath];
     try { await run(require(modulePath)); } finally {
+        restoreScheduler();
         safety.safeFetch = originalFetch;
         delete require.cache[modulePath];
         if (originalModule) require.cache[modulePath] = originalModule;
@@ -1147,17 +1150,17 @@ async function testRuntimeFailuresPersistSpecificReasonsAndRespectBackoff() {
     let requests = 0;
     tmdbMetadata.getSeriesLevelRuntime = async () => null;
     provider.fetchSeriesRuntimeInfo = async (_addon, _id, diagnostic) => {
-        requests++; Object.assign(diagnostic, { reason: "provider_http_error", httpStatus: 429 }); return null;
+        requests++; Object.assign(diagnostic, { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 }); return null;
     };
     tmdbMetadata.getSeriesRuntimeMetadata = async () => { throw new Error("episode metadata must not run after provider failure"); };
     try {
         const failed = await addon.ensureSeriesRuntimeAverage(item, old);
-        assert.deepStrictEqual(failed.runtimeAverage.lastFailure, { reason: "provider_http_error", httpStatus: 429 });
+        assert.deepStrictEqual(failed.runtimeAverage.lastFailure, { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 });
         assert.strictEqual(failed.runtime, "22 min");
         assert.strictEqual(store.entries.get(item.id).value.description, old.description);
         await addon.ensureSeriesRuntimeAverage(item, failed);
         assert.strictEqual(requests, 1, "recording diagnostics must not bypass the retry backoff");
-        now += 12 * HOUR + 1;
+        now += 60001;
         provider.fetchSeriesRuntimeInfo = async () => ({ episodes: [{ id: "e1", season: 1, episode: 1 }] });
         tmdbMetadata.getSeriesRuntimeMetadata = async () => ({ episodeCount: 0, totalMinutes: 0, complete: true });
         const missing = await addon.ensureSeriesRuntimeAverage(item, failed);
@@ -1220,7 +1223,7 @@ async function testRuntimeMigrationSummaryPersistsReasonsAndBoundsExamples() {
     const previews = Array.from({ length: 8 }, (_, index) => seriesPreview({ id: "iptv_series_" + (index + 1), runtime: "22 min", runtimeAverage: {
         version: 1, runtime: "22 min", source: "tmdb-episodes", tmdbId: "123", complete: true,
         checkedAt: now - HOUR, attemptedAt: now, attemptProviderLastUpdate: 1000, scopeMigrationAttemptedAt: now, lookupRevision: 1,
-        lastFailure: index < 7 ? { reason: "provider_http_error", httpStatus: 429 } : { reason: "episode_durations_unavailable" }
+        lastFailure: index < 7 ? { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 } : { reason: "episode_durations_unavailable" }
     } }));
     previews.push(seriesPreview({ id: "iptv_series_9", runtimeAverage: {
         version: 1, attemptedAt: now, scopeMigrationAttemptedAt: now, attemptProviderLastUpdate: 1000, lookupRevision: 1,
