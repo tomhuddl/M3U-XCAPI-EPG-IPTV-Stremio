@@ -1,4 +1,5 @@
 const { safeFetch } = require("../../urlSafety");
+const logSeriesMetadata429 = require("../../seriesMetadataLog");
 const LRUCache = require("../../lruCache");
 const fs = require("fs");
 const path = require("path");
@@ -189,6 +190,7 @@ async function getByImdbId(value, options = {}) {
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" }
       });
       if (!response || !response.ok) {
+        if (options.mediaType === 'series') logSeriesMetadata429('omdb', 'imdb_lookup', { imdbId }, response);
         markRetryableFailure(imdbId, true);
         recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
         return retryableResult(imdbId, staleCached);

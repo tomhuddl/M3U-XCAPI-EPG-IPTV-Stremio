@@ -1,6 +1,7 @@
 const { safeFetch } = require("../../urlSafety");
+const logSeriesMetadata429 = require("../../seriesMetadataLog");
 const LRUCache = require("../../lruCache");
-const { parseRuntimeMinutes, providerEpisodes, providerEpisodeFingerprint, averageProviderEpisodes } = require("../../seriesRuntime");
+const { parseRuntimeMinutes, averageEpisodeRuntime, isEligibleRuntimeEpisode } = require("../../seriesRuntime");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/";
 const TMDB_API_KEY = (process.env.TMDB_API_KEY || "").trim();
@@ -140,6 +141,11 @@ async function request(path, { refresh = false, diagnostics = null } = {}) {
       });
       status = response.status;
       if (!response.ok) {
+        const seriesRequest = path.match(/^\/tv\/(\d+)(?:\/season\/(\d+))?/);
+        if (seriesRequest) logSeriesMetadata429('tmdb', seriesRequest[2] ? 'season_details'
+          : path.includes('/videos') ? 'series_videos' : 'series_details', {
+            tmdbId: seriesRequest[1], ...(seriesRequest[2] ? { season: Number(seriesRequest[2]) } : {})
+          }, response);
         // Do not leave an unused upstream response body draining in the
         // background. Explicitly close it so repeated HTTP failures release
         // sockets and buffers promptly.
@@ -392,6 +398,15 @@ function mapSeriesMetadata(details, credits, videos, images) {
     year,
     releaseInfo,
     runtime: episodeRuntime ? episodeRuntime + " min" : undefined,
+    runtimeSeasons: Array.isArray(details.seasons)
+      ? [...new Map(details.seasons.filter(season =>
+          Number.isSafeInteger(season?.season_number) && season.season_number > 0 && season.season_number <= 1000
+        ).map(season => [season.season_number, {
+          season: season.season_number,
+          episodeCount: Number.isSafeInteger(season.episode_count) && season.episode_count >= 0
+            ? season.episode_count : null
+        }])).values()].sort((a, b) => a.season - b.season)
+      : undefined,
     rating: Number.isFinite(details.vote_average) && details.vote_count > 0 ? Number(details.vote_average).toFixed(1) : undefined,
     cast,
     links: metadataLinks(details, credits, "tv"),
@@ -437,130 +452,127 @@ async function getSeasonEpisodes(tmdbId, seasonNumber, options = {}) {
 }
 
 function validSeasonRuntimeSummary(value, now) {
-  return value && (value.season === null || (Number.isSafeInteger(value.season) && value.season >= 0 && value.season <= 1000)) &&
-    typeof value.episodeFingerprint === "string" &&
+  return value && Number.isSafeInteger(value.season) && value.season >= 0 && value.season <= 1000 &&
     Number.isSafeInteger(value.episodeCount) && value.episodeCount >= 0 &&
-    Number.isSafeInteger(value.runtimeCount) && value.runtimeCount >= 0 && value.runtimeCount <= value.episodeCount &&
+    Number.isSafeInteger(value.runtimeCount) && value.runtimeCount >= 0 &&
     Number.isFinite(value.totalMinutes) && value.totalMinutes >= 0 &&
     value.totalMinutes <= value.runtimeCount * 24 * 60 &&
     (value.runtimeCount > 0 ? value.totalMinutes > 0 : value.totalMinutes === 0) &&
     Number.isFinite(value.checkedAt) && value.checkedAt > 0 && value.checkedAt <= now;
 }
 
-async function getSeriesLevelRuntime(tmdbId, options = {}) {
-  const diagnostics = options.diagnostics;
+async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false } = {}) {
   const id = validTmdbId(tmdbId);
-  if (!id) {
-    recordLookupDiagnostic(diagnostics, { reason: tmdbId == null ? "tmdb_id_missing" : "tmdb_id_invalid" });
-    return null;
-  }
-  if (!tmdbConfigured()) {
-    recordLookupDiagnostic(diagnostics, { reason: "tmdb_not_configured" });
-    return null;
-  }
-  const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, options);
-  if (!details) return null;
-  const runtime = Array.isArray(details.episode_run_time)
-    ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;
-  recordLookupDiagnostic(diagnostics, { reason: runtime == null ? "tmdb_series_runtime_missing" : "tmdb_series_runtime_found" });
-  return runtime == null ? null : {
-    runtime: runtime + " min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: []
-  };
-}
-
-async function getSeriesRuntimeMetadata(tmdbId, { episodes, previous = null, refresh = false, seriesLevelChecked = false } = {}) {
-  if (!Array.isArray(episodes)) return null;
-  const listed = providerEpisodes(episodes);
-  const id = validTmdbId(tmdbId);
-  const fingerprint = providerEpisodeFingerprint(listed);
-  const pendingKey = (id || "provider") + ":" + fingerprint + (refresh ? ":refresh" : ":cached");
+  if (!id || !tmdbConfigured()) return null;
+  const pendingKey = id + (refresh ? ":refresh" : ":cached");
   if (runtimePending.has(pendingKey)) return runtimePending.get(pendingKey);
   const task = (async () => {
-    const configured = Boolean(id && tmdbConfigured());
-    if (configured && !seriesLevelChecked) {
-      const official = await getSeriesLevelRuntime(id, { refresh });
-      if (official) return official;
+    // Share the existing series-details response with catalogue/detail requests.
+    // Persistent callers retain only the small per-season totals returned below.
+    const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, { refresh });
+    if (!details || !nonEmpty(details.name)) return null;
+    const officialRuntime = Array.isArray(details.episode_run_time)
+      ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;
+    if (officialRuntime != null) {
+      return { runtime: officialRuntime + " min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: [] };
     }
+
     const now = Date.now();
-    const prior = new Map();
-    if (previous?.version === 2 && previous.scope === "provider-episodes" &&
-        String(previous.tmdbId || "") === String(id || "")) {
-      for (const summary of previous.seasons || []) {
-        if (validSeasonRuntimeSummary(summary, now)) prior.set(summary.season, summary);
+    const priorSeasons = new Map();
+    if (previous?.policyVersion === 1 && (!previous?.tmdbId || String(previous.tmdbId) === id) && Array.isArray(previous?.seasons)) {
+      for (const summary of previous.seasons) {
+        if (validSeasonRuntimeSummary(summary, now)) priorSeasons.set(summary.season, summary);
       }
     }
-    const groups = new Map();
-    for (const episode of listed) {
-      const season = episode.episode === null ? null : episode.season;
-      if (!groups.has(season)) groups.set(season, []);
-      groups.get(season).push(episode);
+    const listedSeasons = new Map();
+    let validListing = Array.isArray(details.seasons);
+    for (const entry of Array.isArray(details.seasons) ? details.seasons : []) {
+      const season = entry?.season_number;
+      if (season === 0) continue;
+      if (!Number.isSafeInteger(season) || season < 0 || season > 1000) {
+        validListing = false;
+        continue;
+      }
+      const episodeCount = Number.isSafeInteger(entry.episode_count) && entry.episode_count >= 0
+        ? entry.episode_count : null;
+      listedSeasons.set(season, { season, episodeCount });
     }
-    const seasons = [...groups];
+    if (Number(details.number_of_episodes) > 0 && listedSeasons.size === 0) validListing = false;
+    const seasons = [...listedSeasons.values()].sort((a, b) => a.season - b.season);
     const summaries = new Array(seasons.length);
-    let next = 0;
+    let nextSeason = 0;
     const worker = async () => {
-      while (next < seasons.length) {
-        const index = next++;
-        const [season, selected] = seasons[index];
-        const selectedFingerprint = providerEpisodeFingerprint(selected);
-        const saved = prior.get(season);
-        const samePopulation = saved?.episodeFingerprint === selectedFingerprint;
-        const ttl = saved?.runtimeCount === saved?.episodeCount && !saved?.tmdbLookupFailed
+      while (nextSeason < seasons.length) {
+        const index = nextSeason++;
+        const { season, episodeCount } = seasons[index];
+        const saved = priorSeasons.get(season);
+        const durationTtl = saved?.runtimeCount >= (saved?.eligibleEpisodeCount ?? saved?.episodeCount)
           ? COMPLETE_SEASON_RUNTIME_TTL_MS : PARTIAL_SEASON_RUNTIME_TTL_MS;
-        if (samePopulation && saved.complete === true && now - saved.checkedAt < ttl) {
+        if (saved?.complete === true && episodeCount !== null && saved.episodeCount === episodeCount &&
+            now - saved.checkedAt < durationTtl) {
           summaries[index] = { ...saved };
           continue;
         }
-        const diagnostic = {};
-        const data = configured && season !== null
-          ? await request("/tv/" + id + "/season/" + season + "?language=en-GB", {
-              refresh: Boolean(refresh || saved), diagnostics: diagnostic
-            }) : null;
-        const failure = configured && season !== null && !Array.isArray(data?.episodes)
-          ? { reason: data ? "tmdb_episode_response_invalid" : diagnostic.reason || "tmdb_episode_lookup_failed",
-              ...(Number.isInteger(diagnostic.httpStatus) ? { httpStatus: diagnostic.httpStatus } : {}),
-              ...(diagnostic.errorName ? { errorName: diagnostic.errorName } : {}),
-              ...(diagnostic.errorCode ? { errorCode: diagnostic.errorCode } : {}) } : null;
-        const rows = Array.isArray(data?.episodes) ? data.episodes.filter(episode => episode && typeof episode === "object").map(episode => ({
-          season: episode.season_number ?? season, episode: episode.episode_number, runtime: episode.runtime
-        })) : null;
-        // An old aggregate is safe only for this exact provider episode set.
-        // Never reuse a total that includes removed episodes or TMDb-only extras.
-        if (configured && season !== null && rows === null && samePopulation) {
-          summaries[index] = { ...saved, complete: false, tmdbLookupFailed: true, lookupFailure: failure };
+        if (episodeCount === 0) {
+          summaries[index] = { season, episodeCount: 0, eligibleEpisodeCount: 0, runtimeCount: 0, totalMinutes: 0, checkedAt: now, complete: true };
           continue;
         }
-        const average = averageProviderEpisodes(selected, rows ? [[season, rows]] : []);
-        const failed = configured && season !== null && rows === null;
-        summaries[index] = {
-          season, episodeFingerprint: selectedFingerprint, episodeCount: selected.length,
-          runtimeCount: average.episodeCount, totalMinutes: average.totalMinutes,
-          tmdbEpisodeCount: average.tmdbEpisodeCount, providerDurationCount: average.providerDurationCount,
-          checkedAt: now, complete: !configured || season === null || average.unresolvedEpisodeCount === 0,
-          tmdbLookupFailed: failed, ...(failure ? { lookupFailure: failure } : {})
+        // Use the same cached endpoint as getSeasonEpisodes, but do not build
+        // thumbnails, credits or full episode metadata for a runtime-only pass.
+        const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB", {
+          refresh: Boolean(refresh || saved)
+        });
+        if (!data || !Array.isArray(data.episodes)) {
+          summaries[index] = saved ? { ...saved, complete: false } : {
+            season, episodeCount: episodeCount ?? 0, runtimeCount: 0,
+            totalMinutes: 0, checkedAt: now, complete: false
+          };
+          continue;
+        }
+        const episodes = data.episodes.filter(episode => episode && typeof episode === "object" &&
+          Number.isSafeInteger(episode.episode_number) && episode.episode_number >= 0);
+        const runtimeEpisodes = episodes.map(episode => ({
+          id: episode.id,
+          season: Number.isSafeInteger(episode.season_number) && episode.season_number >= 0 ? episode.season_number : season,
+          episode: episode.episode_number,
+          runtime: episode.runtime,
+          released: episode.air_date
+        })).filter(episode => isEligibleRuntimeEpisode(episode, now));
+        const average = averageEpisodeRuntime(runtimeEpisodes);
+        const eligibleEpisodeCount = new Set(runtimeEpisodes.map(episode => episode.episode)).size;
+        const uniqueEpisodeCount = new Set(episodes.map(episode => episode.episode_number)).size;
+        const complete = episodes.length === data.episodes.length &&
+          (episodeCount === null || uniqueEpisodeCount >= episodeCount);
+        summaries[index] = !complete && saved ? { ...saved, complete: false } : {
+          season,
+          episodeCount: episodeCount ?? episodes.length,
+          eligibleEpisodeCount,
+          runtimeCount: average?.episodeCount || 0,
+          totalMinutes: average?.totalMinutes || 0,
+          checkedAt: now,
+          complete
         };
       }
     };
     await Promise.all(Array.from({ length: Math.min(2, seasons.length) }, () => worker()));
-    const episodeCount = summaries.reduce((sum, season) => sum + season.runtimeCount, 0);
-    const totalMinutes = summaries.reduce((sum, season) => sum + season.totalMinutes, 0);
-    const tmdbEpisodeCount = summaries.reduce((sum, season) => sum + (season.tmdbEpisodeCount || 0), 0);
-    const providerDurationCount = summaries.reduce((sum, season) => sum + (season.providerDurationCount || 0), 0);
+    const episodeCount = summaries.reduce((total, summary) => total + summary.runtimeCount, 0);
+    const totalMinutes = summaries.reduce((total, summary) => total + summary.totalMinutes, 0);
     return {
       ...(episodeCount ? { runtime: Math.max(1, Math.round(totalMinutes / episodeCount)) + " min" } : {}),
-      scope: "provider-episodes", episodeFingerprint: fingerprint, providerEpisodeCount: listed.length,
-      source: tmdbEpisodeCount ? (providerDurationCount ? "mixed-episodes" : "tmdb-episodes") : "provider-episodes",
-      episodeCount, totalMinutes, tmdbEpisodeCount, providerDurationCount,
-      missingDurationCount: listed.length - episodeCount,
-      failedSeasonLookups: summaries.filter(season => season.tmdbLookupFailed).length,
-      ...(summaries.find(season => season.lookupFailure)?.lookupFailure
-        ? { lookupFailure: summaries.find(season => season.lookupFailure).lookupFailure } : {}),
-      complete: summaries.every(season => season.complete), seasons: summaries
+      source: "tmdb-episodes",
+      policyVersion: 1,
+      episodeCount,
+      totalMinutes,
+      complete: validListing && summaries.every(summary => summary.complete),
+      seasons: summaries
     };
   })();
   runtimePending.set(pendingKey, task);
-  try { return await task; }
-  finally { if (runtimePending.get(pendingKey) === task) runtimePending.delete(pendingKey); }
+  try {
+    return await task;
+  } finally {
+    if (runtimePending.get(pendingKey) === task) runtimePending.delete(pendingKey);
+  }
 }
 
 function stripEmpty(value) {
@@ -578,7 +590,6 @@ module.exports = {
   getSeriesCatalogMetadata,
   getSeasonEpisodes,
   getSeriesRuntimeMetadata,
-  getSeriesLevelRuntime,
   getDiagnostics,
   mapMovieMetadata,
   mapSeriesMetadata,

@@ -195,6 +195,7 @@ app.post("/encrypt", preflightRateLimit, (req, res) => {
 });
 
 const { resolvePublicAddresses, createPinnedAgent, safeFetch } = require("./urlSafety");
+const logSeriesMetadata429 = require('./seriesMetadataLog');
 
 // Count Xtream series from Railway without returning the full catalogue to the browser.
 app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
@@ -231,6 +232,7 @@ app.post("/api/xtream-series-check", preflightRateLimit, async (req, res) => {
       timeout: 35000,
       headers: { "User-Agent": "IPTV-Stremio-Addon series preflight/1.0" },
     });
+    logSeriesMetadata429('xtream', 'get_series_preflight', {}, response);
     if (!response.ok) {
       if (response.body) response.body.destroy();
       return res.status(502).json({
@@ -509,6 +511,11 @@ app.post("/api/prefetch", preflightRateLimit, async (req, res) => {
       }
 
       if (!fetched.ok) {
+        const action = currentUrl.searchParams.get('action');
+        if (currentUrl.pathname.endsWith('/player_api.php') &&
+            ['get_series', 'get_series_categories', 'get_series_info'].includes(action)) {
+          logSeriesMetadata429('xtream', action, { seriesId: currentUrl.searchParams.get('series_id') }, fetched);
+        }
         if (fetched.body) fetched.body.destroy();
         const upstream = new Error("Upstream request failed");
         upstream.statusCode = 502;

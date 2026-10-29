@@ -26,7 +26,6 @@ function makeXtreamFetch(overrides = {}) {
 }
 
 async function withProviderFetch(providerName, fetchMock, run) {
-    const restoreScheduler = providerName === 'xtream' ? require('./xtreamTestScheduler')() : () => {};
     const safety = require("../urlSafety");
     const modulePath = require.resolve("../src/js/providers/" + providerName + "Provider");
     const originalFetch = safety.safeFetch;
@@ -36,7 +35,6 @@ async function withProviderFetch(providerName, fetchMock, run) {
     try {
         await run(require(modulePath));
     } finally {
-        restoreScheduler();
         safety.safeFetch = originalFetch;
         delete require.cache[modulePath];
         if (originalModule) require.cache[modulePath] = originalModule;

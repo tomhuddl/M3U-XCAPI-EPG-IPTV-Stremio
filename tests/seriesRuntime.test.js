@@ -2,7 +2,7 @@ const assert = require("assert");
 const createAddon = require("../addon");
 const { M3UEPGAddon, disposeAddonInterface } = createAddon;
 const tmdbMetadata = require("../src/js/tmdbMetadata");
-const { parseRuntimeMinutes, averageEpisodeRuntime, providerEpisodeFingerprint, averageProviderEpisodes } = require("../seriesRuntime");
+const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../seriesRuntime");
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const quietLog = { debug() {}, info() {}, warn() {}, error() {} };
@@ -40,16 +40,11 @@ function seriesPreview(overrides = {}) {
     };
 }
 
-function defaultProviderVideos() {
-    return Array.from({ length: 9 }, (_, index) => ({ id: "ep-1-" + (index + 1), season: 1, episode: index + 1 }));
-}
-
 function runtimeAddon(stored = seriesPreview()) {
     const addon = new M3UEPGAddon({ provider: "direct" });
     const item = { id: stored.id, series_id: "3", type: "series", name: stored.name, tmdbId: "123" };
     addon.series = [item];
     addon.lastUpdate = 1000;
-    addon.directSeriesEpisodeIndex.set("3", defaultProviderVideos());
     addon.log = quietLog;
     addon.persistentCatalogMetaCache = metadataStore([stored]);
     addon.persistentSeriesInfoCache = { get: async () => null };
@@ -65,22 +60,15 @@ async function settleWrites(addon) {
 
 async function withTmdbRuntimeResult(result, run) {
     const original = tmdbMetadata.getSeriesRuntimeMetadata;
-    const originalLevel = tmdbMetadata.getSeriesLevelRuntime;
-    tmdbMetadata.getSeriesLevelRuntime = async () => null;
     let calls = 0;
     tmdbMetadata.getSeriesRuntimeMetadata = async (...args) => {
         calls++;
         return typeof result === "function" ? result(...args) : structuredClone(result);
     };
-    try { await run(() => calls); } finally {
-        tmdbMetadata.getSeriesRuntimeMetadata = original;
-        tmdbMetadata.getSeriesLevelRuntime = originalLevel;
-    }
+    try { await run(() => calls); } finally { tmdbMetadata.getSeriesRuntimeMetadata = original; }
 }
 
 async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false) {
-    const restoreScheduler = moduleName.includes('xtreamProvider')
-        ? require('./xtreamTestScheduler')() : () => {};
     const safety = require("../urlSafety");
     const modulePath = require.resolve(moduleName);
     const originalFetch = safety.safeFetch;
@@ -90,7 +78,6 @@ async function withFreshFetchModule(moduleName, fetchMock, run, withKey = false)
     if (withKey) process.env.TMDB_API_KEY = "runtime-tests-only-key";
     delete require.cache[modulePath];
     try { await run(require(modulePath)); } finally {
-        restoreScheduler();
         safety.safeFetch = originalFetch;
         delete require.cache[modulePath];
         if (originalModule) require.cache[modulePath] = originalModule;
@@ -141,35 +128,30 @@ function testDuttonRanchAverageAndEpisodeWeighting() {
     assert.strictEqual(averageEpisodeRuntime([{ runtime: 0 }, { runtime: "N/A" }]), null);
 }
 
-async function testTmdbAverageIncludesOnlyProviderEpisodesAndLimitsConcurrentRequests() {
+async function testTmdbAverageIncludesRegularSeasonsAndLimitsConcurrentRequests() {
     let active = 0;
     let maxActive = 0;
-    const requested = [];
-    const episodes = [
-        { id: "s1e2", season: 1, episode: 2 },
-        { id: "s2e1", season: 2, episode: 1 },
-        { id: "s2e3", season: 2, episode: 3 },
-        { id: "s3e1", season: 3, episode: 1 }
-    ];
+    const requestedSeasons = [];
     await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
         const match = new URL(url).pathname.match(/\/season\/(\d+)$/);
-        if (!match) return tmdbResponse(tvDetails([[0, 73], [1, 3], [2, 3], [3, 1], [4, 20]]));
+        if (!match) return tmdbResponse(tvDetails([[0, 1], [1, 1], [2, 3]]));
         const season = Number(match[1]);
-        requested.push(season);
-        assert.notStrictEqual(season, 0, "TMDb-only specials must not be fetched");
-        assert.notStrictEqual(season, 4, "unavailable seasons must not be fetched");
-        active++; maxActive = Math.max(active, maxActive);
-        await new Promise(setImmediate); active--;
-        return tmdbResponse(seasonEpisodes(season, season === 1 ? [20, 30, 40] : season === 2 ? [50, 90, 70] : [80]));
+        requestedSeasons.push(season);
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise(resolve => setImmediate(resolve));
+        active--;
+        return tmdbResponse(seasonEpisodes(season, season === 0 ? [10] : season === 1 ? [20] : [60, 60, 60]));
     }, async fresh => {
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes });
-        assert.strictEqual(result.runtime, "58 min");
+        const result = await fresh.getSeriesRuntimeMetadata("123");
+        assert.strictEqual(result.runtime, "50 min");
         assert.strictEqual(result.episodeCount, 4);
-        assert.strictEqual(result.totalMinutes, 230);
+        assert.strictEqual(result.totalMinutes, 200);
         assert.strictEqual(result.complete, true);
-        assert.deepStrictEqual(requested.sort(), [1, 2, 3]);
-        assert.ok(maxActive <= 2);
-        assert.ok(result.seasons.every(summary => !Object.hasOwn(summary, "episodes")));
+        assert.deepStrictEqual(requestedSeasons.sort(), [1, 2]);
+        assert.ok(maxActive <= 2, "a runtime backfill must keep upstream season concurrency bounded");
+        assert.ok(result.seasons.every(summary => !Object.hasOwn(summary, "episodes")),
+            "only aggregates should be retained for a background runtime calculation");
     }, true);
 }
 
@@ -179,73 +161,62 @@ async function testTmdbOfficialSeriesRuntimeAvoidsSeasonRequests() {
         calls++;
         return tmdbResponse(tvDetails([[1, 10]], { episode_run_time: [48] }));
     }, async fresh => {
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes: defaultProviderVideos() });
+        const result = await fresh.getSeriesRuntimeMetadata("123");
         assert.strictEqual(result.runtime, "48 min");
         assert.strictEqual(result.source, "tmdb-series");
-        assert.strictEqual(calls, 1);
+        assert.strictEqual(calls, 1, "an official series duration must not trigger episode backfill");
     }, true);
 }
 
 async function testTmdbAverageReusesUnchangedSeasonsAndRefreshesChangedOnes() {
-    let episodes = [
-        { id: "a", season: 1, episode: 1 }, { id: "b", season: 1, episode: 2 }, { id: "c", season: 2, episode: 1 }
-    ];
+    const now = Date.now();
+    const previous = { policyVersion: 1, tmdbId: "123", seasons: [
+        { season: 1, episodeCount: 2, runtimeCount: 2, totalMinutes: 80, checkedAt: now - 1000, complete: true },
+        { season: 2, episodeCount: 1, runtimeCount: 1, totalMinutes: 60, checkedAt: now - 1000, complete: true }
+    ] };
     const requested = [];
-    let expanded = false;
     await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
         const match = new URL(url).pathname.match(/\/season\/(\d+)$/);
-        if (!match) return tmdbResponse(tvDetails([[0, 70], [1, 10], [2, 10]]));
-        const season = Number(match[1]); requested.push(season);
-        return tmdbResponse(seasonEpisodes(season, season === 1 ? [40, 40] : expanded ? [40, 60] : [60]));
+        if (!match) return tmdbResponse(tvDetails([[1, 2], [2, 2]]));
+        requested.push(Number(match[1]));
+        return tmdbResponse(seasonEpisodes(2, [40, 60]));
     }, async fresh => {
-        const first = await fresh.getSeriesRuntimeMetadata("123", { episodes });
-        const previous = { ...first, version: 2, tmdbId: "123" };
-        requested.length = 0; expanded = true;
-        episodes = [...episodes, { id: "d", season: 2, episode: 2 }];
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes, previous, refresh: true });
+        const result = await fresh.getSeriesRuntimeMetadata("123", { previous, refresh: true });
         assert.deepStrictEqual(requested, [2]);
         assert.strictEqual(result.runtime, "45 min");
         assert.strictEqual(result.episodeCount, 4);
         assert.strictEqual(result.seasons[0].checkedAt, previous.seasons[0].checkedAt);
-        requested.length = 0;
-        const replaced = episodes.map(episode => episode.id === "b" ? { id: "replacement", season: 1, episode: 3 } : episode);
-        await fresh.getSeriesRuntimeMetadata("123", { episodes: replaced, previous: { ...result, version: 2, tmdbId: "123" }, refresh: true });
-        assert.deepStrictEqual(requested, [1], "same-count episode replacement must invalidate its season aggregate");
     }, true);
 }
 
 async function testTmdbUnknownEpisodeLengthsRetryAfterTwelveHours() {
-    const episodes = [{ id: "a", season: 1, episode: 1 }, { id: "b", season: 1, episode: 2 }];
-    let recovered = false;
+    const now = Date.now();
+    const previous = { policyVersion: 1, tmdbId: "123", seasons: [
+        { season: 1, episodeCount: 2, runtimeCount: 1, totalMinutes: 40, checkedAt: now - 13 * HOUR, complete: true }
+    ] };
     let seasonCalls = 0;
     await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
         if (!new URL(url).pathname.includes("/season/")) return tmdbResponse(tvDetails([[1, 2]]));
         seasonCalls++;
-        return tmdbResponse(seasonEpisodes(1, recovered ? [40, 50] : [40, null]));
+        return tmdbResponse(seasonEpisodes(1, [40, 50]));
     }, async fresh => {
-        const first = await fresh.getSeriesRuntimeMetadata("123", { episodes });
-        const previous = { ...first, version: 2, tmdbId: "123", seasons: first.seasons.map(season => ({ ...season, checkedAt: Date.now() - 13 * HOUR })) };
-        recovered = true;
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes, previous, refresh: true });
-        assert.strictEqual(seasonCalls, 2);
+        const result = await fresh.getSeriesRuntimeMetadata("123", { previous });
+        assert.strictEqual(seasonCalls, 1);
         assert.strictEqual(result.runtime, "45 min");
         assert.strictEqual(result.episodeCount, 2);
     }, true);
 }
 
 async function testTmdbPartialFailureRetainsPriorSeasonTotalsAndMarksIncomplete() {
-    const episodes = [{ id: "a", season: 1, episode: 1 }, { id: "b", season: 1, episode: 2 }, { id: "c", season: 2, episode: 1 }];
-    let fail = false;
+    const previous = { policyVersion: 1, tmdbId: "123", seasons: [
+        { season: 2, episodeCount: 1, runtimeCount: 1, totalMinutes: 60, checkedAt: Date.now() - 15 * DAY, complete: true }
+    ] };
     await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
         const match = new URL(url).pathname.match(/\/season\/(\d+)$/);
         if (!match) return tmdbResponse(tvDetails([[1, 2], [2, 1]]));
-        const season = Number(match[1]);
-        return season === 2 && fail ? tmdbResponse(null, 503) : tmdbResponse(seasonEpisodes(season, season === 1 ? [40, 50] : [60]));
+        return Number(match[1]) === 2 ? tmdbResponse(null, 503) : tmdbResponse(seasonEpisodes(1, [40, 50]));
     }, async fresh => {
-        const first = await fresh.getSeriesRuntimeMetadata("123", { episodes });
-        fail = true;
-        const previous = { ...first, version: 2, tmdbId: "123", seasons: first.seasons.map(season => ({ ...season, checkedAt: Date.now() - 15 * DAY })) };
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes, previous, refresh: true });
+        const result = await fresh.getSeriesRuntimeMetadata("123", { previous });
         assert.strictEqual(result.complete, false);
         assert.strictEqual(result.seasons.find(summary => summary.season === 2).totalMinutes, 60);
         assert.strictEqual(result.runtime, "50 min");
@@ -253,9 +224,9 @@ async function testTmdbPartialFailureRetainsPriorSeasonTotalsAndMarksIncomplete(
     await withFreshFetchModule("../src/js/tmdbMetadata", async url => tmdbResponse(
         new URL(url).pathname.includes("/season/") ? seasonEpisodes(1, [null, 0]) : tvDetails([[1, 2]])
     ), async fresh => {
-        const result = await fresh.getSeriesRuntimeMetadata("123", { episodes: episodes.slice(0, 2) });
+        const result = await fresh.getSeriesRuntimeMetadata("123");
         assert.strictEqual(result.episodeCount, 0);
-        assert.strictEqual(result.runtime, undefined);
+        assert.strictEqual(result.runtime, undefined, "unknown lengths must never fabricate a zero-minute average");
     }, true);
 }
 
@@ -277,15 +248,14 @@ async function testXtreamDurationsAndConcurrentDetailRequestsShareOneFetch() {
     }, async provider => {
         const addon = { config: { xtreamUrl: "https://example.com", xtreamUsername: "test", xtreamPassword: "test" }, lastUpdate: 1000 };
         const [details, id, summary] = await Promise.all([
-            provider.fetchSeriesInfo(addon, "3"), provider.fetchSeriesTmdbId(addon, "3"), provider.fetchSeriesRuntimeInfo(addon, "3")
+            provider.fetchSeriesInfo(addon, "3"), provider.fetchSeriesTmdbId(addon, "3"), provider.fetchSeriesRuntimeSummary(addon, "3")
         ]);
         assert.strictEqual(calls, 1);
         assert.strictEqual(id, "123");
         assert.strictEqual(details.videos.find(video => video.id === "iptv_series_ep_11").runtimeMinutes, 44.5);
-        const calculated = averageEpisodeRuntime(summary.episodes);
-        assert.strictEqual(calculated.runtime, "40 min");
-        assert.strictEqual(calculated.episodeCount, 3);
-        assert.strictEqual(calculated.totalMinutes, 120);
+        assert.strictEqual(summary.runtime, "45 min");
+        assert.strictEqual(summary.episodeCount, 2);
+        assert.strictEqual(summary.totalMinutes, 90);
         assert.strictEqual(summary.videos, undefined);
         assert.ok(!JSON.stringify(summary).includes("/series/"), "aggregate persistence must not need playable URLs");
     });
@@ -299,10 +269,10 @@ async function testXtreamMissingDurationsAndFailuresDoNotInventRuntime() {
     ]) {
         await withFreshFetchModule("../src/js/providers/xtreamProvider", async () => response, async provider => {
             const addon = { config: { xtreamUrl: "https://example.com", xtreamUsername: "test", xtreamPassword: "test" } };
-            const result = await provider.fetchSeriesRuntimeInfo(addon, "3");
+            const result = await provider.fetchSeriesRuntimeSummary(addon, "3");
             if (result) {
-                assert.strictEqual(averageEpisodeRuntime(result.episodes), null);
-                assert.strictEqual(result.episodes.length, 1, "unknown durations must retain the provider episode for TMDb matching");
+                assert.strictEqual(result.runtime, undefined);
+                assert.strictEqual(result.episodeCount, 0);
             } else assert.strictEqual(result, null);
         });
     }
@@ -384,8 +354,7 @@ async function testCatalogueFirstNextAndSearchPagesAwaitVisibleRuntimeAverages()
         updateData: proto.updateData,
         startConfiguredCatalogPrefetch: proto.startConfiguredCatalogPrefetch,
         startScheduledRefresh: proto.startScheduledRefresh,
-        runtime: tmdbMetadata.getSeriesRuntimeMetadata,
-        seriesLevel: tmdbMetadata.getSeriesLevelRuntime
+        runtime: tmdbMetadata.getSeriesRuntimeMetadata
     };
     const env = {
         CATALOG_PREFETCH_NEXT_PAGE: process.env.CATALOG_PREFETCH_NEXT_PAGE,
@@ -421,7 +390,6 @@ async function testCatalogueFirstNextAndSearchPagesAwaitVisibleRuntimeAverages()
         instance = this;
         this.log = quietLog;
         this.series = series;
-        for (const item of series) this.directSeriesEpisodeIndex.set(item.series_id, defaultProviderVideos());
         this.channels = [];
         this.movies = [];
         this.epgData = {};
@@ -436,7 +404,6 @@ async function testCatalogueFirstNextAndSearchPagesAwaitVisibleRuntimeAverages()
     proto.startScheduledRefresh = () => {};
     process.env.CATALOG_PREFETCH_NEXT_PAGE = "false";
     process.env.CATALOG_PAGE_SIZE = "50";
-    tmdbMetadata.getSeriesLevelRuntime = async () => null;
     tmdbMetadata.getSeriesRuntimeMetadata = async tmdbId => {
         calls.push(String(tmdbId));
         if (String(tmdbId) === activeGate?.tmdbId) {
@@ -502,7 +469,6 @@ async function testCatalogueFirstNextAndSearchPagesAwaitVisibleRuntimeAverages()
             startScheduledRefresh: originals.startScheduledRefresh
         });
         tmdbMetadata.getSeriesRuntimeMetadata = originals.runtime;
-        tmdbMetadata.getSeriesLevelRuntime = originals.seriesLevel;
         for (const [key, value] of Object.entries(env)) {
             if (value === undefined) delete process.env[key];
             else process.env[key] = value;
@@ -587,7 +553,7 @@ async function testForegroundCardsAwaitDueFieldsAndJoinMetadataRefresh() {
 async function testRuntimeSummaryLogsExplainSavedAndUnavailableAverages() {
     const now = Date.now();
     const average = (runtime, source, extra = {}) => ({
-        version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime, source, episodeCount: 9, totalMinutes: parseRuntimeMinutes(runtime) * 9,
+        version: 1, policyVersion: 1, runtime, source, episodeCount: 9, totalMinutes: parseRuntimeMinutes(runtime) * 9,
         checkedAt: now, attemptedAt: now, tmdbId: "123", complete: true, seasons: [], ...extra
     });
     const previews = [
@@ -598,7 +564,7 @@ async function testRuntimeSummaryLogsExplainSavedAndUnavailableAverages() {
             checkedAt: now - 13 * HOUR
         }) }),
         seriesPreview({ id: "iptv_series_5", runtimeAverage: {
-            version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), checkedAt: 0, attemptedAt: now, complete: false, tmdbId: "123"
+            version: 1, policyVersion: 1, checkedAt: 0, attemptedAt: now, complete: false, tmdbId: "123"
         } })
     ];
     const items = previews.map((preview, index) => ({
@@ -606,9 +572,8 @@ async function testRuntimeSummaryLogsExplainSavedAndUnavailableAverages() {
     }));
     const store = metadataStore(previews);
     const expected = {
-        seriesLevel: 1, tmdbEpisodeAverage: 2, providerEpisodeAverage: 1, mixedEpisodeAverage: 0, legacyScope: 0, missing: 1,
-        retainedAfterFailedRefresh: 1, retryDue: 0, missingRetryDeferred: 1,
-        lookupFailureReasons: { not_recorded: 2 }
+        seriesLevel: 1, tmdbEpisodeAverage: 2, providerEpisodeAverage: 1, missing: 1,
+        retainedAfterFailedRefresh: 1, retryDue: 0, missingRetryDeferred: 1
     };
     const build = logs => {
         const addon = runtimeAddon().addon;
@@ -662,8 +627,8 @@ async function testFailedRuntimeCalculationRetainsAverageAndBacksOff() {
     try {
         for (const hadAverage of [false, true]) {
             const old = seriesPreview(hadAverage ? {
-                runtime: "49 min", runtimeAverage: { version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "49 min", source: "tmdb-episodes",
-                    episodeCount: 9, totalMinutes: 441, checkedAt: now - 13 * HOUR, attemptedAt: now - 13 * HOUR, tmdbId: "123", complete: true, seasons: [] }
+                runtime: "49 min", runtimeAverage: { version: 1, policyVersion: 1, runtime: "49 min", source: "tmdb-episodes",
+                    episodeCount: 9, totalMinutes: 441, checkedAt: now - 15 * DAY, attemptedAt: now - 15 * DAY, tmdbId: "123", complete: true, seasons: [] }
             } : {});
             const { addon, item } = runtimeAddon(old);
             await withTmdbRuntimeResult(null, async calls => {
@@ -734,8 +699,8 @@ async function testNewEpisodesRefreshAverageAndOfficialRuntimeSupersedesIt() {
     Date.now = () => now;
     try {
         const old = seriesPreview({ runtime: "49 min", runtimeAverage: {
-            version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
-            checkedAt: now - 13 * HOUR, attemptedAt: now - 13 * HOUR, tmdbId: "123", complete: true, seasons: []
+            version: 1, policyVersion: 1, runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
+            checkedAt: now - 15 * DAY, attemptedAt: now - 15 * DAY, tmdbId: "123", complete: true, seasons: []
         } });
         const { addon, item, store } = runtimeAddon(old);
         let response = { runtime: "50 min", source: "tmdb-episodes", episodeCount: 10, totalMinutes: 500, complete: true, seasons: [] };
@@ -743,7 +708,7 @@ async function testNewEpisodesRefreshAverageAndOfficialRuntimeSupersedesIt() {
             const updated = await addon.ensureSeriesRuntimeAverage(item, old);
             assert.strictEqual(updated.runtime, "50 min");
             assert.strictEqual(store.entries.get(item.id).value.runtimeAverage.episodeCount, 10);
-            now += 13 * HOUR;
+            now += 15 * DAY;
             response = { runtime: "52 min", source: "tmdb-series", episodeCount: 0, totalMinutes: 0, complete: true, seasons: [] };
             const official = await addon.ensureSeriesRuntimeAverage(item, updated);
             assert.strictEqual(official.runtime, "52 min");
@@ -756,8 +721,8 @@ async function testNewEpisodesRefreshAverageAndOfficialRuntimeSupersedesIt() {
 
 async function testPartialSeasonFailureCannotReplaceSavedCompleteAverage() {
     const old = seriesPreview({ runtime: "49 min", runtimeAverage: {
-        version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
-        checkedAt: Date.now() - 13 * HOUR, attemptedAt: Date.now() - 13 * HOUR,
+        version: 1, policyVersion: 1, runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
+        checkedAt: Date.now() - 15 * DAY, attemptedAt: Date.now() - 15 * DAY,
         tmdbId: "123", complete: true, seasons: []
     } });
     const { addon, item, store } = runtimeAddon(old);
@@ -787,25 +752,24 @@ async function testDirectPlaylistEpisodeDurationsCanProduceAnAverage() {
     });
 }
 
-async function testPartialDetailLookupKeepsSavedAverageForSameProviderPopulation() {
+async function testPartialDetailEpisodeListKeepsSavedWholeSeriesAverage() {
     const old = seriesPreview({ runtime: "49 min", runtimeAverage: {
-        version: 2, scope: "provider-episodes", episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()),
-        runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
-        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123", complete: true, attemptProviderLastUpdate: 1000
+        version: 1, policyVersion: 1, runtime: "49 min", source: "tmdb-episodes", episodeCount: 9, totalMinutes: 441,
+        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123", complete: true,
+        seasons: [{ season: 1, episodeCount: 9, runtimeCount: 9, totalMinutes: 441, checkedAt: Date.now(), complete: true }]
     } });
     const { addon, item } = runtimeAddon(old);
-    addon.catalogMetaCache.set(item.id, old);
-    const partial = [[1, [{ season: 1, episode: 1, runtime: "100 min" }]]];
-    const result = await addon.getSeriesDetailRuntime(item, {}, null,
-        { videos: defaultProviderVideos() }, partial, addon.lastUpdate);
+    const result = await addon.getSeriesDetailRuntime(item,
+        { runtimeSeasons: [{ season: 1, episodeCount: 9 }, { season: 2, episodeCount: 2 }] },
+        null, { videos: [] }, [[1, [{ season: 1, episode: 1, runtime: "100 min" }]]], addon.lastUpdate);
     assert.strictEqual(result.runtime, "49 min",
-        "a partial TMDb lookup cannot replace a saved average for the same provider episode set");
+        "a partial set of episodes used on a detail page must not replace the saved complete-series average");
     assert.strictEqual(result.runtimeAverage.episodeCount, 9);
-    const changed = await addon.getSeriesDetailRuntime(item, {}, null,
-        { videos: defaultProviderVideos().slice(0, 1) }, partial, addon.lastUpdate);
-    assert.strictEqual(changed.runtime, "100 min",
-        "after the provider removes episodes, a complete calculation for its smaller set must replace the old total");
-    assert.strictEqual(changed.runtimeAverage.episodeCount, 1);
+    const truncated = await addon.getSeriesDetailRuntime(item,
+        { runtimeSeasons: [{ season: 1, episodeCount: 9 }] }, null, { videos: [] },
+        [[1, [{ season: 1, episode: 1, runtime: "100 min" }]]], addon.lastUpdate);
+    assert.strictEqual(truncated.runtime, "49 min",
+        "a returned season with too few episodes must not be mistaken for complete series coverage");
 }
 
 async function testIdleScheduledChecksStartMetadataWarmupAndRespectDisableSetting() {
@@ -850,8 +814,8 @@ async function testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
     try {
         for (const priorSource of ["provider-episodes", "tmdb-episodes", "official"]) {
             const old = seriesPreview({ runtime: "45 min", ...(priorSource === "official" ? {} : { runtimeAverage: {
-                version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "45 min", source: priorSource, episodeCount: 1, totalMinutes: 45,
-                checkedAt: Date.now() - 13 * HOUR, attemptedAt: Date.now() - 13 * HOUR,
+                version: 1, policyVersion: 1, runtime: "45 min", source: priorSource, episodeCount: 1, totalMinutes: 45,
+                checkedAt: Date.now() - 15 * DAY, attemptedAt: Date.now() - 15 * DAY,
                 tmdbId: "123", complete: true, seasons: []
             } }) });
             const { addon, item, store } = runtimeAddon(old);
@@ -861,7 +825,7 @@ async function testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
             const detail = await addon.buildSeriesMeta(item);
             await settleWrites(addon);
             const persisted = store.entries.get(item.id).value;
-            const expected = priorSource === "official" ? "45 min" : "60 min";
+            const expected = priorSource === "provider-episodes" ? "60 min" : "45 min";
             assert.strictEqual(detail.runtime, expected);
             assert.strictEqual(persisted.runtime, expected,
                 priorSource + " runtime must agree between full details and its saved catalogue card");
@@ -870,7 +834,7 @@ async function testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
             } else {
                 assert.strictEqual(persisted.runtimeAverage.runtime, persisted.runtime,
                     "the average value and its source/count marker must be saved atomically");
-                assert.strictEqual(persisted.runtimeAverage.source, "provider-episodes");
+                assert.strictEqual(persisted.runtimeAverage.source, priorSource);
             }
         }
         // Model an in-flight fallback built before another request installed the
@@ -878,13 +842,13 @@ async function testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
         // different provenance and must not downgrade that installed record.
         for (const priorSource of ["official", "tmdb-episodes"]) {
             const old = seriesPreview({ runtime: "45 min", ...(priorSource === "official" ? {} : { runtimeAverage: {
-                version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "45 min", source: "tmdb-episodes", episodeCount: 1, totalMinutes: 45,
+                version: 1, policyVersion: 1, runtime: "45 min", source: "tmdb-episodes", episodeCount: 1, totalMinutes: 45,
                 checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123", complete: true, seasons: []
             } }) });
             const { addon, item, store } = runtimeAddon(old);
             await addon.persistDetailedCatalogPreview(item.id, "series", null, {
                 name: item.name, runtime: "45 min", runtimeAverage: {
-                    version: 2, scope: "provider-episodes", attemptProviderLastUpdate: 1000, episodeFingerprint: providerEpisodeFingerprint(defaultProviderVideos()), runtime: "45 min", source: "provider-episodes", episodeCount: 1,
+                    version: 1, policyVersion: 1, runtime: "45 min", source: "provider-episodes", episodeCount: 1,
                     totalMinutes: 45, checkedAt: Date.now(), attemptedAt: Date.now(), complete: true
                 }
             }, { providerFallback: true });
@@ -905,380 +869,293 @@ async function testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
     }
 }
 
-async function testHouseOfTheDragonMigratesLegacyAverageAndMatchesCardsAndDetails() {
-    const durations = [
-        [66, 54, 63, 62, 60, 67, 59, 67, 58, 59],
-        [58, 69, 66, 55, 63, 67, 64, 69],
-        [66, 64, 57, 62, 64, 63, 64, 71]
-    ];
-    const episodes = durations.flatMap((rows, index) => rows.map((runtime, number) => ({
-        id: "hotd-" + (index + 1) + "-" + (number + 1), season: index + 1, episode: number + 1
-    })));
-    const old = seriesPreview({ runtime: "22 min", runtimeAverage: {
-        version: 1, runtime: "22 min", source: "tmdb-episodes", complete: true,
-        episodeCount: 99, totalMinutes: 2178, checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123"
-    } });
-    const { addon, item, store } = runtimeAddon(old);
-    addon.directSeriesEpisodeIndex.set("3", episodes);
-    const original = tmdbMetadata.getSeriesRuntimeMetadata;
-    const originalLevel = tmdbMetadata.getSeriesLevelRuntime;
-    const requested = [];
-    await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
-        const match = new URL(url).pathname.match(/\/season\/(\d+)$/);
-        if (!match) return tmdbResponse(tvDetails([[0, 73], [1, 10], [2, 8], [3, 8], [4, 10]]));
-        const season = Number(match[1]);
-        requested.push(season);
-        assert.ok(season >= 1 && season <= 3, "only provider-supplied seasons may be fetched");
-        const response = seasonEpisodes(season, durations[season - 1]);
-        response.episodes.push({ id: "not-supplied", season_number: season, episode_number: 99, runtime: 1 });
-        return tmdbResponse(response);
-    }, async fresh => {
-        tmdbMetadata.getSeriesRuntimeMetadata = fresh.getSeriesRuntimeMetadata;
-        tmdbMetadata.getSeriesLevelRuntime = fresh.getSeriesLevelRuntime;
-        try {
-            const previews = await addon.enrichCatalogMetaItems([item], 1);
-            const preview = previews.get(item.id);
-            assert.strictEqual(preview.runtime, "63 min", "the attached 26 episode lengths total 1,637 minutes and round to 63");
-            assert.strictEqual(preview.runtimeAverage.version, 2, "a fresh but wrongly scoped legacy aggregate must migrate immediately");
-            assert.strictEqual(preview.runtimeAverage.providerEpisodeCount, 26);
-            assert.strictEqual(preview.runtimeAverage.episodeCount, 26);
-            assert.strictEqual(preview.runtimeAverage.totalMinutes, 1637);
-            assert.deepStrictEqual(requested.sort(), [1, 2, 3]);
-            const seasonResults = durations.map((rows, index) => [index + 1,
-                [...rows.map((runtime, number) => ({ season: index + 1, episode: number + 1, runtime: runtime + " min" })),
-                    { season: index + 1, episode: 99, runtime: "1 min" }]]);
-            const detail = await addon.getSeriesDetailRuntime(item, {}, null, { videos: episodes }, seasonResults, addon.lastUpdate);
-            assert.strictEqual(detail.runtime, preview.runtime);
-            assert.strictEqual(detail.runtimeAverage.episodeFingerprint, preview.runtimeAverage.episodeFingerprint);
-            assert.strictEqual(detail.runtimeAverage.totalMinutes, 1637);
-            const saved = store.entries.get(item.id).value;
-            assert.strictEqual(saved.runtime, "63 min");
-            for (const field of ["description", "year", "poster", "imdbRating"]) assert.deepStrictEqual(saved[field], old[field]);
-            const calls = requested.length;
-            await addon.enrichCatalogMetaItems([item], 1);
-            assert.strictEqual(requested.length, calls, "a migrated persisted average must be reused on the next card request");
-        } finally { tmdbMetadata.getSeriesRuntimeMetadata = original; tmdbMetadata.getSeriesLevelRuntime = originalLevel; }
-    }, true);
+function testRuntimePolicyFiltersSpecialsAndKnownFutureDates() {
+    const now = Date.now();
+    const average = averageEpisodeRuntime([
+        { season: 0, episode: 1, runtime: 1 },
+        { season: 1, episode: 1, runtime: 40, released: '2000-01-01' },
+        { season: 1, episode: 2, runtime: 60 },
+        { season: 1, episode: 3, runtime: 100, released: '2999-01-01' },
+        { season: 1, episode: 4, runtime: 50, released: 'unknown' },
+        { season: 1, episode: 5, runtime: 100, released: String(Math.floor((now + DAY) / 1000)) },
+        { season: 1, episode: 1, runtime: 500 },
+        { runtime: 500 }
+    ]);
+    assert.deepStrictEqual(average, { runtime: '50 min', episodeCount: 3, totalMinutes: 150 });
 }
 
-async function testProviderPopulationMixesMatchedAndFallbackDurationsPerEpisode() {
-    const episodes = [
-        { id: "1", season: 1, episode: 1, runtime: "1 min" },
-        { id: "2", season: 1, episode: 2, runtimeMinutes: 54 },
-        { id: "3", season: 1, episode: 3, runtime: "63 min" },
-        { id: "4", season: 2, episode: 1 },
-        { id: "5", season: 0, episode: 1, runtime: "5 min" },
-        { id: "6", season: 1, episode: 4, runtime: "N/A" },
-        { id: "duplicate", season: 1, episode: 1, runtime: "999 min" }
-    ];
-    const seasons = [
-        [0, [{ season: 0, episode: 1, runtime: "7 min" }, { season: 0, episode: 2, runtime: "1 min" }]],
-        [1, [{ season: 1, episode: 1, runtime: "66 min" }, { season: 1, episode: 2 },
-            { season: 1, episode: 4, runtime: "0 min" }, { season: 1, episode: 99, runtime: "1 min" }]],
-        [2, [{ season: 2, episode: 1, runtime: "64 min" }]]
-    ];
-    const result = averageProviderEpisodes(episodes, seasons);
-    assert.strictEqual(result.runtime, "51 min");
-    assert.strictEqual(result.totalMinutes, 254);
-    assert.strictEqual(result.episodeCount, 5);
-    assert.strictEqual(result.providerEpisodeCount, 6);
-    assert.strictEqual(result.tmdbEpisodeCount, 3);
-    assert.strictEqual(result.providerDurationCount, 2);
-    assert.strictEqual(result.missingDurationCount, 1);
-    assert.strictEqual(result.source, "mixed-episodes");
-    assert.strictEqual(providerEpisodeFingerprint(episodes), providerEpisodeFingerprint([...episodes].reverse().filter(row => row.id !== "duplicate")),
-        "ordering and redundant identical episode entries must not alter the population");
-    const noTmdb = await tmdbMetadata.getSeriesRuntimeMetadata(null, { episodes });
-    assert.strictEqual(noTmdb.source, "provider-episodes");
-    assert.strictEqual(noTmdb.episodeCount, 4);
-    assert.strictEqual(noTmdb.runtime, "31 min");
+async function testTmdbRuntimePolicyExcludesFutureEpisodesWithoutMarkingThemMissing() {
     const requested = [];
-    await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
+    await withFreshFetchModule('../src/js/tmdbMetadata', async url => {
         const match = new URL(url).pathname.match(/\/season\/(\d+)$/);
-        if (!match) return tmdbResponse(tvDetails([[0, 70], [1, 20], [2, 20], [3, 20]]));
+        if (!match) return tmdbResponse(tvDetails([[0, 40], [1, 3], [2, 1]]));
         const season = Number(match[1]); requested.push(season);
-        const rows = seasons.find(([number]) => number === season)[1];
-        return tmdbResponse({ episodes: rows.map(row => ({ season_number: season, episode_number: row.episode,
-            runtime: parseRuntimeMinutes(row.runtime) })) });
+        const data = seasonEpisodes(season, season === 1 ? [40, 100, 60] : [80]);
+        if (season === 1) data.episodes[1].air_date = '2999-01-01';
+        return tmdbResponse(data);
     }, async fresh => {
-        const fetched = await fresh.getSeriesRuntimeMetadata("123", { episodes });
-        assert.strictEqual(fetched.runtime, result.runtime);
-        assert.strictEqual(fetched.totalMinutes, 254);
-        assert.strictEqual(fetched.source, "mixed-episodes");
-        assert.strictEqual(fetched.tmdbEpisodeCount, 3);
-        assert.strictEqual(fetched.providerDurationCount, 2);
-        assert.strictEqual(fetched.complete, true);
-        assert.deepStrictEqual(requested.sort(), [0, 1, 2], "specials are included only when the provider actually supplies them");
+        const value = await fresh.getSeriesRuntimeMetadata('123');
+        assert.deepStrictEqual(requested.sort(), [1, 2]);
+        assert.strictEqual(value.runtime, '60 min');
+        assert.strictEqual(value.episodeCount, 3);
+        assert.strictEqual(value.totalMinutes, 180);
+        assert.strictEqual(value.seasons[0].episodeCount, 3);
+        assert.strictEqual(value.seasons[0].eligibleEpisodeCount, 2);
+        assert.strictEqual(value.seasons[0].runtimeCount, 2);
     }, true);
 }
 
-async function testFreshAverageRechecksMembershipAfterProviderGenerationChanges() {
-    const originalNow = Date.now;
-    let now = originalNow(); Date.now = () => now;
+async function testSuccessfulRuntimeChecksNewEpisodesAtFourteenDaysNotTwelveHours() {
+    const originalNow = Date.now; const initial = originalNow(); let now = initial;
+    Date.now = () => now;
+    let lengths = [40, 60]; let seasonCalls = 0;
     try {
-        const { addon, item, store } = runtimeAddon();
-        addon.lastUpdate = now;
-        const rows = Array.from({ length: 10 }, (_, index) => ({ season: 1, episode: index + 1, runtime: index === 9 ? "90 min" : "49 min" }));
-        await withTmdbRuntimeResult((_id, options) => ({ ...averageProviderEpisodes(options.episodes, [[1, rows]]), complete: true, seasons: [] }), async calls => {
-            addon.startContinuousCatalogPrefetch("series", 10, 1);
-            await addon.catalogPrefetchJobs.get("series");
-            assert.strictEqual(store.entries.get(item.id).value.runtime, "49 min");
-            const firstFingerprint = store.entries.get(item.id).value.runtimeAverage.episodeFingerprint;
-            await new Promise(setImmediate); // Allow the completed job's cleanup to settle before the next refresh.
-            now += 60000; addon.lastUpdate = now;
-            addon.seriesInfoCache.clear();
-            addon.directSeriesEpisodeIndex.set("3", [...defaultProviderVideos().slice(1), { id: "ep-1-10", season: 1, episode: 10 }]);
-            addon.startContinuousCatalogPrefetch("series", 10, 1);
-            await addon.catalogPrefetchJobs.get("series");
-            const updated = store.entries.get(item.id).value;
-            assert.strictEqual(updated.runtime, "54 min", "remove the unavailable episode and average the replacement episode");
-            assert.strictEqual(updated.runtimeAverage.episodeCount, 9);
-            assert.notStrictEqual(updated.runtimeAverage.episodeFingerprint, firstFingerprint);
-            assert.strictEqual(calls(), 2, "a recent scan marker must not suppress a new provider generation");
-        });
+        await withFreshFetchModule('../src/js/tmdbMetadata', async url => {
+            if (!new URL(url).pathname.includes('/season/')) return tmdbResponse(tvDetails([[1, lengths.length]]));
+            seasonCalls++;
+            return tmdbResponse(seasonEpisodes(1, lengths));
+        }, async fresh => {
+            await withTmdbRuntimeResult((id, options) => fresh.getSeriesRuntimeMetadata(id, options), async calls => {
+                const { addon, item, store } = runtimeAddon();
+                addon.ensureSeriesInfo = async () => { throw new Error('a successful TMDb average must not fetch provider episodes'); };
+                const first = await addon.ensureSeriesRuntimeAverage(item, seriesPreview());
+                assert.strictEqual(first.runtime, '50 min');
+                lengths = [40, 60, 80];
+                now = initial + 12 * HOUR + 1; addon.lastUpdate = 2000;
+                await addon.ensureSeriesRuntimeAverage(item, first);
+                now = initial + 14 * DAY - 1;
+                await addon.ensureSeriesRuntimeAverage(item, first);
+                assert.strictEqual(calls(), 1, 'a provider catalogue refresh must not force a fresh successful average');
+                now = initial + 14 * DAY + 1;
+                const updated = await addon.ensureSeriesRuntimeAverage(item, first);
+                assert.strictEqual(updated.runtime, '60 min');
+                assert.strictEqual(updated.runtimeAverage.episodeCount, 3);
+                assert.strictEqual(calls(), 2);
+                assert.strictEqual(seasonCalls, 2, 'the full refresh must include newly listed episodes');
+                const restarted = runtimeAddon(store.entries.get(item.id).value);
+                await restarted.addon.ensureSeriesRuntimeAverage(restarted.item, updated);
+                assert.strictEqual(calls(), 2, 'the longer successful interval must survive a restart');
+            });
+        }, true);
     } finally { Date.now = originalNow; }
 }
 
-async function testLegacyAverageMigrationFailureBacksOffWithoutDroppingMetadata() {
-    const old = seriesPreview({ runtime: "22 min", runtimeAverage: {
-        version: 1, runtime: "22 min", source: "tmdb-episodes", complete: true,
-        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123", scopeMigrationAttemptedAt: Date.now(), attemptProviderLastUpdate: 1000
+async function testMissingEpisodeDurationsStillRetryAfterTwelveHours() {
+    const originalNow = Date.now; const initial = originalNow(); let now = initial;
+    Date.now = () => now; let lengths = [40, null];
+    try {
+        await withFreshFetchModule('../src/js/tmdbMetadata', async url => tmdbResponse(
+            new URL(url).pathname.includes('/season/') ? seasonEpisodes(1, lengths) : tvDetails([[1, 2]])
+        ), async fresh => {
+            await withTmdbRuntimeResult((id, options) => fresh.getSeriesRuntimeMetadata(id, options), async calls => {
+                const { addon, item } = runtimeAddon();
+                const partial = await addon.ensureSeriesRuntimeAverage(item, seriesPreview());
+                assert.strictEqual(partial.runtime, '40 min');
+                now = initial + 12 * HOUR - 1;
+                await addon.ensureSeriesRuntimeAverage(item, partial);
+                assert.strictEqual(calls(), 1);
+                lengths = [40, 60]; now = initial + 12 * HOUR + 1;
+                const complete = await addon.ensureSeriesRuntimeAverage(item, partial);
+                assert.strictEqual(complete.runtime, '50 min');
+                assert.strictEqual(calls(), 2);
+                now += 12 * HOUR + 1;
+                await addon.ensureSeriesRuntimeAverage(item, complete);
+                assert.strictEqual(calls(), 2, 'once durations are complete, the successful fourteen-day policy applies');
+            });
+        }, true);
+    } finally { Date.now = originalNow; }
+}
+
+async function testFutureEpisodeBecomesEligibleOnFullRefreshWithUnchangedCount() {
+    const originalNow = Date.now; const initial = originalNow(); let now = initial;
+    Date.now = () => now;
+    try {
+        await withFreshFetchModule('../src/js/tmdbMetadata', async url => {
+            if (!new URL(url).pathname.includes('/season/')) return tmdbResponse(tvDetails([[1, 2]]));
+            const data = seasonEpisodes(1, [40, 80]);
+            data.episodes[1].air_date = new Date(initial + DAY).toISOString().slice(0, 10);
+            return tmdbResponse(data);
+        }, async fresh => {
+            await withTmdbRuntimeResult((id, options) => fresh.getSeriesRuntimeMetadata(id, options), async calls => {
+                const { addon, item } = runtimeAddon();
+                const first = await addon.ensureSeriesRuntimeAverage(item, seriesPreview());
+                assert.strictEqual(first.runtime, '40 min');
+                now = initial + 12 * HOUR + 1;
+                await addon.ensureSeriesRuntimeAverage(item, first);
+                assert.strictEqual(calls(), 1, 'excluded future episodes must not be treated as missing duration data');
+                now = initial + 14 * DAY + 1;
+                const aired = await addon.ensureSeriesRuntimeAverage(item, first);
+                assert.strictEqual(aired.runtime, '60 min');
+                assert.strictEqual(aired.runtimeAverage.episodeCount, 2);
+            });
+        }, true);
+    } finally { Date.now = originalNow; }
+}
+
+async function testOldPersistedAverageFormatsRecalculateWithNewFiltersWithoutClearingMetadata() {
+    for (const version of [1, 2]) {
+        const old = seriesPreview({ runtime: '22 min', runtimeAverage: {
+            version, runtime: '22 min', source: 'tmdb-episodes', complete: true,
+            checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: '123'
+        } });
+        const { addon, item, store } = runtimeAddon(old);
+        await withTmdbRuntimeResult({ runtime: '63 min', source: 'tmdb-episodes', complete: true, episodeCount: 18,
+            totalMinutes: 1134, seasons: [] }, async calls => {
+            const value = await addon.ensureSeriesRuntimeAverage(item, old);
+            assert.strictEqual(calls(), 1);
+            assert.strictEqual(value.runtime, '63 min');
+            assert.strictEqual(value.runtimeAverage.policyVersion, 1);
+            assert.strictEqual(store.entries.get(item.id).value.description, old.description);
+            assert.strictEqual(value.imdbRating, old.imdbRating);
+        });
+    }
+}
+
+async function testFailedRuntimePolicyMigrationRetainsAverageAndRetriesAfterTwelveHours() {
+    const originalNow = Date.now; let now = originalNow(); Date.now = () => now;
+    const old = seriesPreview({ runtime: '22 min', runtimeAverage: {
+        version: 2, runtime: '22 min', source: 'tmdb-episodes', complete: true,
+        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: '123'
     } });
     const { addon, item } = runtimeAddon(old);
-    await withTmdbRuntimeResult(null, async calls => {
+    try { await withTmdbRuntimeResult(null, async calls => {
         const first = await addon.ensureSeriesRuntimeAverage(item, old);
-        assert.strictEqual(calls(), 1, "migration must run even when the old aggregate was recently saved");
-        assert.strictEqual(first.runtime, "22 min", "an unavailable lookup keeps the prior value until it can be recalculated");
-        assert.strictEqual(first.description, old.description);
-        assert.ok(first.runtimeAverage.scopeMigrationAttemptedAt);
-        assert.strictEqual(first.runtimeAverage.lookupRevision, 1, "older failed attempts must get one immediate retry after the lookup correction");
-        assert.strictEqual(first.runtimeAverage.version, 1, "a failed migration must not falsely claim the old total uses the new population");
-        await addon.ensureSeriesRuntimeAverage(item, first);
+        const second = await addon.ensureSeriesRuntimeAverage(item, first);
+        assert.strictEqual(first.runtime, '22 min');
+        assert.strictEqual(second.description, old.description);
         assert.strictEqual(calls(), 1);
-    });
-}
-
-async function testSeriesLevelRuntimeIsUsedWithoutRequestingProviderEpisodes() {
-    const old = seriesPreview({ runtime: "22 min", runtimeAverage: {
-        version: 1, runtime: "22 min", source: "tmdb-episodes", complete: true,
-        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123"
-    } });
-    const { addon, item, store } = runtimeAddon(old);
-    const originalLevel = tmdbMetadata.getSeriesLevelRuntime;
-    const originalAverage = tmdbMetadata.getSeriesRuntimeMetadata;
-    let levelRequests = 0;
-    let providerRequests = 0;
-    tmdbMetadata.getSeriesLevelRuntime = async id => {
-        levelRequests++; assert.strictEqual(id, "123");
-        return { runtime: "60 min", source: "tmdb-series", complete: true };
-    };
-    tmdbMetadata.getSeriesRuntimeMetadata = async () => { throw new Error("no episode average is necessary"); };
-    addon.ensureSeriesInfo = async () => { providerRequests++; throw new Error("provider is unavailable"); };
-    try {
-        const result = await addon.ensureSeriesRuntimeAverage(item, old);
-        assert.strictEqual(result.runtime, "60 min");
-        assert.strictEqual(result.runtimeAverage, null);
-        assert.strictEqual(levelRequests, 1);
-        assert.strictEqual(providerRequests, 0, "a usable series runtime must not depend on the episode endpoint");
-        assert.strictEqual(store.entries.get(item.id).value.runtime, "60 min");
-        for (const field of ["description", "poster", "year", "cast", "imdbRating"]) assert.deepStrictEqual(result[field], old[field]);
-    } finally {
-        tmdbMetadata.getSeriesLevelRuntime = originalLevel;
-        tmdbMetadata.getSeriesRuntimeMetadata = originalAverage;
-    }
-}
-
-async function testRuntimeProviderParserSupportsSeasonArraysAndPreservesFailures() {
-    const config = { xtreamUrl: "https://example.com", xtreamUsername: "test", xtreamPassword: "test" };
-    const rows = [
-        [{ id: 1, season: 0, episode_num: 1, info: { duration_secs: 300 } }],
-        [{ id: 2, season: 1, episode_num: 1, info: { duration_secs: 3600 } }]
-    ];
-    for (const episodes of [rows, { "0": rows[0], "1": rows[1] }, [null, rows[1]], { "0": null, "1": rows[1] }]) {
-        let requests = 0;
-        await withFreshFetchModule("../src/js/providers/xtreamProvider", async () => {
-            requests++; await new Promise(setImmediate);
-            return { ok: true, status: 200, json: async () => ({ episodes, info: { tmdb: 123 } }) };
-        }, async provider => {
-            const diagnostic = {};
-            const addon = { config, lastUpdate: 1000 };
-            const [runtime, details] = await Promise.all([
-                provider.fetchSeriesRuntimeInfo(addon, "3", diagnostic), provider.fetchSeriesInfo(addon, "3")
-            ]);
-            assert.strictEqual(requests, 1);
-            const count = Object.values(episodes).flatMap(group => Array.isArray(group) ? group : []).length;
-            assert.strictEqual(runtime.episodes.length, count);
-            assert.deepStrictEqual(runtime.episodes.map(episode => episode.id), details.videos.map(episode => episode.id));
-            assert.strictEqual(averageEpisodeRuntime(runtime.episodes).runtime, count === 2 ? "33 min" : "60 min");
-            assert.strictEqual(diagnostic.reason, "provider_episodes_loaded");
-        });
-    }
-    const cases = [
-        [{ ok: false, status: 429 }, "provider_http_error", 429],
-        [{ ok: true, json: async () => { throw new SyntaxError("secret-do-not-log https://example.com/password"); } }, "provider_invalid_json"],
-        [{ ok: true, json: async () => ({}) }, "provider_episodes_missing"],
-        [{ ok: true, json: async () => ({ episodes: "invalid" }) }, "provider_episodes_invalid"],
-        [{ ok: true, json: async () => ({ episodes: { "1": {} } }) }, "provider_season_episodes_invalid"],
-        [{ ok: true, json: async () => ({ episodes: { "1": [null] } }) }, "provider_episode_invalid"],
-        [{ ok: true, json: async () => ({ episodes: { "1": [{}] } }) }, "provider_episode_id_missing"]
-    ];
-    for (const [response, reason, httpStatus] of cases) {
-        await withFreshFetchModule("../src/js/providers/xtreamProvider", async () => response, async provider => {
-            const diagnostic = {};
-            assert.strictEqual(await provider.fetchSeriesRuntimeInfo({ config }, "3", diagnostic), null);
-            assert.strictEqual(diagnostic.reason, reason);
-            if (httpStatus) assert.strictEqual(diagnostic.httpStatus, httpStatus);
-            assert.ok(!JSON.stringify(diagnostic).includes("secret-do-not-log"));
-        });
-    }
-}
-
-async function testRuntimeFailuresPersistSpecificReasonsAndRespectBackoff() {
-    const old = seriesPreview({ runtime: "22 min", runtimeAverage: {
-        version: 1, runtime: "22 min", source: "tmdb-episodes", complete: true,
-        checkedAt: Date.now(), attemptedAt: Date.now(), tmdbId: "123"
-    } });
-    const { addon, item, store } = runtimeAddon(old);
-    addon.providerName = "xtream";
-    addon.config = { ...addon.config, provider: "xtream", xtreamUrl: "https://example.com", xtreamUsername: "test", xtreamPassword: "test" };
-    const provider = require("../src/js/providers/xtreamProvider");
-    const originalProvider = provider.fetchSeriesRuntimeInfo;
-    const originalLevel = tmdbMetadata.getSeriesLevelRuntime;
-    const originalAverage = tmdbMetadata.getSeriesRuntimeMetadata;
-    const originalNow = Date.now;
-    let now = originalNow(); Date.now = () => now;
-    let requests = 0;
-    tmdbMetadata.getSeriesLevelRuntime = async () => null;
-    provider.fetchSeriesRuntimeInfo = async (_addon, _id, diagnostic) => {
-        requests++; Object.assign(diagnostic, { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 }); return null;
-    };
-    tmdbMetadata.getSeriesRuntimeMetadata = async () => { throw new Error("episode metadata must not run after provider failure"); };
-    try {
-        const failed = await addon.ensureSeriesRuntimeAverage(item, old);
-        assert.deepStrictEqual(failed.runtimeAverage.lastFailure, { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 });
-        assert.strictEqual(failed.runtime, "22 min");
-        assert.strictEqual(store.entries.get(item.id).value.description, old.description);
-        await addon.ensureSeriesRuntimeAverage(item, failed);
-        assert.strictEqual(requests, 1, "recording diagnostics must not bypass the retry backoff");
-        now += 60001;
-        provider.fetchSeriesRuntimeInfo = async () => ({ episodes: [{ id: "e1", season: 1, episode: 1 }] });
-        tmdbMetadata.getSeriesRuntimeMetadata = async () => ({ episodeCount: 0, totalMinutes: 0, complete: true });
-        const missing = await addon.ensureSeriesRuntimeAverage(item, failed);
-        assert.deepStrictEqual(missing.runtimeAverage.lastFailure, { reason: "episode_durations_unavailable" },
-            "missing duration data must not be reported as a provider HTTP failure");
+        assert.strictEqual(first.runtimeAverage.attemptPolicyVersion, 1);
         now += 12 * HOUR + 1;
-        tmdbMetadata.getSeriesRuntimeMetadata = async () => {
-            const error = new TypeError("secret-do-not-log https://example.com/password"); error.code = "ETIMEDOUT"; throw error;
-        };
-        const exception = await addon.ensureSeriesRuntimeAverage(item, missing);
-        assert.deepStrictEqual(exception.runtimeAverage.lastFailure,
-            { reason: "runtime_calculation_error", errorName: "TypeError", errorCode: "ETIMEDOUT" });
-        assert.ok(!JSON.stringify(store.entries.get(item.id)).includes("secret-do-not-log"));
-        now += 12 * HOUR + 1;
-        tmdbMetadata.getSeriesLevelRuntime = async () => ({ runtime: "60 min", source: "tmdb-series", complete: true });
-        const recovered = await addon.ensureSeriesRuntimeAverage(item, exception);
-        assert.strictEqual(recovered.runtime, "60 min");
-        assert.strictEqual(recovered.runtimeAverage, null, "a recovered source runtime must clear old failure and legacy markers");
-    } finally {
-        Date.now = originalNow;
-        provider.fetchSeriesRuntimeInfo = originalProvider;
-        tmdbMetadata.getSeriesLevelRuntime = originalLevel;
-        tmdbMetadata.getSeriesRuntimeMetadata = originalAverage;
-    }
+        await addon.ensureSeriesRuntimeAverage(item, first);
+        assert.strictEqual(calls(), 2);
+    }); } finally { Date.now = originalNow; }
 }
 
-async function testTmdbRuntimeProbeIsIndependentAndNotRepeatedDuringEpisodeFallback() {
-    let details = 0;
-    let seasons = 0;
-    await withFreshFetchModule("../src/js/tmdbMetadata", async url => {
-        if (new URL(url).pathname.includes("/season/")) { seasons++; return tmdbResponse(seasonEpisodes(1, [55])); }
-        details++; return tmdbResponse(tvDetails([[1, 1]]));
-    }, async fresh => {
-        const diagnostic = {};
-        assert.strictEqual(await fresh.getSeriesLevelRuntime("123", { refresh: true, diagnostics: diagnostic }), null);
-        assert.strictEqual(diagnostic.reason, "tmdb_series_runtime_missing");
-        const result = await fresh.getSeriesRuntimeMetadata("123", {
-            episodes: [{ id: "e1", season: 1, episode: 1 }], refresh: true, seriesLevelChecked: true
-        });
-        assert.strictEqual(result.runtime, "55 min");
-        assert.strictEqual(details, 1, "the independent probe and episode fallback must share a single series-details lookup");
-        assert.strictEqual(seasons, 1);
-    }, true);
-    for (const malformed of [false, true]) {
-        await withFreshFetchModule("../src/js/tmdbMetadata", async () => malformed
-            ? tmdbResponse({ invalid: true }) : tmdbResponse(null, 503), async fresh => {
-            const result = await fresh.getSeriesRuntimeMetadata("123", {
-                episodes: [{ id: "e1", season: 1, episode: 1 }], seriesLevelChecked: true
-            });
-            assert.strictEqual(result.runtime, undefined);
-            assert.strictEqual(result.failedSeasonLookups, 1);
-            if (malformed) assert.strictEqual(result.lookupFailure.reason, "tmdb_episode_response_invalid");
-            else assert.strictEqual(result.lookupFailure.httpStatus, 503);
+async function testDetailRuntimeUsesSameRegularAiredEpisodeFilter() {
+    const { addon, item } = runtimeAddon();
+    const episodes = [
+        { season: 0, episode: 1, runtime: '2 min' },
+        { season: 1, episode: 1, runtime: '45 min' },
+        { season: 1, episode: 2, runtime: '55 min' },
+        { season: 1, episode: 3, runtime: '100 min', released: '2999-01-01' }
+    ];
+    const result = await addon.getSeriesDetailRuntime(item,
+        { runtimeSeasons: [{ season: 1, episodeCount: 3 }] }, null, { videos: episodes },
+        [[0, episodes.slice(0, 1)], [1, episodes.slice(1)]]);
+    assert.strictEqual(result.runtime, '50 min');
+    assert.strictEqual(result.runtimeAverage.episodeCount, 2);
+    assert.strictEqual(result.runtimeAverage.seasons[0].eligibleEpisodeCount, 2);
+    assert.strictEqual(episodes.length, 4, 'filtering an average must not remove playable specials from the actual episode list');
+}
+
+async function captureSeries429Logs(run) {
+    const original = console.warn; const lines = [];
+    console.warn = (...args) => { lines.push(args.join(' ')); };
+    try { await run(lines); } finally { console.warn = original; }
+    return lines.filter(line => line.includes('Series metadata request returned HTTP 429'))
+        .map(line => JSON.parse(line.slice(line.indexOf('{'))));
+}
+
+async function testSeriesTmdb429LoggingCoversDetailsSeasonsAndVideosOnly() {
+    const logs = await captureSeries429Logs(async () => {
+        await withFreshFetchModule('../src/js/tmdbMetadata', async () => tmdbResponse(null, 429), async fresh => {
+            await fresh.getSeriesCatalogMetadata('123');
+            await fresh.getSeasonEpisodes('123', 2);
+            await fresh.getSeriesMetadata('123');
+            await fresh.getMovieMetadata('456');
         }, true);
+    });
+    assert.strictEqual(logs.length, 4);
+    assert.ok(logs.every(entry => entry.source === 'tmdb' && entry.tmdbId === '123' && entry.status === 429));
+    assert.ok(logs.some(entry => entry.operation === 'season_details' && entry.season === 2));
+    assert.ok(logs.some(entry => entry.operation === 'series_videos'));
+}
+
+async function testSeriesXtream429LoggingIsSharedAndDoesNotBlockOtherSeries() {
+    let calls = 0;
+    const logs = await captureSeries429Logs(async () => {
+        await withFreshFetchModule('../src/js/providers/xtreamProvider', async () => {
+            calls++; await new Promise(setImmediate);
+            return { ok: false, status: 429, headers: { get: () => '30' } };
+        }, async provider => {
+            const addon = { config: { xtreamUrl: 'https://example.com', xtreamUsername: 'secret-user', xtreamPassword: 'secret-password' } };
+            await Promise.all([provider.fetchSeriesInfo(addon, '3'), provider.fetchSeriesTmdbId(addon, '3'), provider.fetchSeriesRuntimeSummary(addon, '3')]);
+            await provider.fetchSeriesInfo(addon, '4');
+        });
+    });
+    assert.strictEqual(calls, 2, 'logging must not introduce a cooldown or suppress requests');
+    assert.deepStrictEqual(logs.map(entry => entry.seriesId), ['3', '4']);
+    assert.ok(logs.every(entry => entry.source === 'xtream' && entry.operation === 'get_series_info' && entry.retryAfterSeconds === 30));
+    assert.ok(!JSON.stringify(logs).includes('secret-'));
+}
+
+async function testSeriesCatalogue429LoggingIncludesProviderListRequests() {
+    const logs = await captureSeries429Logs(async () => {
+        await withFreshFetchModule('../src/js/providers/xtreamProvider', async url => {
+            const action = new URL(url).searchParams.get('action');
+            return action === 'get_series' || action === 'get_series_categories'
+                ? { ok: false, status: 429 } : { ok: true, json: async () => [] };
+        }, async provider => {
+            await assert.rejects(() => provider.fetchData({ config: {
+                xtreamUrl: 'https://example.com', xtreamUsername: 'test', xtreamPassword: 'test', includeSeries: true
+            }, log: quietLog }));
+        });
+    });
+    assert.deepStrictEqual(logs.map(entry => entry.operation).sort(), ['get_series', 'get_series_categories']);
+}
+
+async function testSeriesOmdb429LoggingIncludesRatingsAndLeavesMovieLoggingUnchanged() {
+    const fs = require('fs/promises'); const path = require('path'); const os = require('os');
+    const root = path.resolve(os.tmpdir());
+    const directory = await fs.mkdtemp(path.join(root, 'series-429-test-'));
+    const originalKey = process.env.OMDB_API_KEY; const originalDirectory = process.env.PERSISTENT_DATA_DIR;
+    process.env.OMDB_API_KEY = 'secret-test-key'; process.env.PERSISTENT_DATA_DIR = directory;
+    try {
+        const logs = await captureSeries429Logs(async () => {
+            await withFreshFetchModule('../src/js/omdbMetadata', async () => ({ ok: false, status: 429 }), async fresh => {
+                await fresh.getByImdbId('tt1234567', { mediaType: 'series' });
+                await fresh.getByImdbId('tt7654321', { mediaType: 'movie' });
+            });
+        });
+        assert.deepStrictEqual(logs, [{ source: 'omdb', operation: 'imdb_lookup', status: 429, imdbId: 'tt1234567' }]);
+        assert.ok(!JSON.stringify(logs).includes('secret-'));
+    } finally {
+        if (originalKey === undefined) delete process.env.OMDB_API_KEY; else process.env.OMDB_API_KEY = originalKey;
+        if (originalDirectory === undefined) delete process.env.PERSISTENT_DATA_DIR; else process.env.PERSISTENT_DATA_DIR = originalDirectory;
+        if (!path.resolve(directory).startsWith(root + path.sep)) throw new Error('Unexpected temporary test directory');
+        await fs.rm(directory, { recursive: true, force: true });
     }
 }
 
-async function testRuntimeMigrationSummaryPersistsReasonsAndBoundsExamples() {
-    const now = Date.now();
-    const previews = Array.from({ length: 8 }, (_, index) => seriesPreview({ id: "iptv_series_" + (index + 1), runtime: "22 min", runtimeAverage: {
-        version: 1, runtime: "22 min", source: "tmdb-episodes", tmdbId: "123", complete: true,
-        checkedAt: now - HOUR, attemptedAt: now, attemptProviderLastUpdate: 1000, scopeMigrationAttemptedAt: now, lookupRevision: 1,
-        lastFailure: index < 7 ? { reason: "provider_http_error", httpStatus: 429, retryAt: now + 60000 } : { reason: "episode_durations_unavailable" }
-    } }));
-    previews.push(seriesPreview({ id: "iptv_series_9", runtimeAverage: {
-        version: 1, attemptedAt: now, scopeMigrationAttemptedAt: now, attemptProviderLastUpdate: 1000, lookupRevision: 1,
-        lastFailure: { reason: "episode_durations_unavailable" }
-    } }));
-    const items = previews.map(value => ({ id: value.id, series_id: value.id.replace("iptv_series_", ""), type: "series", name: value.name, tmdbId: "123" }));
-    const store = metadataStore(previews);
-    const logs = [];
-    const make = () => {
-        const addon = runtimeAddon().addon; addon.series = items; addon.persistentCatalogMetaCache = store;
-        addon.log = Object.fromEntries(["debug", "info", "warn", "error"].map(level => [level, (message, details) => logs.push({ level, message, details })]));
-        return addon;
-    };
-    await withTmdbRuntimeResult(() => { throw new Error("backed-off records should not look up episodes"); }, async calls => {
-        const addon = make(); addon.startContinuousCatalogPrefetch("series", 50, 2); await addon.catalogPrefetchJobs.get("series");
-        const diagnostic = logs.find(log => log.message === "Catalogue metadata diagnostics").details.seriesRuntime;
-        assert.strictEqual(diagnostic.legacyScope, 8);
-        assert.deepStrictEqual(diagnostic.legacyFailureReasons, { "provider_http_error:429": 7, episode_durations_unavailable: 1 });
-        assert.deepStrictEqual(diagnostic.lookupFailureReasons, { "provider_http_error:429": 7, episode_durations_unavailable: 2 });
-        assert.strictEqual(diagnostic.legacyExamples.length, 5);
-        assert.strictEqual(diagnostic.legacyExamples[0].httpStatus, 429);
-        const complete = logs.find(log => log.message === "Persistent catalogue metadata scan complete");
-        assert.strictEqual(complete.details.runtimeMigrationPending, 8);
-        assert.strictEqual(calls(), 0);
-        const restarted = make(); restarted.startContinuousCatalogPrefetch("series", 50, 2); await restarted.catalogPrefetchJobs.get("series");
-        const current = logs.find(log => log.message === "Persistent catalogue metadata scan is current");
-        assert.deepStrictEqual(current.details.seriesRuntime.legacyFailureReasons, diagnostic.legacyFailureReasons);
+async function testSeries429LogOmitsUnsafeIdentifiersAndHeaderContents() {
+    const log429 = require('../seriesMetadataLog');
+    const logs = await captureSeries429Logs(async () => {
+        log429('xtream', 'get_series_info', { seriesId: 'https://provider.example/secret-password', tmdbId: 'secret-api-key' },
+            { status: 429, headers: { get: () => 'secret-response-header' } });
+        log429('tmdb', 'series_details', { tmdbId: '123' }, { status: 503 });
+        log429('tmdb', 'series_details', { tmdbId: '123' }, { status: 200 });
     });
-}
-
-async function testMetadataFallbackSummarySeparatesRequestFailuresFromMissingIds() {
-    const { addon } = runtimeAddon();
-    const values = [1, 2].map(number => seriesPreview({ id: "iptv_series_" + number, runtime: "60 min" }));
-    addon.series = values.map(value => ({ id: value.id, type: "series", series_id: value.id.replace("iptv_series_", ""), name: value.name }));
-    addon.persistentCatalogMetaCache = metadataStore(values);
-    for (const value of values) addon.catalogMetaCache.set(value.id, value);
-    addon.catalogMetaLookupDiagnostics.set(values[0].id, {
-        providerFallback: true, reason: "provider_tmdb_id_lookup_failed", providerLookup: { reason: "provider_http_error", httpStatus: 429 }
-    });
-    addon.catalogMetaLookupDiagnostics.set(values[1].id, {
-        providerFallback: true, reason: "provider_tmdb_id_missing", providerLookup: { reason: "provider_tmdb_id_missing" }
-    });
-    const logs = [];
-    addon.log = Object.fromEntries(["debug", "info", "warn", "error"].map(level => [level, (message, details) => logs.push({ level, message, details })]));
-    addon.startContinuousCatalogPrefetch("series", 50, 2); await addon.catalogPrefetchJobs.get("series");
-    const complete = logs.find(log => log.message === "Persistent catalogue metadata scan complete").details;
-    assert.strictEqual(complete.providerFallbacks, 2);
-    assert.deepStrictEqual(complete.providerLookupFailureReasons, { "provider_http_error:429": 1 });
-    assert.deepStrictEqual(complete.providerFallbackReasons, { provider_tmdb_id_lookup_failed: 1, provider_tmdb_id_missing: 1 });
+    assert.deepStrictEqual(logs, [{ source: 'xtream', operation: 'get_series_info', status: 429 }]);
+    assert.ok(!JSON.stringify(logs).includes('secret-'));
 }
 
 module.exports = [
+    testRuntimePolicyFiltersSpecialsAndKnownFutureDates,
+    testTmdbRuntimePolicyExcludesFutureEpisodesWithoutMarkingThemMissing,
+    testSuccessfulRuntimeChecksNewEpisodesAtFourteenDaysNotTwelveHours,
+    testMissingEpisodeDurationsStillRetryAfterTwelveHours,
+    testFutureEpisodeBecomesEligibleOnFullRefreshWithUnchangedCount,
+    testOldPersistedAverageFormatsRecalculateWithNewFiltersWithoutClearingMetadata,
+    testFailedRuntimePolicyMigrationRetainsAverageAndRetriesAfterTwelveHours,
+    testDetailRuntimeUsesSameRegularAiredEpisodeFilter,
+    testSeriesTmdb429LoggingCoversDetailsSeasonsAndVideosOnly,
+    testSeriesXtream429LoggingIsSharedAndDoesNotBlockOtherSeries,
+    testSeriesCatalogue429LoggingIncludesProviderListRequests,
+    testSeriesOmdb429LoggingIncludesRatingsAndLeavesMovieLoggingUnchanged,
+    testSeries429LogOmitsUnsafeIdentifiersAndHeaderContents,
     testEpisodeRuntimeParsingRejectsUnknownAndAmbiguousValues,
     testDuttonRanchAverageAndEpisodeWeighting,
-    testTmdbAverageIncludesOnlyProviderEpisodesAndLimitsConcurrentRequests,
+    testTmdbAverageIncludesRegularSeasonsAndLimitsConcurrentRequests,
     testTmdbOfficialSeriesRuntimeAvoidsSeasonRequests,
     testTmdbAverageReusesUnchangedSeasonsAndRefreshesChangedOnes,
     testTmdbUnknownEpisodeLengthsRetryAfterTwelveHours,
@@ -1298,17 +1175,7 @@ module.exports = [
     testNewEpisodesRefreshAverageAndOfficialRuntimeSupersedesIt,
     testPartialSeasonFailureCannotReplaceSavedCompleteAverage,
     testDirectPlaylistEpisodeDurationsCanProduceAnAverage,
-    testPartialDetailLookupKeepsSavedAverageForSameProviderPopulation,
+    testPartialDetailEpisodeListKeepsSavedWholeSeriesAverage,
     testIdleScheduledChecksStartMetadataWarmupAndRespectDisableSetting,
-    testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether,
-    testHouseOfTheDragonMigratesLegacyAverageAndMatchesCardsAndDetails,
-    testProviderPopulationMixesMatchedAndFallbackDurationsPerEpisode,
-    testFreshAverageRechecksMembershipAfterProviderGenerationChanges,
-    testLegacyAverageMigrationFailureBacksOffWithoutDroppingMetadata,
-    testSeriesLevelRuntimeIsUsedWithoutRequestingProviderEpisodes,
-    testRuntimeProviderParserSupportsSeasonArraysAndPreservesFailures,
-    testRuntimeFailuresPersistSpecificReasonsAndRespectBackoff,
-    testTmdbRuntimeProbeIsIndependentAndNotRepeatedDuringEpisodeFallback,
-    testRuntimeMigrationSummaryPersistsReasonsAndBoundsExamples,
-    testMetadataFallbackSummarySeparatesRequestFailuresFromMissingIds
+    testProviderRuntimeRefreshKeepsDetailAndPreviewProvenanceTogether
 ];

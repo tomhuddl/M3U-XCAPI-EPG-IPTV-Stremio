@@ -5,21 +5,8 @@
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
 const { parseEPGStream } = require("../epgStreamParser");
-const { parseRuntimeMinutes } = require("../../../seriesRuntime");
-const xtreamRequests = require("../../../xtreamRequests");
-
-// Consume each JSON body inside its queue slot. Waiting for several response
-// headers before reading their bodies would otherwise deadlock a bounded queue.
-function fetchJsonResponse(addon, url, options) {
-  return xtreamRequests.request(addon, url, () => fetch(url, options), async response => {
-    if (!response.ok) {
-      response.body?.destroy?.();
-      return { ok: false, status: response.status };
-    }
-    const payload = await response.json();
-    return { ok: true, status: response.status, json: async () => payload };
-  });
-}
+const { parseRuntimeMinutes, averageEpisodeRuntime } = require("../../../seriesRuntime");
+const logSeriesMetadata429 = require("../../../seriesMetadataLog");
 
 function getEpgFetchConcurrency() {
     const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
@@ -81,16 +68,12 @@ async function fetchData(addonInstance) {
       `&password=${encodeURIComponent(xtreamPassword)}` +
       `&type=m3u_plus` +
       (xtreamOutput ? `&output=${encodeURIComponent(xtreamOutput)}` : "");
-    const text = await xtreamRequests.request(addonInstance, url, () => fetch(url, {
+    const resp = await fetch(url, {
       timeout: 30000,
       headers: { "User-Agent": "Stremio M3U/EPG Addon (xtreamProvider/m3u)" },
-    }), async resp => {
-      if (!resp.ok) {
-        resp.body?.destroy?.();
-        throw new Error("Xtream M3U fetch failed");
-      }
-      return resp.text();
     });
+    if (!resp.ok) throw new Error("Xtream M3U fetch failed");
+    const text = await resp.text();
     const items = addonInstance.parseM3U(text);
 
     addonInstance.channels = items.filter((i) => i.type === "tv");
@@ -126,12 +109,12 @@ async function fetchData(addonInstance) {
     const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
     // Fetch streams + category lists in parallel to map category_id -> category_name
     const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-      fetchJsonResponse(addonInstance, `${base}&action=get_live_streams`, { timeout: 30000 }),
-      fetchJsonResponse(addonInstance, `${base}&action=get_vod_streams`, { timeout: 30000 }),
-      fetchJsonResponse(addonInstance, `${base}&action=get_live_categories`, { timeout: 20000 }).catch(
+      fetch(`${base}&action=get_live_streams`, { timeout: 30000 }),
+      fetch(`${base}&action=get_vod_streams`, { timeout: 30000 }),
+      fetch(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
-      fetchJsonResponse(addonInstance, `${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
+      fetch(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
     ]);
@@ -218,14 +201,16 @@ async function fetchData(addonInstance) {
       const seriesFetchStartedAt = Date.now();
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
-          fetchJsonResponse(addonInstance, `${base}&action=get_series`, { timeout: 35000 }),
-          fetchJsonResponse(addonInstance, `${base}&action=get_series_categories`, {
+          fetch(`${base}&action=get_series`, { timeout: 35000 }),
+          fetch(`${base}&action=get_series_categories`, {
             timeout: 20000,
           }).catch((error) => {
             return null;
           }),
         ]);
         let seriesCatMap = {};
+        logSeriesMetadata429('xtream', 'get_series', {}, seriesResp);
+        logSeriesMetadata429('xtream', 'get_series_categories', {}, seriesCatsResp);
         try {
           if (seriesCatsResp && seriesCatsResp.ok) {
             const arr = await seriesCatsResp.json();
@@ -304,15 +289,13 @@ async function fetchData(addonInstance) {
     const retentionBudget = { programmes: 0, textChars: 0 };
     const parsedSources = await mapWithConcurrency(epgSources, getEpgFetchConcurrency(), async sourceUrl => {
       try {
-        return await xtreamRequests.request(addonInstance, sourceUrl,
-          () => fetch(sourceUrl, { timeout: 120000 }), async epgResp => {
-            if (!epgResp || !epgResp.ok || !epgResp.body) {
-              addonInstance.epgRefreshFailed = true;
-              if (epgResp?.body) epgResp.body.destroy();
-              return null;
-            }
-            return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
-          });
+        const epgResp = await fetch(sourceUrl, { timeout: 120000 });
+        if (!epgResp || !epgResp.ok || !epgResp.body) {
+          addonInstance.epgRefreshFailed = true;
+          if (epgResp?.body) epgResp.body.destroy();
+          return null;
+        }
+        return await parseEPGStream(epgResp.body, allowedIds, retentionBudget);
       } catch {
         addonInstance.epgRefreshFailed = true;
         return null;
@@ -352,7 +335,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
   if (!streamId || !config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return null;
   const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
   try {
-    const response = await fetchJsonResponse(addonInstance, `${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
+    const response = await fetch(`${base}&action=get_vod_info&vod_id=${encodeURIComponent(streamId)}`, {
       timeout: 20000,
       // Reuse a connection for this provider fallback when its validated DNS
       // addresses are unchanged; safeFetch still validates DNS on every request.
@@ -363,8 +346,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
     const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
     const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;
     return { tmdbId: normalizeTmdbId(tmdbId) };
-  } catch (error) {
-    if (xtreamRequests.isXtreamRateLimitError(error)) throw error;
+  } catch {
     return null;
   }
 }
@@ -397,33 +379,31 @@ function requestSeriesPayload(addonInstance, seriesId) {
     const { config } = addonInstance;
     const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
     try {
-      const url = `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`;
-      return await xtreamRequests.request(addonInstance, url,
-        () => fetch(url, { timeout: 25000, reuseConnection: true }), async response => {
-          if (!response.ok) {
-            if (response.body && typeof response.body.destroy === "function") response.body.destroy();
-            return { diagnostic: {
-              reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
-            } };
-          }
-          let payload;
-          try {
-            payload = await response.json();
-          } catch (error) {
-            return { diagnostic: {
-              reason: "provider_invalid_json", source: "xtream_get_series_info",
-              errorName: error?.name || "SyntaxError"
-            } };
-          }
-          if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-            return { diagnostic: { reason: "provider_invalid_response", source: "xtream_get_series_info" } };
-          }
-          return { payload };
-        });
+      const response = await fetch(
+        `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+        { timeout: 25000, reuseConnection: true },
+      );
+      if (!response.ok) {
+        logSeriesMetadata429('xtream', 'get_series_info', { seriesId }, response);
+        if (response.body && typeof response.body.destroy === "function") response.body.destroy();
+        return { diagnostic: {
+          reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: response.status
+        } };
+      }
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (error) {
+        return { diagnostic: {
+          reason: "provider_invalid_json", source: "xtream_get_series_info",
+          errorName: error?.name || "SyntaxError"
+        } };
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        return { diagnostic: { reason: "provider_invalid_response", source: "xtream_get_series_info" } };
+      }
+      return { payload };
     } catch (error) {
-      if (xtreamRequests.isXtreamRateLimitError(error)) return { diagnostic: {
-        reason: "provider_http_error", source: "xtream_get_series_info", httpStatus: 429, retryAt: error.retryAt
-      } };
       return { diagnostic: providerRequestDiagnostic(error) };
     }
   })();
@@ -485,45 +465,33 @@ async function fetchSeriesTmdbId(addonInstance, seriesId, diagnostics = null) {
   return tmdbId;
 }
 
-async function fetchSeriesRuntimeInfo(addonInstance, seriesId, diagnostics = null) {
-  const report = details => {
-    if (diagnostics && typeof diagnostics === "object") Object.assign(diagnostics, details, { source: "xtream_get_series_info" });
-  };
-  if (!seriesId || !hasSeriesCredentials(addonInstance)) {
-    report({ reason: !seriesId ? "provider_series_id_missing" : "provider_credentials_missing" });
-    return null;
-  }
-  const { payload, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
-  if (!payload) { report(diagnostic || { reason: "provider_series_info_unavailable" }); return null; }
-  const groups = payload.episodes;
-  if (groups == null || typeof groups !== "object") {
-    report({ reason: groups == null ? "provider_episodes_missing" : "provider_episodes_invalid" });
-    return null;
-  }
-  const episodes = [];
-  // The details parser already accepts season arrays keyed by either a JSON
-  // object or a JSON array. Runtime lookup must accept those same layouts.
-  for (const [seasonKey, rows] of Object.entries(groups)) {
-    if (rows == null) continue; // Empty slots in indexed season lists contain no playable episodes.
-    if (!Array.isArray(rows)) { report({ reason: "provider_season_episodes_invalid" }); return null; }
-    for (const episode of rows) {
-      if (!episode || typeof episode !== "object" || Array.isArray(episode)) {
-        report({ reason: "provider_episode_invalid" }); return null;
-      }
-      if (episode.id == null || String(episode.id).trim() === "") {
-        report({ reason: "provider_episode_id_missing" }); return null;
-      }
-      episodes.push({
-        id: "iptv_series_ep_" + episode.id,
+async function fetchSeriesRuntimeSummary(addonInstance, seriesId) {
+  if (!seriesId || !hasSeriesCredentials(addonInstance)) return null;
+  const { payload } = await requestSeriesPayload(addonInstance, seriesId);
+  const groups = payload?.episodes;
+  if (!groups || typeof groups !== "object" || (Array.isArray(groups) && groups.length > 0)) return null;
+  const runtimes = [];
+  for (const [seasonKey, episodes] of Object.entries(groups)) {
+    if (!Array.isArray(episodes)) return null;
+    for (const episode of episodes) {
+      if (!episode || typeof episode !== "object" || Array.isArray(episode)) return null;
+      const runtimeMinutes = episodeRuntimeMinutes(episode);
+      if (runtimeMinutes === null) continue;
+      runtimes.push({
+        id: episode.id,
         season: Number.parseInt(episode.season ?? seasonKey, 10),
         episode: Number.parseInt(episode.episode_num ?? episode.episode ?? 0, 10),
-        runtimeMinutes: episodeRuntimeMinutes(episode)
+        released: episode.releasedate || episode.info?.releasedate || episode.info?.air_date,
+        runtimeMinutes
       });
     }
   }
-  const info = payload.info && typeof payload.info === "object" ? payload.info : {};
-  report({ reason: episodes.length ? "provider_episodes_loaded" : "provider_episodes_empty", episodeCount: episodes.length });
-  return { episodes, tmdbId: normalizeTmdbId(info.tmdb || info.tmdb_id || payload.tmdb || payload.tmdb_id), fetchedAt: Date.now() };
+  const average = averageEpisodeRuntime(runtimes);
+  return {
+    ...(average || { episodeCount: 0, totalMinutes: 0 }),
+    source: "provider-episodes",
+    complete: true
+  };
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
@@ -539,7 +507,6 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         fetchError: diagnostic?.httpStatus ? `HTTP ${diagnostic.httpStatus}` : "Provider request failed",
         ...(diagnostic?.errorName ? { errorName: diagnostic.errorName } : {}),
         ...(diagnostic?.errorCode ? { errorCode: diagnostic.errorCode } : {}),
-        ...(diagnostic?.retryAt ? { retryAt: diagnostic.retryAt } : {}),
         fetchedAt: Date.now()
       };
     }
@@ -609,6 +576,6 @@ module.exports = {
   fetchMovieInfo,
   fetchSeriesInfo,
   fetchSeriesTmdbId,
-  fetchSeriesRuntimeInfo,
+  fetchSeriesRuntimeSummary,
   normalizeTmdbId,
 };
