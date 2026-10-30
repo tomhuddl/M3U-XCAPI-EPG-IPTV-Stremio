@@ -28,10 +28,16 @@ const CATALOG_METADATA_FAILURE_RETRY_MS = parsePositiveInteger(
 );
 
 const SERIES_INFO_FAILURE_RETRY_MS = 5 * 60 * 1000;
+const PROVIDER_REFRESH_RETRY_MS = parsePositiveInteger(
+    process.env.PROVIDER_REFRESH_RETRY_MS, 60 * 60 * 1000, 5 * 60 * 1000, 6 * 60 * 60 * 1000
+);
+const EPG_REFRESH_RETRY_MS = parsePositiveInteger(
+    process.env.EPG_REFRESH_RETRY_MS, 60 * 60 * 1000, 5 * 60 * 1000, 6 * 60 * 60 * 1000
+);
 
-function omdbMetadataNeedsRefresh(value) {
-    if (!value || !value.imdbId) return false;
-    if (value.imdbRating && value.runtime) return false;
+function omdbMetadataNextCheckAt(value) {
+    if (!value || !value.imdbId) return Infinity;
+    if (value.imdbRating && value.runtime && !value.omdbPending) return Infinity;
     // Coordinate OMDb and general catalogue retries. If a recent catalogue
     // attempt already tried available sources, don't let an older OMDb timestamp
     // bypass the shared 12-hour backoff on the next card request.
@@ -40,7 +46,11 @@ function omdbMetadataNeedsRefresh(value) {
         Number(value.missingMetadataCheckedAt) || 0,
         Number(value.metadataCheckedAt) || 0
     );
-    return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+    return checkedAt ? checkedAt + OMDB_MISSING_DATA_RETRY_MS : 0;
+}
+
+function omdbMetadataNeedsRefresh(value) {
+    return omdbMetadataNextCheckAt(value) <= Date.now();
 }
 
 // Retry incomplete combined catalogue metadata from any source on the same
@@ -152,14 +162,23 @@ function missingCatalogMetadataFields(value) {
     return missing;
 }
 
-function catalogMetadataNeedsRefresh(value) {
+function catalogMetadataMissingNextCheckAt(value) {
     const missing = missingCatalogMetadataFields(value);
-    if (!missing.length) return false;
+    if (!missing.length) return Infinity;
     // Keep missing-field retry timing separate from the normal metadata
     // refresh timestamp. Older persisted entries migrate via metadataCheckedAt.
-    const checkedAt = Number(value.missingMetadataCheckedAt) ||
+    let checkedAt = Number(value.missingMetadataCheckedAt) ||
         Number(value.metadataCheckedAt) || 0;
-    return !checkedAt || Date.now() - checkedAt >= OMDB_MISSING_DATA_RETRY_MS;
+    // A real OMDb attempt can throttle retries of its own fields. Merely
+    // opening details must not defer retries of artwork, cast or descriptions.
+    if (value.imdbId && missing.every(field => field === 'imdbRating' || field === 'runtime')) {
+        checkedAt = Math.max(checkedAt, Number(value.omdbCheckedAt) || 0);
+    }
+    return checkedAt ? checkedAt + OMDB_MISSING_DATA_RETRY_MS : 0;
+}
+
+function catalogMetadataNeedsRefresh(value) {
+    return catalogMetadataMissingNextCheckAt(value) <= Date.now();
 }
 
 const GENERIC_CATALOG_GENRES = new Set(['movie', 'movies', 'series', 'tv']);
@@ -249,62 +268,71 @@ function validSeriesRuntime(...values) {
     return values.find(value => parseRuntimeMinutes(value) !== null);
 }
 
-function seriesRuntimeAverageNeedsRefresh(value) {
-    if (value?.type !== 'series') return false;
-    if (withoutProviderEpisodeAverage(value) !== value) return true;
-    if (parseRuntimeMinutes(value.runtime) !== null && !hasDerivedSeriesRuntime(value)) return false;
+function metadataRefreshInterval() {
+    return parsePositiveInteger(process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+        60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000);
+}
+
+function seriesRuntimeAverageNextCheckAt(value) {
+    if (value?.type !== 'series') return Infinity;
+    if (withoutProviderEpisodeAverage(value) !== value) return 0;
+    if (parseRuntimeMinutes(value.runtime) !== null && !hasDerivedSeriesRuntime(value)) return Infinity;
     const average = value.runtimeAverage;
-    if (![1, 2].includes(average?.version)) return true;
+    if (![1, 2].includes(average?.version)) return 0;
     const attemptedAt = Number(average.attemptedAt) || 0;
     if (average.policyVersion !== 1) {
-        return average.attemptPolicyVersion !== 1 || !attemptedAt ||
-            Date.now() - attemptedAt >= OMDB_MISSING_DATA_RETRY_MS;
+        return average.attemptPolicyVersion !== 1 || !attemptedAt ? 0 : attemptedAt + OMDB_MISSING_DATA_RETRY_MS;
     }
-    if (average.complete === false && !Number(average.attemptedAt)) return true;
+    if (average.complete === false && !Number(average.attemptedAt)) return 0;
     const checkedAt = Number(average.checkedAt) || 0;
     const missingDurations = Array.isArray(average.seasons) && average.seasons.some(season =>
         Number(season.runtimeCount) < Number(season.eligibleEpisodeCount ?? season.episodeCount));
     const retryMissing = !hasDerivedSeriesRuntime(value) || average.complete !== true ||
         missingDurations || attemptedAt > checkedAt;
-    const interval = retryMissing ? OMDB_MISSING_DATA_RETRY_MS : parsePositiveInteger(
-        process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
-        60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
-    );
+    const interval = retryMissing ? OMDB_MISSING_DATA_RETRY_MS : metadataRefreshInterval();
     const timestamp = retryMissing ? attemptedAt || checkedAt : checkedAt;
-    return !timestamp || Date.now() - timestamp >= interval;
+    return timestamp ? timestamp + interval : 0;
 }
 
-function getCatalogMetadataWarmupState(value) {
+function seriesRuntimeAverageNeedsRefresh(value) {
+    return seriesRuntimeAverageNextCheckAt(value) <= Date.now();
+}
+
+function catalogMetadataIdentityNextCheckAt(value, item) {
+    if (!value?._tmdbId || !item?.tmdbId || String(value._tmdbId) === String(item.tmdbId)) return Infinity;
+    const attemptedAt = Number(value.metadataRefreshAttemptedAt) || 0;
+    return attemptedAt ? attemptedAt + CATALOG_METADATA_FAILURE_RETRY_MS : 0;
+}
+
+function catalogMetadataNextCheckAt(value, item) {
+    if (!value) return 0;
+    return Math.min(catalogMetadataNormalNextCheckAt(value), catalogMetadataIdentityNextCheckAt(value, item),
+        catalogMetadataMissingNextCheckAt(value), omdbMetadataNextCheckAt(value), seriesRuntimeAverageNextCheckAt(value));
+}
+
+function getCatalogMetadataWarmupState(value, item) {
     const missingFields = value ? missingCatalogMetadataFields(value) : ['preview'];
     const nameMissing = !String(value?.name || '').trim();
     const metadataVersionOld = Boolean(value) && !(Number(value.metadataVersion) >= 3);
     const imdbIdLookupPending = Boolean(value?._tmdbId && !value?.imdbId && value?.imdbIdChecked !== true);
-    const omdbRetryDue = omdbMetadataNeedsRefresh(value);
-    const catalogRetryDue = catalogMetadataNeedsRefresh(value);
-    const incomplete = !value || nameMissing || metadataVersionOld || imdbIdLookupPending || missingFields.length > 0;
-    const retryDue = !value || nameMissing ||
-        ((metadataVersionOld || imdbIdLookupPending) && catalogMetadataRefreshAttemptIsDue(value)) ||
-        omdbRetryDue || catalogRetryDue || seriesRuntimeAverageNeedsRefresh(value);
+    const incomplete = !value || nameMissing || metadataVersionOld || imdbIdLookupPending ||
+        value.omdbPending === true || missingFields.length > 0;
+    const retryDue = catalogMetadataNextCheckAt(value, item) <= Date.now();
     return { missingFields, incomplete, retryDue };
 }
 
-function catalogMetadataRefreshAttemptIsDue(value) {
+function catalogMetadataNormalNextCheckAt(value, savedAt = 0) {
+    const timestamp = Number(value?.metadataCheckedAt) || Number(savedAt) || 0;
+    const schemaDue = !String(value?.name || '').trim() ||
+        !(Number(value?.metadataVersion) >= 3) ||
+        (value?._tmdbId && !value?.imdbId && value?.imdbIdChecked !== true);
     const attemptedAt = Number(value?.metadataRefreshAttemptedAt) || 0;
-    return !attemptedAt || Date.now() - attemptedAt >= CATALOG_METADATA_FAILURE_RETRY_MS;
+    return Math.max(schemaDue || !timestamp ? 0 : timestamp + metadataRefreshInterval(),
+        attemptedAt ? attemptedAt + CATALOG_METADATA_FAILURE_RETRY_MS : 0);
 }
 
 function catalogMetadataNormalRefreshIsDue(value, savedAt = 0) {
-    const refreshInterval = parsePositiveInteger(
-        process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
-        60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000
-    );
-    const timestamp = Number(value?.metadataCheckedAt) || Number(savedAt) || 0;
-    return catalogMetadataRefreshAttemptIsDue(value) && (
-        !String(value?.name || '').trim() ||
-        !(Number(value?.metadataVersion) >= 3) ||
-        (value?._tmdbId && !value?.imdbId && value?.imdbIdChecked !== true) ||
-        Date.now() - timestamp >= refreshInterval
-    );
+    return catalogMetadataNormalNextCheckAt(value, savedAt) <= Date.now();
 }
 
 const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
@@ -713,10 +741,7 @@ class M3UEPGAddon {
         this.seriesEpisodeCacheMax = parsePositiveInteger(
             process.env.SERIES_EPISODE_CACHE_MAX, 50000, 1000, 200000
         );
-        // Keep a small parallel diagnostic cache without consuming slots from the
-        // bounded series-info LRU.
-        // Coalesce overlapping Xtream ID and series-info lookups started by parallel
-        // Discover workers, avoiding duplicate provider API round-trips.
+        // Coalesce on-demand provider detail lookups for the same title.
         this.providerInfoInFlight = new Map();
         // Cached catalogue enrichment lets later home/search requests return
         // rich cards without waiting on TMDb/Xtream for every item.
@@ -731,6 +756,7 @@ class M3UEPGAddon {
         // spawn independent background walks over different filtered result sets.
         this.catalogPrefetchJobs = new Map();
         this.catalogPrefetchLastCompleted = new Map();
+        this.catalogPrefetchNextCheckAt = new Map();
         // Remember which ordered catalogue the in-memory completion applies to, so
         // provider catalogue changes can trigger a new warm-up before the daily interval.
         this.catalogPrefetchLastFingerprint = new Map();
@@ -742,7 +768,6 @@ class M3UEPGAddon {
         // duplicate Xtream lookups even though TMDb's own HTTP layer is deduplicated.
         this.catalogMetaInFlight = new Map();
         this.seriesRuntimeInFlight = new Map();
-        // Retain compact lookup-failure reasons for the warm-up summary.
         // Track asynchronous disk writes so a completed pre-warm can flush every
         // metadata preview before its durable completion marker is written.
         this.catalogMetaPersistWrites = new Set();
@@ -759,6 +784,9 @@ class M3UEPGAddon {
         // end-times let guide requests skip programmes that cannot overlap the
         // requested window, including programmes that started much earlier.
         this.lastUpdate = 0;
+        this.lastEpgUpdate = 0;
+        this.epgRefreshAttemptedAt = 0;
+        this.providerRefreshRetryAfter = 0;
         this.log = makeLogger(config.debug);
 
         // Direct provider may populate this (seriesId -> episodes array)
@@ -842,15 +870,23 @@ class M3UEPGAddon {
             while (this.catalogMetaPersistWrites.size) {
                 await Promise.allSettled([...this.catalogMetaPersistWrites]);
             }
-            await Promise.allSettled([
-                this.persistentAddonDataCache.flush(),
-                this.persistentCatalogMetaCache.flush(),
-                this.persistentSeriesInfoCache.flush()
-            ]);
+            const stores = [
+                ['provider snapshot', this.persistentAddonDataCache],
+                ['catalogue metadata', this.persistentCatalogMetaCache],
+                ['series details', this.persistentSeriesInfoCache]
+            ];
+            const results = await Promise.allSettled(stores.map(([, cache]) => Promise.resolve().then(() => cache.flush())));
             providerRefreshState.delete(this.cacheKey);
             if (typeof this.releasePersistentCacheRegistration === "function") {
                 this.releasePersistentCacheRegistration();
                 this.releasePersistentCacheRegistration = null;
+            }
+            const failures = results.flatMap((result, index) => result.status === 'rejected'
+                ? [{ cache: stores[index][0], reason: result.reason }] : []);
+            if (failures.length) {
+                const error = new AggregateError(failures.map(failure => failure.reason), 'Persistent cache flush failed');
+                error.failedCaches = failures.map(failure => failure.cache);
+                throw error;
             }
         })();
         return this.disposePromise;
@@ -877,6 +913,12 @@ class M3UEPGAddon {
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
             this.lastUpdate = cached.lastUpdate || 0;
+            this.lastEpgUpdate = cached.lastEpgUpdate === undefined
+                ? (Object.values(this.epgData).some(programmes => Array.isArray(programmes) && programmes.length)
+                    ? this.lastUpdate : 0)
+                : Number(cached.lastEpgUpdate) || 0;
+            this.epgRefreshAttemptedAt = Number(cached.epgRefreshAttemptedAt) || 0;
+            this.providerRefreshRetryAfter = Number(cached.providerRefreshRetryAfter) || 0;
             this.pendingRemovalCandidates = cached.pendingRemovalCandidates && typeof cached.pendingRemovalCandidates === 'object'
                 ? cached.pendingRemovalCandidates : {};
 
@@ -919,18 +961,34 @@ class M3UEPGAddon {
         }
     }
 
-    async saveToCache() {
-        if (!CACHE_ENABLED) return;
-        const cacheKey = 'addon:data:' + this.cacheKey;
-        const entry = {
+    providerSnapshot() {
+        return {
             channels: this.channels,
             movies: this.movies,
             series: this.series,
             epgData: this.epgData,
             lastUpdate: this.lastUpdate,
+            lastEpgUpdate: this.lastEpgUpdate,
+            epgRefreshAttemptedAt: this.epgRefreshAttemptedAt,
+            providerRefreshRetryAfter: this.providerRefreshRetryAfter,
             directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
             pendingRemovalCandidates: this.pendingRemovalCandidates
         };
+    }
+
+    async persistProviderSnapshot() {
+        if (CACHE_ENABLED) return this.saveToCache();
+        try {
+            await this.persistentAddonDataCache.save(this.providerSnapshot());
+        } catch (error) {
+            this.log.warn('Persistent provider data save failed', { name: error?.name || 'Error', code: error?.code || 'UNKNOWN' });
+        }
+    }
+
+    async saveToCache() {
+        if (!CACHE_ENABLED) return;
+        const cacheKey = 'addon:data:' + this.cacheKey;
+        const entry = this.providerSnapshot();
         dataCache.set(cacheKey, entry);
         try {
             await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
@@ -1174,6 +1232,10 @@ class M3UEPGAddon {
     }
 
     cacheSeriesInfo(seriesId, info, ttl = CACHE_TTL_MS) {
+        const owner = String(seriesId);
+        for (const [id, entry] of this.seriesEpisodeCache) {
+            if (entry.seriesId === owner) this.seriesEpisodeCache.delete(id);
+        }
         this.seriesInfoCache.set(seriesId, info, ttl);
         if (Array.isArray(info?.videos)) {
             for (const video of info.videos) {
@@ -1182,6 +1244,7 @@ class M3UEPGAddon {
                 this.seriesEpisodeCache.delete(id);
                 this.seriesEpisodeCache.set(id, {
                     video,
+                    seriesId: owner,
                     expires: Date.now() + ttl
                 });
                 while (this.seriesEpisodeCache.size > this.seriesEpisodeCacheMax) {
@@ -1219,7 +1282,7 @@ class M3UEPGAddon {
                     const info = await providerModule.fetchSeriesInfo(this, normalizedSeriesId);
                     if (!isCurrent()) return null;
                     // A failed provider request is not a valid empty series.
-                    if (info?.fetchError) {
+                    if (info?.fetchError || !Array.isArray(info?.videos)) {
                         if (persisted?.value) {
                             this.cacheSeriesInfo(normalizedSeriesId, persisted.value, SERIES_INFO_FAILURE_RETRY_MS);
                             return persisted.value;
@@ -1301,6 +1364,7 @@ class M3UEPGAddon {
         }
         for (const type of changedTypes) {
             this.catalogPrefetchLastCompleted.delete(type);
+            this.catalogPrefetchNextCheckAt.delete(type);
             this.catalogPrefetchLastFingerprint.delete(type);
             this.catalogPrefetchRetryAfter.delete(type);
             persistentInvalidations.push(this.persistentCatalogMetaCache.delete('__catalog_prefetch_status__:' + type));
@@ -1343,9 +1407,13 @@ class M3UEPGAddon {
             if (!currentCatalogIds.has(String(id)) || changedCatalogIds.has(String(id))) this.catalogMetaStaleFallbacks.delete(id);
         }
         // Provider refreshes may add or remove episodes for an existing series.
-        // Drop process-local episode details so the next open uses the new listing.
-        // Cached stream URLs belong to the provider snapshot that just expired.
-        this.seriesEpisodeCache.clear();
+        // Refresh details on the next open, while retaining playable mappings for
+        // unchanged series whose pages may already be open in Stremio.
+        for (const [id, entry] of this.seriesEpisodeCache) {
+            if (!entry.seriesId || !currentSeriesKeys.has(entry.seriesId) || changedSeriesKeys.has(entry.seriesId)) {
+                this.seriesEpisodeCache.delete(id);
+            }
+        }
         const seriesKeysToInvalidate = new Set([
             ...(Array.isArray(previous.series) ? previous.series : []).map(getProviderSeriesKey),
             ...this.series.map(getProviderSeriesKey)
@@ -1382,7 +1450,10 @@ class M3UEPGAddon {
         const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
         if (sharedLastUpdate > this.lastUpdate) await this.loadFromCache();
 
-        const refreshPromise = this._updateData(force);
+        const refreshPromise = (async () => {
+            await this._updateData(force);
+            await this._updateEpg();
+        })();
         providerRefreshInFlight.set(this.cacheKey, refreshPromise);
         try {
             await refreshPromise;
@@ -1393,70 +1464,103 @@ class M3UEPGAddon {
         }
     }
 
+    isEpgRefreshDue() {
+        if (!this.config.enableEpg || this.disposed) return false;
+        const normalDue = this.lastEpgUpdate ? this.lastEpgUpdate + this.updateInterval : 0;
+        const retryDue = this.epgRefreshAttemptedAt > this.lastEpgUpdate
+            ? this.epgRefreshAttemptedAt + EPG_REFRESH_RETRY_MS : 0;
+        return Date.now() >= Math.max(normalDue, retryDue);
+    }
+
+    async _updateEpg() {
+        if (!this.isEpgRefreshDue()) return;
+        const provider = require('./src/js/providers/' + this.providerName + 'Provider.js');
+        if (typeof provider.fetchEpg !== 'function') return;
+        const generation = this.lastUpdate;
+        const startedAt = Date.now();
+        const previousGuide = this.epgData;
+        const previousSuccess = this.lastEpgUpdate;
+        let acceptedPartial = false;
+        const staged = Object.assign(Object.create(this), { epgData: {}, epgRefreshFailed: false });
+        this.epgRefreshAttemptedAt = startedAt;
+        try {
+            await provider.fetchEpg(staged);
+            if (this.disposed || this.lastUpdate !== generation) return;
+            const hasProgrammes = Object.values(staged.epgData || {}).some(items => Array.isArray(items) && items.length);
+            if (staged.epgRefreshFailed || !hasProgrammes) {
+                const hadGuide = Object.values(this.epgData).some(items => Array.isArray(items) && items.length);
+                if (!hadGuide && hasProgrammes) {
+                    this.epgData = staged.epgData;
+                    this.buildGenresInManifest();
+                    acceptedPartial = true;
+                }
+                throw new Error('Guide unavailable');
+            }
+            this.epgData = staged.epgData;
+            this.buildGenresInManifest();
+            this.lastEpgUpdate = Math.max(Date.now(), startedAt);
+            this.epgRefreshAttemptedAt = this.lastEpgUpdate;
+            this.log.info('EPG refresh complete', {
+                epgChannels: Object.keys(this.epgData).length,
+                epgProgrammes: Object.values(this.epgData).reduce((total, programmes) => total + programmes.length, 0),
+                durationMs: Date.now() - startedAt
+            });
+        } catch (error) {
+            if (this.disposed || this.lastUpdate !== generation) return;
+            if (!acceptedPartial) {
+                this.epgData = previousGuide;
+                this.lastEpgUpdate = previousSuccess;
+            }
+            this.log.warn('EPG refresh failed; retaining saved guide', { retryDelay: EPG_REFRESH_RETRY_MS });
+        }
+        if (!this.disposed && this.lastUpdate === generation) await this.persistProviderSnapshot();
+    }
+
     async _updateData(force = false) {
         const now = Date.now();
-        if (!force) {
-            if (this.lastUpdate && now - this.lastUpdate < this.updateInterval) return;
-            if ((this.channels.length || this.movies.length || this.series.length) && now - this.lastUpdate < 900000) return;
-        }
-
+        if (this.disposed || now < this.providerRefreshRetryAfter) return;
+        if (!force && this.lastUpdate && now - this.lastUpdate < this.updateInterval) return;
         const previous = {
-            channels: this.channels,
-            movies: this.movies,
-            series: this.series,
-            epgData: this.epgData,
-            lastUpdate: this.lastUpdate,
+            channels: this.channels, movies: this.movies, series: this.series,
+            epgData: this.epgData, lastUpdate: this.lastUpdate,
+            lastEpgUpdate: this.lastEpgUpdate, epgRefreshAttemptedAt: this.epgRefreshAttemptedAt,
             directSeriesEpisodeIndex: this.directSeriesEpisodeIndex,
             directSeriesEpisodeById: this.directSeriesEpisodeById,
             pendingRemovalCandidates: this.pendingRemovalCandidates
         };
-        // Providers build into an isolated object so requests continue seeing the
-        // last complete snapshot while slow network fetches and parsers run.
+        const skipEpg = !this.isEpgRefreshDue();
         const refreshed = Object.assign(Object.create(this), {
-            channels: [],
-            movies: [],
-            series: this.config.includeSeries === false ? previous.series : [],
-            epgData: {},
-            epgRefreshFailed: false,
-            directSeriesEpisodeIndex: new Map(),
-            directSeriesEpisodeById: new Map()
+            channels: [], movies: [], series: this.config.includeSeries === false ? previous.series : [],
+            epgData: skipEpg ? previous.epgData : {}, epgRefreshFailed: false,
+            directSeriesEpisodeIndex: new Map(), directSeriesEpisodeById: new Map()
         });
 
         try {
             const start = Date.now();
-            const providerModule = require(`./src/js/providers/${this.providerName}Provider.js`);
-            await providerModule.fetchData(refreshed);
-
-            // Accept ordinary removals immediately. Major or empty sections need
-            // matching observations before replacing the last-known-good catalogue.
+            const provider = require('./src/js/providers/' + this.providerName + 'Provider.js');
+            await provider.fetchData(refreshed, { skipEpg });
+            if (this.disposed) return;
+            const guideAttemptAt = !skipEpg && this.config.enableEpg ? Date.now() : previous.epgRefreshAttemptedAt;
             const removalCandidates = { ...(previous.pendingRemovalCandidates || {}) };
             const unconfirmedDrops = [];
-            const providerConfirmations = parsePositiveInteger(
-                process.env.PROVIDER_REMOVAL_CONFIRMATIONS, 2, 2, 5
-            );
+            const confirmationsRequired = parsePositiveInteger(process.env.PROVIDER_REMOVAL_CONFIRMATIONS, 2, 2, 5);
             for (const section of ['channels', 'movies', 'series']) {
                 const stats = getSectionRemovalStats(previous[section], refreshed[section]);
-                const guardedDrop = stats.largeDrop || (stats.previousCount > 0 && stats.currentCount === 0);
-                if (guardedDrop) {
-                    const ids = (Array.isArray(refreshed[section]) ? refreshed[section] : [])
-                        .filter(item => item && item.id != null)
-                        .map(item => String(item.id))
-                        .sort();
+                if (stats.largeDrop || (stats.previousCount > 0 && stats.currentCount === 0)) {
+                    const ids = refreshed[section].map(item => String(item.id)).sort();
                     const fingerprint = crypto.createHash('sha256').update(ids.join('\n')).digest('hex');
                     const prior = removalCandidates[section];
-                    const confirmations = prior?.fingerprint === fingerprint
-                        ? Math.min(providerConfirmations, (Number(prior.confirmations) || 1) + 1)
-                        : 1;
-                    removalCandidates[section] = { fingerprint, confirmations, observedAt: Date.now() };
-                    if (confirmations < providerConfirmations) {
-                        unconfirmedDrops.push({
-                            section,
-                            removedCount: stats.removedCount,
-                            previousCount: stats.previousCount,
-                            currentCount: stats.currentCount,
-                            removedPercent: Number(stats.removedPercent.toFixed(1))
-                        });
-                    }
+                    const same = prior?.fingerprint === fingerprint;
+                    const sufficientlySeparated = same && Date.now() - (Number(prior.observedAt) || 0) >= PROVIDER_REFRESH_RETRY_MS;
+                    const confirmations = same
+                        ? Math.min(confirmationsRequired, (Number(prior.confirmations) || 1) + (sufficientlySeparated ? 1 : 0)) : 1;
+                    removalCandidates[section] = {
+                        fingerprint, confirmations, observedAt: same && !sufficientlySeparated ? prior.observedAt : Date.now()
+                    };
+                    if (confirmations < confirmationsRequired) unconfirmedDrops.push({
+                        section, removedCount: stats.removedCount, previousCount: stats.previousCount,
+                        currentCount: stats.currentCount, removedPercent: Number(stats.removedPercent.toFixed(1))
+                    });
                 } else {
                     delete removalCandidates[section];
                 }
@@ -1464,130 +1568,68 @@ class M3UEPGAddon {
 
             if (unconfirmedDrops.length) {
                 this.pendingRemovalCandidates = removalCandidates;
-                this.log.warn('Provider catalogue reduction needs one matching refresh before acceptance', {
-                    sections: unconfirmedDrops,
-                    requiredMatchingRefreshes: providerConfirmations
+                this.providerRefreshRetryAfter = Date.now() + PROVIDER_REFRESH_RETRY_MS;
+                this.epgRefreshAttemptedAt = guideAttemptAt;
+                this.log.warn('Provider catalogue reduction awaits a later matching refresh', {
+                    sections: unconfirmedDrops, requiredMatchingRefreshes: confirmationsRequired,
+                    retryDelay: PROVIDER_REFRESH_RETRY_MS
                 });
-                if (CACHE_ENABLED) await this.saveToCache();
-                else {
-                    try {
-                        await this.persistentAddonDataCache.save({
-                            channels: this.channels,
-                            movies: this.movies,
-                            series: this.series,
-                            epgData: this.epgData,
-                            lastUpdate: this.lastUpdate,
-                            directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
-                            pendingRemovalCandidates: this.pendingRemovalCandidates
-                        });
-                    } catch (error) {
-                        this.log.warn('Persistent removal confirmation state save failed', error?.name || 'Error');
-                    }
-                }
+                await this.persistProviderSnapshot();
                 return;
             }
 
+            const hasNewGuide = Object.values(refreshed.epgData || {}).some(items => Array.isArray(items) && items.length);
+            const hadGuide = Object.values(previous.epgData || {}).some(items => Array.isArray(items) && items.length);
+            const guideSucceeded = !skipEpg && this.config.enableEpg && !refreshed.epgRefreshFailed && hasNewGuide;
+            if (skipEpg) refreshed.epgData = previous.epgData;
+            else if (this.config.enableEpg && !guideSucceeded) {
+                if (hadGuide) refreshed.epgData = previous.epgData;
+                this.log.warn('EPG refresh incomplete; retaining available guide', { retryDelay: EPG_REFRESH_RETRY_MS });
+            }
+
+            if (previous.channels.length + previous.movies.length + previous.series.length > 0 &&
+                refreshed.channels.length + refreshed.movies.length + refreshed.series.length === 0) {
+                throw new Error('Provider refresh returned an empty catalogue');
+            }
             for (const section of ['channels', 'movies', 'series']) {
                 const stats = getSectionRemovalStats(previous[section], refreshed[section]);
-                if (stats.removedCount > 0) {
-                    this.log.info('Provider catalogue items removed', {
-                        section,
-                        removedCount: stats.removedCount,
-                        previousCount: stats.previousCount,
-                        currentCount: stats.currentCount
-                    });
-                }
+                if (stats.removedCount) this.log.info('Provider catalogue items removed', {
+                    section, removedCount: stats.removedCount, previousCount: stats.previousCount, currentCount: stats.currentCount
+                });
             }
 
-            // Keep the last-known-good guide if an optional EPG refresh is empty.
-            const hasNewEpg = Object.values(refreshed.epgData || {}).some(
-                programmes => Array.isArray(programmes) && programmes.length > 0
-            );
-            const hadPreviousEpg = Object.values(previous.epgData || {}).some(
-                programmes => Array.isArray(programmes) && programmes.length > 0
-            );
-            if (this.config.enableEpg && hadPreviousEpg && (refreshed.epgRefreshFailed || !hasNewEpg)) {
-                refreshed.epgData = previous.epgData;
-                this.log.warn(refreshed.epgRefreshFailed
-                    ? 'EPG refresh incomplete; retaining last-known-good guide'
-                    : 'EPG refresh returned no programmes; retaining last-known-good guide');
-            } else if (this.config.enableEpg && refreshed.epgRefreshFailed) {
-                this.log.warn('EPG refresh incomplete; using available programmes until the next refresh');
-            }
-
-            const previousHadCatalogue = previous.channels.length + previous.movies.length + previous.series.length > 0;
-            const currentHasCatalogue = refreshed.channels.length + refreshed.movies.length + refreshed.series.length > 0;
-            if (previousHadCatalogue && !currentHasCatalogue) {
-                this.log.warn('Provider refresh returned an empty catalogue; retaining the previous catalogue');
-                throw new Error('Provider refresh returned an empty catalogue; retaining previous data');
-            }
-
-            // Commit the whole validated snapshot together. No request can observe
-            // the empty/partially populated arrays used during provider fetching.
-            this.channels = refreshed.channels;
-            this.movies = refreshed.movies;
-            this.series = refreshed.series;
+            this.channels = refreshed.channels; this.movies = refreshed.movies; this.series = refreshed.series;
             this.epgData = refreshed.epgData;
             this.directSeriesEpisodeIndex = refreshed.directSeriesEpisodeIndex;
             this.directSeriesEpisodeById = refreshed.directSeriesEpisodeById;
             this.pendingRemovalCandidates = {};
             this.lastUpdate = Math.max(Date.now(), (Number(previous.lastUpdate) || 0) + 1);
+            this.providerRefreshRetryAfter = 0;
+            this.epgRefreshAttemptedAt = guideSucceeded ? this.lastUpdate : guideAttemptAt;
+            this.lastEpgUpdate = guideSucceeded ? this.lastUpdate : previous.lastEpgUpdate;
             providerRefreshState.set(this.cacheKey, this.lastUpdate);
 
-            // Build user-facing catalogue metadata before saving the refreshed
-            // snapshot. If this fails, the previous persistent snapshot stays intact.
             this.buildGenresInManifest();
             await this.pruneRemovedCatalogState(previous);
-            if (CACHE_ENABLED) await this.saveToCache();
-            else {
-                try {
-                    await this.persistentAddonDataCache.save({
-                        channels: this.channels,
-                        movies: this.movies,
-                        series: this.series,
-                        epgData: this.epgData,
-                        lastUpdate: this.lastUpdate,
-                        directSeriesEpisodes: Object.fromEntries(this.directSeriesEpisodeIndex.entries()),
-                        pendingRemovalCandidates: this.pendingRemovalCandidates
-                    });
-                } catch (error) {
-                    this.log.warn('Persistent provider data save failed', {
-                        name: error?.name || 'Error', code: error?.code || 'UNKNOWN',
-                        syscall: error?.syscall || null,
-                        message: String(error?.message || 'No error message').slice(0, 300)
-                    });
-                }
-            }
+            await this.persistProviderSnapshot();
             this.log.info('Provider data refresh complete', {
-                channels: this.channels.length,
-                movies: this.movies.length,
-                series: this.series.length,
-                epgChannels: Object.keys(this.epgData || {}).length,
-                epgProgrammes: Object.values(this.epgData || {}).reduce(
-                    (total, programmes) => total + (Array.isArray(programmes) ? programmes.length : 0), 0
-                ),
+                channels: this.channels.length, movies: this.movies.length, series: this.series.length,
+                epgChannels: Object.keys(this.epgData).length,
+                epgProgrammes: Object.values(this.epgData).reduce((total, programmes) => total + programmes.length, 0),
                 durationMs: Date.now() - start
             });
         } catch (error) {
-            // Before the commit point, live data is untouched. If an unexpected
-            // post-commit failure occurs, restore the prior in-memory snapshot.
-            this.channels = previous.channels;
-            this.movies = previous.movies;
-            this.series = previous.series;
-            this.epgData = previous.epgData;
-            this.lastUpdate = previous.lastUpdate;
-            this.directSeriesEpisodeIndex = previous.directSeriesEpisodeIndex;
-            this.directSeriesEpisodeById = previous.directSeriesEpisodeById;
-            this.pendingRemovalCandidates = previous.pendingRemovalCandidates;
+            Object.assign(this, previous);
+            this.providerRefreshRetryAfter = Date.now() + PROVIDER_REFRESH_RETRY_MS;
             providerRefreshState.set(this.cacheKey, previous.lastUpdate || 0);
             this.log.error('[UPDATE] Failed; retaining last-known-good data:', {
                 name: error?.name || 'Error',
                 message: String(error?.message || 'No error message')
                     .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted URL]')
-                    .replace(/((?:username|password|token|api[_-]?key)=)[^&\s]+/gi, '$1[redacted]')
-                    .slice(0, 240),
+                    .replace(/((?:username|password|token|api[_-]?key)=)[^&\s]+/gi, '$1[redacted]').slice(0, 240),
                 code: typeof error?.code === 'string' ? error.code : null
             });
+            await this.persistProviderSnapshot();
         }
     }
     startConfiguredCatalogPrefetch() {
@@ -1608,16 +1650,17 @@ class M3UEPGAddon {
             if (this.scheduledRefreshInFlight || providerRefreshInFlight.has(this.cacheKey)) return;
             const sharedLastUpdate = providerRefreshState.get(this.cacheKey) || 0;
             const lastSuccessfulRefresh = Math.max(Number(this.lastUpdate) || 0, sharedLastUpdate);
-            if (lastSuccessfulRefresh && Date.now() - lastSuccessfulRefresh < this.updateInterval) {
-                this.lastUpdate = lastSuccessfulRefresh;
+            const providerDue = (!lastSuccessfulRefresh || Date.now() - lastSuccessfulRefresh >= this.updateInterval) &&
+                Date.now() >= this.providerRefreshRetryAfter;
+            if (!providerDue && !this.isEpgRefreshDue()) {
                 this.startConfiguredCatalogPrefetch();
                 return;
             }
-            this.log.debug('Scheduled provider refresh is due', {
+            if (providerDue) this.log.debug('Scheduled provider refresh is due', {
                 lastSuccessfulRefresh: lastSuccessfulRefresh ? new Date(lastSuccessfulRefresh).toISOString() : null,
                 intervalHours: this.updateInterval / (60 * 60 * 1000)
             });
-            this.scheduledRefreshInFlight = this.updateData(true)
+            this.scheduledRefreshInFlight = this.updateData()
                 .then(() => this.startConfiguredCatalogPrefetch())
                 .catch(error => this.log.warn('Scheduled provider refresh failed', error?.name || 'Error'))
                 .finally(() => {
@@ -1689,6 +1732,16 @@ class M3UEPGAddon {
         };
     }
 
+    async getStreamAsync(id) {
+        const rememberedOwner = this.seriesEpisodeCache.get(id)?.seriesId;
+        const cached = this.getStream(id);
+        if (cached || !String(id).startsWith('iptv_series_ep_') || this.providerName !== 'xtream') return cached;
+        const owner = rememberedOwner || await this.persistentSeriesInfoCache.findSeriesByEpisodeId?.(id);
+        if (!owner || !this.isProviderSeriesCurrent(owner)) return null;
+        await this.ensureSeriesInfo(owner);
+        return this.getStream(id);
+    }
+
     lookupEpisodeById(epId) {
         // Direct-M3U episodes use the playlist index; Xtream episode details are
         // indexed as series information enters the bounded detail cache.
@@ -1730,7 +1783,7 @@ class M3UEPGAddon {
             // Incomplete metadata is retried only after the shared 12-hour interval.
             // A failed/partial refresh keeps any previously saved rating/runtime.
             const refreshed = await omdbMetadata.getByImdbId(imdbId, {
-                refreshIncomplete: true
+                refreshIncomplete: true, refresh: preview.omdbPending === true
             });
             const latestPreview = withoutProviderEpisodeAverage(this.catalogMetaCache.get(String(itemId)));
             const sameIdentity = (!latestPreview?.imdbId || String(latestPreview.imdbId) === String(imdbId)) &&
@@ -1754,7 +1807,8 @@ class M3UEPGAddon {
                 runtime: result.runtime,
                 ...(parseRuntimeMinutes(refreshed?.runtime) !== null ? { runtimeAverage: null } : {}),
                 omdbChecked: result.omdbChecked,
-                omdbCheckedAt: result.omdbCheckedAt
+                omdbCheckedAt: result.omdbCheckedAt,
+                omdbPending: refreshed?.omdbRetryableFailure === true || omdbMetadata.shouldRetryLookup(imdbId)
             };
             // This write updates OMDb fields only. Preserve the catalogue/TMDb
             // refresh timestamp so opening a detail page cannot postpone the next
@@ -1771,7 +1825,20 @@ class M3UEPGAddon {
     async ensureSeriesRuntimeAverage(seriesItem, preview, providerLastUpdate = this.lastUpdate) {
         const id = String(seriesItem?.id || '');
         if (!id || !this.isCatalogItemCurrent(id, providerLastUpdate)) return preview;
-        const current = withoutProviderEpisodeAverage(this.catalogMetaCache.get(id) || preview);
+        let current = withoutProviderEpisodeAverage(this.catalogMetaCache.get(id) || preview);
+        if (catalogMetadataIdentityNextCheckAt(current, seriesItem) <= Date.now()) {
+            current = withoutProviderEpisodeAverage(await this.getCatalogMetaAsync(id, 'series') || current);
+        }
+        if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
+        if (current?._tmdbId && seriesItem.tmdbId && String(current._tmdbId) !== String(seriesItem.tmdbId)) {
+            // Retain known metadata after an unresolved identity check, and record
+            // this runtime attempt rather than repeatedly querying a conflicting ID.
+            if (!hasDerivedSeriesRuntime(current) || !seriesRuntimeAverageNeedsRefresh(current)) return current;
+            return this.persistCatalogMetaIfCurrent(id, { ...current, runtimeAverage: {
+                ...current.runtimeAverage, attemptedAt: Date.now(), attemptPolicyVersion: 1,
+                attemptTmdbId: String(seriesItem.tmdbId)
+            } }, providerLastUpdate);
+        }
         if (!seriesRuntimeAverageNeedsRefresh(current)) return current;
         const key = providerLastUpdate + ':' + id;
         if (this.seriesRuntimeInFlight.has(key)) return this.seriesRuntimeInFlight.get(key);
@@ -1782,7 +1849,9 @@ class M3UEPGAddon {
             try {
                 if (tmdbId) {
                     result = await tmdbMetadata.getSeriesRuntimeMetadata(tmdbId, {
-                        previous, refresh: Boolean(previous?.version === 1)
+                        previous, refresh: Boolean(previous),
+                        refreshAll: Boolean(previous && (previous.policyVersion !== 1 ||
+                            Date.now() - (Number(previous.checkedAt) || 0) >= metadataRefreshInterval()))
                     });
                 }
                 if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
@@ -1792,7 +1861,7 @@ class M3UEPGAddon {
             if (!this.isCatalogItemCurrent(id, providerLastUpdate)) return null;
             const latest = withoutProviderEpisodeAverage(this.catalogMetaCache.get(id) || current);
             if (parseRuntimeMinutes(latest.runtime) !== null && !hasDerivedSeriesRuntime(latest)) return latest;
-            if (tmdbId && latest._tmdbId && String(tmdbId) !== String(latest._tmdbId)) return latest;
+            if (tmdbId && latest._tmdbId && String(tmdbId) !== String(latest._tmdbId)) result = null;
             const now = Date.now();
             let updated;
             if (parseRuntimeMinutes(result?.runtime) !== null && result.complete === true) {
@@ -1816,7 +1885,8 @@ class M3UEPGAddon {
                         attemptedAt: now,
                         attemptPolicyVersion: 1,
                         complete: latest.runtimeAverage?.complete === true,
-                        tmdbId: tmdbId ? String(tmdbId) : null,
+                        tmdbId: latest.runtimeAverage?.tmdbId || (tmdbId ? String(tmdbId) : null),
+                        attemptTmdbId: tmdbId ? String(tmdbId) : null,
                         ...(Array.isArray(result?.seasons) ? { seasons: result.seasons } : {})
                     }
                 };
@@ -1848,6 +1918,10 @@ class M3UEPGAddon {
         if (parseRuntimeMinutes(saved?.runtime) !== null && !derived) return { runtime: saved.runtime };
         if (derived && !seriesRuntimeAverageNeedsRefresh(saved)) {
             return { runtime: saved.runtime, runtimeAverage: saved.runtimeAverage };
+        }
+        if (derived) {
+            const refreshed = await this.ensureSeriesRuntimeAverage(seriesItem, saved, providerLastUpdate);
+            return refreshed ? { runtime: refreshed.runtime, runtimeAverage: refreshed.runtimeAverage } : {};
         }
         const bySeason = new Map(seasonResults.filter(([season, episodes]) => Number(season) > 0 && Array.isArray(episodes)));
         const average = averageEpisodeRuntime([...bySeason.values()].flat());
@@ -2057,7 +2131,7 @@ class M3UEPGAddon {
             // An in-memory hit must still wait for a due missing-field retry or
             // an already-running refresh, just like a preview loaded from disk.
             return forceRefresh || cached === undefined || metadataPending || runtimePending ||
-                getCatalogMetadataWarmupState(cached).retryDue || catalogMetadataNormalRefreshIsDue(cached);
+                getCatalogMetadataWarmupState(cached, item).retryDue;
         });
         let nextIndex = 0;
         const worker = async () => {
@@ -2197,7 +2271,8 @@ class M3UEPGAddon {
         preview = {
             ...preview,
             metadataCheckedAt: previousMetadataCheckedAt || Number(preview?.metadataCheckedAt) || now,
-            missingMetadataCheckedAt: previousMissingMetadataCheckedAt || Number(preview?.missingMetadataCheckedAt) || now
+            missingMetadataCheckedAt: previousMissingMetadataCheckedAt || Number(preview?.missingMetadataCheckedAt) ||
+                previousMetadataCheckedAt || Number(preview?.metadataCheckedAt) || now
         };
         this.catalogMetaCache.set(id, preview);
         if (persist) {
@@ -2254,9 +2329,8 @@ class M3UEPGAddon {
             preview.metadataVersion = 3;
             preview.metadataCheckedAt =
                 Number(previous?.metadataCheckedAt) || Number(detailed.metadataCheckedAt) || Date.now();
-            // A full details request has just checked these fields; keep the normal
-            // metadata freshness clock separate from the incomplete-field retry clock.
-            preview.missingMetadataCheckedAt = Date.now();
+            // Reading cached details is not a new missing-field source attempt.
+            // Catalogue attempts and the OMDb client maintain their own clocks.
             this.cacheCatalogMetaPreview(key, preview, true, providerLastUpdate);
             return true;
         } catch (error) {
@@ -2289,7 +2363,8 @@ class M3UEPGAddon {
             .digest('hex');
         const lastCompleted = this.catalogPrefetchLastCompleted.get(type) || 0;
         if (Date.now() - lastCompleted < refreshInterval &&
-            this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint) return;
+            this.catalogPrefetchLastFingerprint.get(type) === catalogueFingerprint &&
+            Date.now() < (this.catalogPrefetchNextCheckAt.get(type) || 0)) return;
 
         const job = (async () => {
             const startedAt = Date.now();
@@ -2310,12 +2385,14 @@ class M3UEPGAddon {
                 let cachedIncompleteItems = 0;
                 let cachedRetryDeferredItems = 0;
                 const cachedMissingFieldCounts = {};
+                let nextCheckAt = persistedCompletedAt + refreshInterval;
                 // Inspect saved previews before honoring the scan marker. Missing
                 // fields are reported separately from retries held by their backoff.
                 for (const item of items) {
                     const saved = await this.persistentCatalogMetaCache.get(String(item.id));
                     if (!isCurrentGeneration()) return;
-                    const state = getCatalogMetadataWarmupState(saved?.value);
+                    const state = getCatalogMetadataWarmupState(saved?.value, item);
+                    nextCheckAt = Math.min(nextCheckAt, catalogMetadataNextCheckAt(saved?.value, item));
                     if (state.incomplete) {
                         cachedIncompleteItems++;
                         for (const field of state.missingFields) {
@@ -2330,6 +2407,7 @@ class M3UEPGAddon {
                 }
                 if (!cachedCatalogueNeedsRefresh) {
                     this.catalogPrefetchLastCompleted.set(type, persistedCompletedAt);
+                    this.catalogPrefetchNextCheckAt.set(type, nextCheckAt);
                     this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                     this.catalogPrefetchRetryAfter.delete(type);
                     this.log.info('Persistent catalogue metadata scan is current', {
@@ -2348,6 +2426,7 @@ class M3UEPGAddon {
             let incompleteItems = 0;
             let retryDueItems = 0;
             const missingFieldCounts = {};
+            let nextCheckAt = Date.now() + refreshInterval;
             for (let offset = 0; offset < items.length; offset += pageSize) {
                 if (this.disposed || !isCurrentGeneration()) return;
                 const batch = items.slice(offset, Math.min(offset + pageSize, items.length));
@@ -2368,7 +2447,8 @@ class M3UEPGAddon {
                         if (!isCurrentGeneration()) return;
                         cached = saved?.value;
                     }
-                    const state = getCatalogMetadataWarmupState(cached);
+                    const state = getCatalogMetadataWarmupState(cached, item);
+                    nextCheckAt = Math.min(nextCheckAt, catalogMetadataNextCheckAt(cached, item));
                     if (state.incomplete) {
                         incompleteItems++;
                         for (const field of state.missingFields) {
@@ -2393,13 +2473,15 @@ class M3UEPGAddon {
                     completedAt,
                     catalogueCount: items.length,
                     catalogueFingerprint,
-                    version: 4
+                    nextCheckAt,
+                    version: 5
                 }, isCurrentGeneration);
                 // Ensure metadata and its completion marker reach the persistent
                 // volume before reporting the scan as durable.
                 await this.persistentCatalogMetaCache.flush();
                 if (!isCurrentGeneration()) return;
                 this.catalogPrefetchLastCompleted.set(type, completedAt);
+                this.catalogPrefetchNextCheckAt.set(type, nextCheckAt);
                 this.catalogPrefetchLastFingerprint.set(type, catalogueFingerprint);
                 this.catalogPrefetchRetryAfter.delete(type);
                 this.log.info('Persistent catalogue metadata scan complete', {
@@ -2487,6 +2569,7 @@ class M3UEPGAddon {
         const providerLastUpdate = Number(this.lastUpdate) || 0;
         const pendingKey = providerLastUpdate + ':' + key;
         if (!key || !this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
+        const item = findCatalogueItemById(type === 'series' ? this.series : this.movies, key);
         const existingTask = this.catalogMetaInFlight.get(pendingKey);
         if (existingTask) {
             const result = await existingTask;
@@ -2502,6 +2585,7 @@ class M3UEPGAddon {
             const cachedValue = this.catalogMetaCache.get(key) || cached || persisted?.value;
             const normalRefreshDue = catalogMetadataNormalRefreshIsDue(cachedValue, persisted?.savedAt);
             const refreshDue = normalRefreshDue ||
+                catalogMetadataIdentityNextCheckAt(cachedValue, item) <= Date.now() ||
                 omdbMetadataNeedsRefresh(cachedValue) ||
                 catalogMetadataNeedsRefresh(cachedValue);
             if (!refreshDue) return cachedValue;
@@ -2525,7 +2609,8 @@ class M3UEPGAddon {
             const hasPreviousPreview = hasNamedPreview(previousRecord);
             const previousSavedAt = Number(persisted?.savedAt) || 0;
             const normalMetadataRefreshDue = catalogMetadataNormalRefreshIsDue(previousRecord, previousSavedAt);
-            const metadataRefreshDue = normalMetadataRefreshDue ||
+            const identityRefreshDue = catalogMetadataIdentityNextCheckAt(previousRecord, item) <= Date.now();
+            const metadataRefreshDue = normalMetadataRefreshDue || identityRefreshDue ||
                 omdbMetadataNeedsRefresh(previousRecord) ||
                 catalogMetadataNeedsRefresh(previousRecord);
             if (hasPreviousPreview && !metadataRefreshDue) {
@@ -2535,7 +2620,10 @@ class M3UEPGAddon {
 
             const refreshed = await this._getCatalogMetaAsync(
                 id, type,
-                omdbMetadataNeedsRefresh(previousRecord) || catalogMetadataNeedsRefresh(previousRecord)
+                omdbMetadataNeedsRefresh(previousRecord) || catalogMetadataNeedsRefresh(previousRecord),
+                { refreshAll: normalMetadataRefreshDue || identityRefreshDue,
+                    refreshOmdb: previousRecord?.omdbPending === true,
+                    previousMetadata: previousRecord }
             );
             if (!this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
             if (refreshed) {
@@ -2546,10 +2634,10 @@ class M3UEPGAddon {
                 const merged = mergeCatalogMetadataPreservingKnownFields(currentRecord, refreshed);
                 const retainedAfterProviderFailure = Boolean(currentRecord?._tmdbId &&
                     Object.prototype.hasOwnProperty.call(refreshed, '_tmdbId') && !refreshed._tmdbId);
-                merged.metadataCheckedAt = normalMetadataRefreshDue && !retainedAfterProviderFailure
+                merged.metadataCheckedAt = (normalMetadataRefreshDue || identityRefreshDue) && !retainedAfterProviderFailure
                     ? (refreshed.metadataCheckedAt || Date.now())
                     : (Number(currentRecord?.metadataCheckedAt) || previousSavedAt || Date.now());
-                if (normalMetadataRefreshDue) {
+                if (normalMetadataRefreshDue || identityRefreshDue) {
                     // Keeping old complete fields through a provider-only fallback
                     // does not mean TMDb refreshed successfully. Retry after failure
                     // backoff instead of postponing the next attempt for 14 days.
@@ -2563,7 +2651,7 @@ class M3UEPGAddon {
                 // attempt so an incomplete result respects the 12-hour retry window.
                 const retained = {
                     ...(this.catalogMetaCache.get(key) || previousRecord),
-                    ...(normalMetadataRefreshDue ? { metadataRefreshAttemptedAt: Date.now() } : {}),
+                    ...(normalMetadataRefreshDue || identityRefreshDue ? { metadataRefreshAttemptedAt: Date.now() } : {}),
                     missingMetadataCheckedAt: Date.now()
                 };
                 const saved = await this.persistCatalogMetaIfCurrent(key, retained, providerLastUpdate);
@@ -2584,7 +2672,25 @@ class M3UEPGAddon {
         }
     }
 
-    async _getCatalogMetaAsync(id, type, refreshIncompleteMetadata = false) {
+    async getCatalogOmdbMetadata(imdbId, refreshIncomplete, options) {
+        const previous = options.previousMetadata;
+        if (previous && String(previous.imdbId || '') === String(imdbId) &&
+            !options.refreshAll && !omdbMetadataNeedsRefresh(previous)) {
+            // A due artwork/description retry must not bypass an independent
+            // recent OMDb attempt, including after its process cache was lost.
+            return {
+                imdbId, imdbRating: previous.imdbRating,
+                runtime: hasDerivedSeriesRuntime(previous) ? undefined : previous.runtime,
+                omdbChecked: previous.omdbChecked, omdbCheckedAt: previous.omdbCheckedAt,
+                omdbPending: previous.omdbPending === true
+            };
+        }
+        return omdbMetadata.getByImdbId(imdbId, {
+            refreshIncomplete, refresh: options.refreshAll === true || options.refreshOmdb === true
+        });
+    }
+
+    async _getCatalogMetaAsync(id, type, refreshIncompleteMetadata = false, options = {}) {
         // Discover cards do not need episode lists, trailers, or logo-image lookups.
         // Fetch only the fields displayed in the panel and the credits needed for cast/directors.
         if (type === 'series' || id.startsWith('iptv_series_')) {
@@ -2592,7 +2698,7 @@ class M3UEPGAddon {
             if (!seriesItem) return null;
             const tmdbId = seriesItem.tmdbId || null;
             const tmdb = tmdbId ? await tmdbMetadata.getSeriesCatalogMetadata(tmdbId, {
-                refresh: refreshIncompleteMetadata
+                refresh: refreshIncompleteMetadata || options.refreshAll === true
             }) : null;
             if (!tmdb) {
                 return {
@@ -2605,9 +2711,7 @@ class M3UEPGAddon {
                     omdbPending: false
                 };
             }
-            const omdb = tmdb.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, {
-                refreshIncomplete: refreshIncompleteMetadata
-            }) : null;
+            const omdb = tmdb.imdbId ? await this.getCatalogOmdbMetadata(tmdb.imdbId, refreshIncompleteMetadata, options) : null;
             return {
                 id: seriesItem.id,
                 type: 'series',
@@ -2629,7 +2733,8 @@ class M3UEPGAddon {
                 imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
                 omdbChecked: omdb?.omdbChecked === true,
                 omdbCheckedAt: omdb?.omdbCheckedAt,
-                omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
+                omdbPending: Boolean(omdb?.omdbPending || omdb?.omdbRetryableFailure ||
+                    (tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId))),
                 cast: tmdb.cast,
                 tmdbRating: tmdb.rating,
                 trailers: [],
@@ -2649,8 +2754,8 @@ class M3UEPGAddon {
         if (!tmdbId && this.providerName === 'xtream' && !this.config.xtreamUseM3U) {
             tmdbId = await this.resolveMovieTmdbId(id, item, providerModule);
         }
-        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId, { refresh: refreshIncompleteMetadata });
-        const omdb = tmdb?.imdbId ? await omdbMetadata.getByImdbId(tmdb.imdbId, { refreshIncomplete: refreshIncompleteMetadata }) : null;
+        const tmdb = await tmdbMetadata.getMovieCatalogMetadata(tmdbId, { refresh: refreshIncompleteMetadata || options.refreshAll === true });
+        const omdb = tmdb?.imdbId ? await this.getCatalogOmdbMetadata(tmdb.imdbId, refreshIncompleteMetadata, options) : null;
         if (!tmdb) {
             const fallback = this.getDetailedMeta(id);
             return fallback ? {
@@ -2681,7 +2786,8 @@ class M3UEPGAddon {
             imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
             omdbChecked: omdb?.omdbChecked === true,
             omdbCheckedAt: omdb?.omdbCheckedAt,
-            omdbPending: Boolean(tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId)),
+            omdbPending: Boolean(omdb?.omdbPending || omdb?.omdbRetryableFailure ||
+                (tmdb.imdbId && omdbMetadata.shouldRetryLookup(tmdb.imdbId))),
             director: tmdb.director,
             cast: tmdb.cast,
             tmdbRating: tmdb.rating,
@@ -2877,7 +2983,7 @@ async function createAddon(config) {
         // IMPORTANT: We must ensure 'manifest' object has 'catalogs[].genres' populated BEFORE creating builder
         const builder = new addonBuilder(manifest); 
 
-        builder.defineCatalogHandler(async (args) => {
+        const buildCatalogPage = async (args) => {
             const start = Date.now();
             try {
                 // Background update
@@ -3072,21 +3178,23 @@ async function createAddon(config) {
                 console.error('[CATALOG] Error', e && e.name ? e.name : 'Error');
                 return { metas: [] };
             }
+        };
+
+        builder.defineCatalogHandler(async (args) => {
+            // A generation change discards old lookups safely, but the response
+            // must also be rebuilt so those discarded results cannot yield sparse cards.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const generation = addonInstance.lastUpdate;
+                const response = await buildCatalogPage(args);
+                if (generation === addonInstance.lastUpdate) return response;
+            }
+            throw new Error('Provider data changed during catalogue loading; retry the request');
         });
 
         builder.defineStreamHandler(async ({ type, id }) => {
             try {
-                if (id.startsWith('iptv_series_ep_')) {
-                    const stream = addonInstance.getStream(id);
-                    if (!stream) return { streams: [] };
-                    if (addonInstance.config.debug) {
-                    }
-                    return { streams: [stream] };
-                }
-                const stream = addonInstance.getStream(id);
+                const stream = await addonInstance.getStreamAsync(id);
                 if (!stream) return { streams: [] };
-                if (addonInstance.config.debug) {
-                }
                 return { streams: [stream] };
             } catch (e) {
                 console.error('[STREAM] Error', e && e.name ? e.name : 'Error');
@@ -3288,7 +3396,9 @@ module.exports.disposeAddonInterface = async function disposeAddonInterface(ifac
     }
 };
 module.exports.flushAddonDisposals = async function flushAddonDisposals() {
-    await Promise.allSettled([...addonDisposals.values()]);
+    const results = await Promise.allSettled([...addonDisposals.values()]);
+    const failures = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (failures.length) throw new AggregateError(failures, 'Addon disposal failed');
 };
 module.exports.M3UEPGAddon = M3UEPGAddon;
 module.exports.normalizeGenre = normalizeGenre;

@@ -23,6 +23,9 @@ function catalogStore(values) {
 async function testProviderRefreshAfterSdkBuildUpdatesLiveManifestAndSnapshot() {
     const proto = M3UEPGAddon.prototype;
     for (const providerName of ["direct", "xtream"]) {
+        const originalNow = Date.now;
+        let now = originalNow();
+        Date.now = () => now;
         const provider = require("../src/js/providers/" + providerName + "Provider");
         const original = {
             loadFromCache: proto.loadFromCache,
@@ -118,14 +121,17 @@ async function testProviderRefreshAfterSdkBuildUpdatesLiveManifestAndSnapshot() 
             await instance.updateData(true);
             for (const key of ["channels", "movies", "series", "epgData", "lastUpdate"]) assert.strictEqual(instance[key], previous[key]);
             assert.strictEqual(JSON.stringify(iface.manifest), previous.manifest);
-            assert.strictEqual(snapshots.length, 1, "a failed request must not replace the saved snapshot");
+            assert.strictEqual(snapshots.length, 2, "a failed request records retry timing with the restored snapshot");
+            assert.strictEqual(snapshots[1].lastUpdate, previous.lastUpdate);
+            assert.deepStrictEqual(snapshots[1].channels, previous.channels);
             assert.strictEqual(logs.filter(log => log.level === "error").length, 1);
 
             fail = false;
             clearGenres = true;
+            now = instance.providerRefreshRetryAfter;
             await instance.updateData(true);
             assert.ok(instance.lastUpdate > previous.lastUpdate, "a later successful refresh must recover normally");
-            assert.strictEqual(snapshots.length, 2);
+            assert.strictEqual(snapshots.length, 3);
             assert.deepStrictEqual(options("iptv_movies"), [], "removed genre options must not remain in the live manifest");
             assert.deepStrictEqual(options("iptv_series"), []);
             assert.strictEqual(logs.filter(log => log.message === "Provider data refresh complete").length, 2);
@@ -136,6 +142,7 @@ async function testProviderRefreshAfterSdkBuildUpdatesLiveManifestAndSnapshot() 
             proto.startConfiguredCatalogPrefetch = original.startConfiguredCatalogPrefetch;
             proto.startScheduledRefresh = original.startScheduledRefresh;
             provider.fetchData = original.fetchData;
+            Date.now = originalNow;
         }
     }
 }

@@ -163,7 +163,7 @@ async function getByImdbId(value, options = {}) {
     const cached = cache.get(imdbId);
     const refreshIncomplete = options.refreshIncomplete === true &&
       cached && (!cached.imdbRating || !cached.runtime);
-    if (!refreshIncomplete) {
+    if (options.refresh !== true && !refreshIncomplete) {
       retryableFailures.delete(imdbId);
       return cached;
     }

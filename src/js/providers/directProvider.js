@@ -71,7 +71,7 @@ async function mapWithConcurrency(items, concurrency, mapper) {
     return results;
 }
 
-async function fetchData(addonInstance) {
+async function fetchData(addonInstance, { skipEpg = false } = {}) {
     const { config } = addonInstance;
     const { m3uUrl } = config;
 
@@ -82,7 +82,7 @@ async function fetchData(addonInstance) {
     addonInstance.series = [];
     addonInstance.directSeriesEpisodeIndex = new Map(); // reset
     addonInstance.directSeriesEpisodeById = new Map(); // reset exact episode lookup index
-    addonInstance.epgData = {};
+    if (!skipEpg) addonInstance.epgData = {};
     addonInstance.epgRefreshFailed = false;
 
     // Fetch playlist
@@ -173,6 +173,13 @@ async function fetchData(addonInstance) {
         addonInstance.series = Array.from(seriesMap.values());
     }
 
+    if (!skipEpg) await fetchEpg(addonInstance);
+}
+
+async function fetchEpg(addonInstance) {
+    const { config } = addonInstance;
+    addonInstance.epgData = {};
+    addonInstance.epgRefreshFailed = false;
     // EPG sources are merged by XMLTV channel ID; an unavailable source does not disable the others.
     if (config.enableEpg) {
         const epgSources = [...new Set([...(config.epgUrl ? [config.epgUrl] : []), ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
@@ -238,6 +245,7 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
 
 module.exports = {
     fetchData,
+    fetchEpg,
     fetchSeriesInfo,
     rebuildDirectEpisodeIndexes
 };

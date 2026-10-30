@@ -47,6 +47,8 @@ class PersistentAddonDataCache {
                 !Array.isArray(parsed.data.series) ||
                 !parsed.data.epgData || typeof parsed.data.epgData !== "object" ||
                 !Number.isFinite(parsed.data.lastUpdate) ||
+                ['lastEpgUpdate', 'epgRefreshAttemptedAt', 'providerRefreshRetryAfter'].some(key =>
+                    parsed.data[key] !== undefined && (!Number.isFinite(parsed.data[key]) || parsed.data[key] < 0)) ||
                 (parsed.data.directSeriesEpisodes !== undefined &&
                     (!parsed.data.directSeriesEpisodes || typeof parsed.data.directSeriesEpisodes !== "object" ||
                         Array.isArray(parsed.data.directSeriesEpisodes))) ||
@@ -70,6 +72,8 @@ class PersistentAddonDataCache {
         if (!data || !Array.isArray(data.channels) || !Array.isArray(data.movies) ||
             !Array.isArray(data.series) || !data.epgData || typeof data.epgData !== "object" ||
             !Number.isFinite(data.lastUpdate) ||
+            ['lastEpgUpdate', 'epgRefreshAttemptedAt', 'providerRefreshRetryAfter'].some(key =>
+                data[key] !== undefined && (!Number.isFinite(data[key]) || data[key] < 0)) ||
             (data.directSeriesEpisodes !== undefined &&
                 (!data.directSeriesEpisodes || typeof data.directSeriesEpisodes !== "object" ||
                     Array.isArray(data.directSeriesEpisodes)))) {

@@ -88,10 +88,10 @@ async function testFailedGenreBuildDoesNotPersistProviderRefresh() {
     const previousLastUpdate = Date.now() - addon.updateInterval - 1000;
     addon.channels = previousChannels;
     addon.lastUpdate = previousLastUpdate;
-    let persisted = false;
+    let persisted = null;
     addon.log = { error() {} };
     addon.pruneRemovedCatalogState = async () => {};
-    addon.saveToCache = async () => { persisted = true; };
+    addon.saveToCache = async () => { persisted = addon.providerSnapshot(); };
     addon.buildGenresInManifest = () => { throw new TypeError("simulated genre build failure"); };
 
     provider.fetchData = async refreshed => {
@@ -106,7 +106,9 @@ async function testFailedGenreBuildDoesNotPersistProviderRefresh() {
         provider.fetchData = originalFetchData;
     }
 
-    assert.strictEqual(persisted, false, "a refresh that fails genre building must not save its new provider snapshot");
+    assert.strictEqual(persisted.channels, previousChannels, "only the restored snapshot and retry state may be saved after failure");
+    assert.strictEqual(persisted.lastUpdate, previousLastUpdate);
+    assert.ok(persisted.providerRefreshRetryAfter > Date.now());
     assert.strictEqual(addon.channels, previousChannels, "the last-known-good in-memory catalogue must be restored");
     assert.strictEqual(addon.lastUpdate, previousLastUpdate, "a failed refresh must leave its prior timestamp intact");
 }
@@ -700,6 +702,7 @@ async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval(
         .update(items.map(item => String(item?.id || "")).join("\n"))
         .digest("hex");
     addon.catalogPrefetchLastCompleted.set("movie", Date.now());
+    addon.catalogPrefetchNextCheckAt.set("movie", Date.now() + 12 * 60 * 60 * 1000);
     addon.catalogPrefetchLastFingerprint.set("movie", fingerprint(addon.movies));
 
     let enriched = [];
@@ -1031,6 +1034,7 @@ async function main() {
         ...require("./tests/metadataRefresh.test"),
         ...require("./tests/seriesRuntime.test"),
         ...require("./tests/seriesMetadataPolicy.test"),
+        ...require("./tests/refreshAuditFixes.test"),
     ];
 
     for (const test of tests) {

@@ -40,7 +40,7 @@ function assertCatalogueIdentifiers(items, idField, label) {
   }
 }
 
-async function fetchData(addonInstance) {
+async function fetchData(addonInstance, { skipEpg = false } = {}) {
   const { config } = addonInstance;
   const {
     xtreamUrl,
@@ -57,7 +57,7 @@ async function fetchData(addonInstance) {
   addonInstance.channels = [];
   addonInstance.movies = [];
   if (config.includeSeries !== false) addonInstance.series = [];
-  addonInstance.epgData = {};
+  if (!skipEpg) addonInstance.epgData = {};
   addonInstance.epgRefreshFailed = false;
 
   if (xtreamUseM3U) {
@@ -261,6 +261,14 @@ async function fetchData(addonInstance) {
     }
   }
 
+  if (!skipEpg) await fetchEpg(addonInstance);
+}
+
+async function fetchEpg(addonInstance) {
+  const { config } = addonInstance;
+  const { xtreamUrl, xtreamUsername, xtreamPassword } = config;
+  addonInstance.epgData = {};
+  addonInstance.epgRefreshFailed = false;
   // Merge the selected primary XMLTV feed with any additional feeds.
   if (config.enableEpg) {
     const customEpgUrl = config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
@@ -447,13 +455,23 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
       };
     }
     const videos = [];
+    if (!Object.prototype.hasOwnProperty.call(infoJson, "episodes") || !infoJson.episodes ||
+        typeof infoJson.episodes !== "object") {
+      throw new Error("Invalid Xtream series episode listing");
+    }
     const seriesInfo = infoJson.info && typeof infoJson.info === "object" ? infoJson.info : {};
     const rawTmdbId = seriesInfo.tmdb || seriesInfo.tmdb_id || infoJson.tmdb || infoJson.tmdb_id || null;
     const tmdbId = normalizeTmdbId(rawTmdbId);
-    const episodesObj = infoJson.episodes || {};
+    const episodesObj = infoJson.episodes;
     for (const [seasonKey, seasonEpisodes] of Object.entries(episodesObj)) {
-      if (!Array.isArray(seasonEpisodes)) continue;
+      if (!Array.isArray(seasonEpisodes)) throw new Error("Invalid Xtream series season group");
+      assertCatalogueIdentifiers(seasonEpisodes, "id", "series episodes");
       for (const ep of seasonEpisodes) {
+        const season = Number(ep.season ?? seasonKey);
+        const episode = Number(ep.episode_num ?? ep.episode ?? 0);
+        if (!Number.isSafeInteger(season) || season < 0 || !Number.isSafeInteger(episode) || episode < 0) {
+          throw new Error("Invalid Xtream episode numbering");
+        }
         const epId = ep.id;
         const container = ep.container_extension || "mp4";
         const url = `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
@@ -474,8 +492,8 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
         videos.push({
           id: `iptv_series_ep_${epId}`,
           title: ep.title || `Episode ${ep.episode_num}`,
-          season: Number.parseInt(ep.season ?? seasonKey, 10),
-          episode: Number.parseInt(ep.episode_num ?? ep.episode ?? 0, 10),
+          season,
+          episode,
           released: releasedISO,
           thumbnail: ep.info?.movie_image || ep.info?.episode_image || ep.info?.cover_big || null,
           ...(runtimeMinutes !== null ? {
@@ -509,6 +527,7 @@ function cryptoHash(text) {
 
 module.exports = {
   fetchData,
+  fetchEpg,
   fetchMovieInfo,
   fetchSeriesInfo,
   normalizeTmdbId,

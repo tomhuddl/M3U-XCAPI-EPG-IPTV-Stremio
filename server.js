@@ -907,15 +907,24 @@ async function shutdown(signal) {
   shutdownPromise = (async () => {
     await closePromise;
     const interfaces = interfaceCache.entries().map(([, iface]) => iface);
-    await Promise.allSettled(interfaces.map((iface) => createAddon.disposeAddonInterface(iface)));
-    await createAddon.flushAddonDisposals();
+    const results = await Promise.allSettled(interfaces.map((iface) => createAddon.disposeAddonInterface(iface)));
+    results.push(...await Promise.allSettled([createAddon.flushAddonDisposals()]));
     interfaceCache.clear();
     await createAddon.closeRedisClient();
     await closePromise;
     clearTimeout(forceCloseTimer);
+    const failures = results.filter(result => result.status === "rejected");
+    if (failures.length) {
+      const error = new AggregateError(failures.map(result => result.reason), "Persistent cache flush failed");
+      error.failedCaches = [...new Set(failures.flatMap(result => result.reason?.failedCaches || []))];
+      throw error;
+    }
     logAt("info", "[SHUTDOWN] Persistent caches flushed");
   })().catch((error) => {
-    logAt("error", "[SHUTDOWN] Could not finish graceful shutdown:", error?.name || "Error");
+    clearTimeout(forceCloseTimer);
+    logAt("error", "[SHUTDOWN] Persistent cache flush incomplete", {
+      errorName: error?.name || "Error", failedCaches: error?.failedCaches || []
+    });
   });
   return shutdownPromise;
 }

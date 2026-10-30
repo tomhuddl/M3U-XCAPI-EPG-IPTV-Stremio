@@ -247,7 +247,7 @@ async function testWarmupReportsIncompleteMetadataSeparatelyFromDeferredRetries(
     assert.deepStrictEqual(summary.details.missingFieldCounts, { description: 1 });
     assert.strictEqual(apiCalls, 0, "a recently checked missing description must respect retry backoff");
     assert.deepStrictEqual(warnings, []);
-    assert.strictEqual(store.entries.get("__catalog_prefetch_status__:series").value.version, 4);
+    assert.strictEqual(store.entries.get("__catalog_prefetch_status__:series").value.version, 5);
 }
 
 async function testLateSeriesDetailsCannotRepopulateANewerProviderGeneration() {

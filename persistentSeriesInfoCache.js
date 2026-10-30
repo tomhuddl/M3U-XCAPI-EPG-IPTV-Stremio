@@ -49,6 +49,7 @@ class PersistentSeriesInfoCache {
         );
 
         this.entries = new Map();
+        this.episodeOwners = null;
         this.loadPromise = null;
         this.writePromise = null;
         this.writeTimer = null;
@@ -94,6 +95,7 @@ class PersistentSeriesInfoCache {
         for (const [key, entry] of this.entries) {
             if (!entry || entry.savedAt < cutoff) {
                 this.entries.delete(key);
+                this.episodeOwners = null;
                 this.journal?.mark(key, null);
                 this.dirty = true;
             }
@@ -109,6 +111,7 @@ class PersistentSeriesInfoCache {
             }
             if (oldestKey === undefined) break;
             this.entries.delete(oldestKey);
+            this.episodeOwners = null;
             this.journal?.mark(oldestKey, null);
             this.dirty = true;
         }
@@ -122,6 +125,7 @@ class PersistentSeriesInfoCache {
         const age = Date.now() - entry.savedAt;
         if (age < 0 || age > this.staleRetentionMs) {
             this.entries.delete(String(seriesId));
+            this.episodeOwners = null;
             this.journal.mark(String(seriesId), null);
             this.dirty = true;
             this.scheduleWrite();
@@ -146,6 +150,7 @@ class PersistentSeriesInfoCache {
             value
         };
         this.entries.set(key, entry);
+        this.episodeOwners = null;
         this.journal.mark(key, entry);
         this.prune();
         this.dirty = true;
@@ -165,6 +170,7 @@ class PersistentSeriesInfoCache {
             const changedIdentity = invalidated.has(key) && entry.providerLastUpdate !== currentGeneration;
             if (!keep.has(key) || changedIdentity) {
                 this.entries.delete(key);
+                this.episodeOwners = null;
                 this.journal.mark(key, null);
                 changed = true;
             }
@@ -174,6 +180,27 @@ class PersistentSeriesInfoCache {
             this.journal.forceCompact = true;
             this.scheduleWrite();
         }
+    }
+
+    async findSeriesByEpisodeId(episodeId) {
+        if (!this.enabled) return null;
+        await this.init();
+        if (!this.episodeOwners) {
+            const owners = new Map();
+            const now = Date.now();
+            for (const [seriesId, entry] of this.entries) {
+                const age = now - entry.savedAt;
+                if (age < 0 || age > this.staleRetentionMs) continue;
+                for (const video of entry.value.videos) {
+                    if (typeof video?.id === 'string' && video.url) owners.set(video.id, seriesId);
+                }
+            }
+            this.episodeOwners = owners;
+        }
+        const owner = this.episodeOwners.get(String(episodeId));
+        if (!owner) return null;
+        // Recheck retention even when the index has been reused for a long time.
+        return await this.get(owner, 0) ? owner : null;
     }
 
     scheduleWrite(delay = 500) {

@@ -80,6 +80,10 @@ async function testRepeatedSeriesFailuresDoNotConfirmProviderRemovals() {
         get_series: () => failSeries ? jsonResponse(null, 503) : jsonResponse([])
     });
     await withProviderFetch("xtream", fetchMock, async () => {
+        const originalNow = Date.now;
+        let now = originalNow();
+        Date.now = () => now;
+        try {
         const addon = new M3UEPGAddon(xtreamConfig("refresh-failure-guard"));
         addon.log = quietLog;
         addon.channels = [{ id: "iptv_live_1", name: "Live channel" }];
@@ -101,14 +105,17 @@ async function testRepeatedSeriesFailuresDoNotConfirmProviderRemovals() {
         assert.strictEqual(addon.lastUpdate, originalUpdate, "failed refreshes must remain overdue");
         assert.deepStrictEqual(addon.pendingRemovalCandidates, {});
         assert.strictEqual(pruned, 0, "failures must not prune metadata or episode details");
-        assert.strictEqual(saves, 0, "a failed provider response must not replace the saved snapshot");
+        assert.strictEqual(saves, 1, "the restored snapshot records retry timing once; rapid requests must join its backoff");
 
         failSeries = false;
+        now = addon.providerRefreshRetryAfter;
         await addon.updateData(true);
         assert.strictEqual(addon.series, originalSeries, "one valid empty observation must still trigger the large-drop guard");
+        now = addon.providerRefreshRetryAfter;
         await addon.updateData(true);
         assert.deepStrictEqual(addon.series, [], "matching valid empty lists may confirm an actual provider removal");
         assert.strictEqual(pruned, 1);
+        } finally { Date.now = originalNow; }
     });
 }
 

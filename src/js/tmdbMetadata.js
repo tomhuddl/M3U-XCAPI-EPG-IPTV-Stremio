@@ -18,7 +18,6 @@ const negativeCache = new LRUCache({
 const pending = new Map();
 const runtimePending = new Map();
 const SERIES_DETAILS_QUERY = "?language=en-GB&append_to_response=aggregate_credits,images,external_ids&include_image_language=en,null";
-const COMPLETE_SEASON_RUNTIME_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const PARTIAL_SEASON_RUNTIME_TTL_MS = parsePositiveInteger(process.env.OMDB_MISSING_DATA_RETRY_MS, 12 * 60 * 60 * 1000, 60 * 60 * 1000, 7 * 24 * 60 * 60 * 1000);
 const MAX_MAIN_CAST = 4;
 
@@ -360,7 +359,7 @@ async function getMovieMetadata(tmdbId) {
   // Only trailers need a separate request; the shared request cache deduplicates it
   // when another detail request for the same movie is already in progress.
   const [details, videos] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB&append_to_response=credits,images&include_image_language=en,null"),
+    request("/movie/" + id + "?language=en-GB&append_to_response=credits,images,external_ids&include_image_language=en,null"),
     request("/movie/" + id + "/videos?language=en-GB"),
   ]);
   return mapMovieMetadata(details, details?.credits, videos, details?.images);
@@ -455,10 +454,10 @@ function validSeasonRuntimeSummary(value, now) {
     Number.isFinite(value.checkedAt) && value.checkedAt > 0 && value.checkedAt <= now;
 }
 
-async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false } = {}) {
+async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false, refreshAll = false } = {}) {
   const id = validTmdbId(tmdbId);
   if (!id || !tmdbConfigured()) return null;
-  const pendingKey = id + (refresh ? ":refresh" : ":cached");
+  const pendingKey = id + (refreshAll ? ":full" : refresh ? ":refresh" : ":cached");
   if (runtimePending.has(pendingKey)) return runtimePending.get(pendingKey);
   const task = (async () => {
     // Share the existing series-details response with catalogue/detail requests.
@@ -501,8 +500,9 @@ async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = fal
         const { season, episodeCount } = seasons[index];
         const saved = priorSeasons.get(season);
         const durationTtl = saved?.runtimeCount >= (saved?.eligibleEpisodeCount ?? saved?.episodeCount)
-          ? COMPLETE_SEASON_RUNTIME_TTL_MS : PARTIAL_SEASON_RUNTIME_TTL_MS;
-        if (saved?.complete === true && episodeCount !== null && saved.episodeCount === episodeCount &&
+          ? parsePositiveInteger(process.env.CATALOG_METADATA_REFRESH_MS, 14 * 24 * 60 * 60 * 1000,
+              60 * 60 * 1000, 90 * 24 * 60 * 60 * 1000) : PARTIAL_SEASON_RUNTIME_TTL_MS;
+        if (!refreshAll && saved?.complete === true && episodeCount !== null && saved.episodeCount === episodeCount &&
             now - saved.checkedAt < durationTtl) {
           summaries[index] = { ...saved };
           continue;
@@ -514,7 +514,7 @@ async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = fal
         // Use the same cached endpoint as getSeasonEpisodes, but do not build
         // thumbnails, credits or full episode metadata for a runtime-only pass.
         const data = await request("/tv/" + id + "/season/" + season + "?language=en-GB", {
-          refresh: Boolean(refresh || saved)
+          refresh: Boolean(refreshAll || refresh || saved)
         });
         if (!data || !Array.isArray(data.episodes)) {
           summaries[index] = saved ? { ...saved, complete: false } : {

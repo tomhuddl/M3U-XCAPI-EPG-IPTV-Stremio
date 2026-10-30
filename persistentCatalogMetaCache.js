@@ -1,6 +1,7 @@
 "use strict";
 
 const path = require("path");
+const { isDeepStrictEqual } = require("util");
 const { logAt } = require("./logger");
 const PersistentMapJournal = require("./persistentMapJournal");
 
@@ -139,6 +140,7 @@ class PersistentCatalogMetaCache {
         await this.init();
         if (typeof canStore === "function" && !canStore()) return;
         const normalizedKey = String(key);
+        if (isDeepStrictEqual(this.entries.get(normalizedKey)?.value, value)) return;
         const entry = { savedAt: Date.now(), value };
         this.entries.set(normalizedKey, entry);
         this.journal.mark(normalizedKey, entry);
