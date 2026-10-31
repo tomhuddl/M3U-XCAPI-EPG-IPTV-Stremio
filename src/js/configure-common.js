@@ -14,13 +14,41 @@
     const PROGRESS_ESTIMATE_MS = 45000;
 
     let pollTimer      = null;
-    let autoOpened     = false;
     let manifestUrl    = '';
     let stremioUrl     = '';
     let startTime      = 0;
     let manualPhase    = false;
     let baselinePct    = 0;
     let ready          = false;
+    let generation = 0;
+    let previousFocus = null;
+    const activeRequests = new Set();
+    let retainedConfig = {};
+
+    function createRequestController() {
+        const controller = new AbortController();
+        activeRequests.add(controller);
+        return controller;
+    }
+    function cancelRequests() {
+        generation++;
+        if (pollTimer) clearTimeout(pollTimer);
+        pollTimer = null;
+        for (const controller of activeRequests) controller.abort();
+        activeRequests.clear();
+    }
+    async function fetchJson(url, options = {}, timeoutMs = 15000) {
+        const startedGeneration = generation;
+        const controller = createRequestController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const response = await fetch(url, { ...options, signal: controller.signal });
+            const payload = await response.json();
+            if (startedGeneration !== generation) throw Object.assign(new Error('Setup cancelled'), { name: 'AbortError' });
+            return { response, payload };
+        } finally { clearTimeout(timeout); activeRequests.delete(controller); }
+    }
+
 
     /* -------- Utility UI helpers -------- */
 
@@ -52,22 +80,27 @@
     }
 
     function showOverlay(isManualPrePhase = false) {
+        cancelRequests();
+        previousFocus = document.activeElement;
         manualPhase = isManualPrePhase;
         if (overlay) overlay.classList.remove('hidden');
         setProgress(0, 'Initializing…');
         statusDetails && (statusDetails.textContent = '');
-        autoOpened = false;
         ready = false;
-        disableActionButtons(); // ALWAYS ensure disabled on open
+        disableActionButtons();
+        document.getElementById("closeSetupBtn")?.focus?.();
     }
 
     function hideOverlay() {
+        cancelRequests();
+        ready = false;
         if (overlay) overlay.classList.add('hidden');
-        if (pollTimer) clearTimeout(pollTimer);
+        previousFocus?.focus?.();
     }
 
     function setProgress(pct, label) {
-        if (progressBar) progressBar.style.width = Math.min(100, pct) + '%';
+        pct = Math.max(0, Math.min(100, Number(pct) || 0));
+        if (progressBar) progressBar.style.width = pct + '%';
         if (progressText) progressText.textContent = `${Math.round(pct)}%`;
         if (label) loaderMessage.textContent = label;
     }
@@ -90,78 +123,52 @@
 
     /* -------- Polling logic -------- */
 
-    function attemptPoll() {
-        if (manualPhase) return; // Pre-flight still running client-side
-        if (ready) return;
-
+    async function attemptPoll(expectedGeneration = generation) {
+        if (manualPhase || ready || expectedGeneration !== generation) return;
         const elapsed = Date.now() - startTime;
-
-        // Synthetic progress up to baseline + 95%
-        if (progressBar && parseFloat(progressBar.style.width) < baselinePct + 95) {
-            const synthetic = baselinePct + Math.min(95, (elapsed / PROGRESS_ESTIMATE_MS) * 95);
-            setProgress(synthetic, progressMessage(elapsed));
-        }
-
-        fetch(manifestUrl + '?_=' + Date.now(), { cache: 'no-store' })
-            .then(r => r.ok ? r.json() : Promise.reject(r.status))
-            .then(json => {
-                if (json && json.id) {
-                    ready = true;
-                    setProgress(100, 'Ready');
-                    appendDetail('Manifest ready.');
-                    enableActionButtons(); // ENABLE ONLY HERE
-                    // Inject a Close button (success case) if not already present
-                    try {
-                        const status = document.getElementById('statusDetails');
-                        if (status && !document.getElementById('successCloseBtn')) {
-                            const btn = document.createElement('button');
-                            btn.id = 'successCloseBtn';
-                            btn.textContent = 'Close';
-                            btn.className = 'btn secondary';
-                            btn.style.marginTop = '14px';
-                            btn.addEventListener('click', hideOverlay);
-                            status.parentElement.appendChild(btn);
-                        }
-                    } catch (e) { /* ignore DOM injection errors */ }
-                    if (!autoOpened) {
-                        autoOpened = true;
-                        // Do not force-open if user might want to copy first.
-                        // To auto-open uncomment next line:
-                        // window.location.href = stremioUrl;
-                    }
-                    if (pollTimer) clearTimeout(pollTimer);
-                    return;
-                }
-                scheduleNext(elapsed);
-            })
-            .catch(() => scheduleNext(elapsed));
-    }
-
-    function scheduleNext(elapsed) {
-        if (ready) return;
-        if (elapsed > MAX_WAIT_MS) {
-            loaderMessage.textContent = 'Taking longer than expected.';
-            appendDetail('Timeout waiting for manifest. You may retry or open later.');
-            setProgress(100, 'Timeout');
-            // Still allow user to copy / open after timeout
-            enableActionButtons();
+        if (elapsed >= MAX_WAIT_MS) {
+            setProgress(100, 'Taking longer than expected. Close and retry when ready.');
+            appendDetail('Manifest is not ready yet.');
             return;
         }
-        pollTimer = setTimeout(attemptPoll, POLL_INTERVAL_MS);
+        setProgress(baselinePct + Math.min(95 - baselinePct, elapsed / PROGRESS_ESTIMATE_MS * (95 - baselinePct)), progressMessage(elapsed));
+        try {
+            const { response, payload } = await fetchJson(manifestUrl + '?_=' + Date.now(),
+                { cache: 'no-store' }, Math.min(10000, MAX_WAIT_MS - elapsed));
+            if (expectedGeneration !== generation) return;
+            if (response.ok && payload?.id) {
+                ready = true;
+                setProgress(100, 'Ready');
+                appendDetail('Manifest ready.');
+                enableActionButtons();
+                return;
+            }
+        } catch { /* Retry only the current setup attempt. */ }
+        if (expectedGeneration === generation && !ready) {
+            const remaining = MAX_WAIT_MS - (Date.now() - startTime);
+            if (remaining <= 0) return attemptPoll(expectedGeneration);
+            pollTimer = setTimeout(() => attemptPoll(expectedGeneration), Math.min(POLL_INTERVAL_MS, remaining));
+        }
     }
 
     function startPolling(startPct = 50) {
-        baselinePct = startPct;
+        if (pollTimer) clearTimeout(pollTimer);
+        baselinePct = Math.max(0, Math.min(95, startPct));
         manualPhase = false;
+        ready = false;
         startTime = Date.now();
-        disableActionButtons(); // Ensure still disabled when entering polling
-        attemptPoll();
+        disableActionButtons();
+        attemptPoll(generation);
     }
 
     /* -------- Clipboard / events -------- */
 
     function copyManifest() {
         if (!manifestUrl || copyBtn.disabled) return;
+        if (!navigator.clipboard?.writeText) {
+            window.prompt('Copy this manifest URL:', manifestUrl);
+            return;
+        }
         navigator.clipboard.writeText(manifestUrl)
             .then(() => {
                 const old = copyBtn.textContent;
@@ -180,17 +187,23 @@
         window.location.href = stremioUrl;
     }
 
+    document.getElementById('closeSetupBtn')?.addEventListener('click', hideOverlay);
+    document.addEventListener?.('keydown', event => {
+        if (!overlay || overlay.classList.contains('hidden')) return;
+        if (event.key === 'Escape') { event.preventDefault(); hideOverlay(); }
+        if (event.key === 'Tab') {
+            const controls = [...overlay.querySelectorAll('button:not([disabled]), a[href], input, [tabindex="0"]')]
+                .filter(element => element.getClientRects().length);
+            if (!controls.length) return;
+            const first = controls[0], last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+            else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+    });
     if (copyBtn) copyBtn.addEventListener('click', copyManifest);
     if (openBtn) openBtn.addEventListener('click', openInStremio);
 
     /* -------- Token / URL builder -------- */
-
-    function quickEpgStats(xml) {
-        const pattern = /<programme\s/gi;
-        let programmes = 0;
-        while (pattern.exec(xml) !== null) programmes += 1;
-        return { programmes };
-    }
 
     // Shared browser/server preflight fetchers. Limits and deadlines prevent a
     // malformed or unexpectedly large playlist/EPG from hanging the setup page.
@@ -200,7 +213,7 @@
 
     async function fetchTextBrowser(url, phaseLabel) {
         appendDetail(`→ (Browser) Fetching ${phaseLabel} (URL hidden for privacy)`);
-        const controller = new AbortController();
+        const controller = createRequestController();
         const timeout = setTimeout(() => controller.abort(), BROWSER_FETCH_TIMEOUT_MS);
         try {
             const response = await fetch(url, { method: 'GET', signal: controller.signal });
@@ -250,12 +263,13 @@
             throw error;
         } finally {
             clearTimeout(timeout);
+            activeRequests.delete(controller);
         }
     }
 
     async function fetchTextServer(url, purpose) {
         appendDetail(`→ (Server) Prefetch ${purpose} (URL hidden for privacy)`);
-        const controller = new AbortController();
+        const controller = createRequestController();
         const timeout = setTimeout(() => controller.abort(), SERVER_FETCH_TIMEOUT_MS);
         try {
             const response = await fetch('/api/prefetch', {
@@ -284,13 +298,14 @@
             throw error;
         } finally {
             clearTimeout(timeout);
+            activeRequests.delete(controller);
         }
     }
 
 
     async function checkEpgStats(url, sourceNumber) {
         appendDetail(`→ Streaming EPG source ${sourceNumber} (URL hidden for privacy)`);
-        const controller = new AbortController();
+        const controller = createRequestController();
         const timeout = setTimeout(() => controller.abort(), 125000);
         try {
             const response = await fetch('/api/epg-stats', {
@@ -311,15 +326,18 @@
             throw error;
         } finally {
             clearTimeout(timeout);
+            activeRequests.delete(controller);
         }
     }
 
     async function robustFetch(url, purpose, browserFirst = true) {
+        const expectedGeneration = generation;
         const mixedContent = window.location.protocol === 'https:' && /^http:\/\//i.test(url);
         if (browserFirst && !mixedContent) {
             try {
                 return await fetchTextBrowser(url, purpose);
             } catch (error) {
+                if (expectedGeneration !== generation) throw Object.assign(new Error('Setup cancelled'), { name: 'AbortError' });
                 appendDetail('⚠ Browser fetch failed → server fallback (details hidden for privacy).');
             }
         }
@@ -329,13 +347,11 @@
     async function buildUrls(config) {
         // Provider credentials must never be put into reversible Base64 JSON.
         // Fail closed unless the server returns an authenticated encrypted token.
-        const response = await fetch('/encrypt', {
+        const { response, payload } = await fetchJson('/encrypt', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(config)
+            body: JSON.stringify({ ...retainedConfig, ...config })
         });
-        let payload = {};
-        try { payload = await response.json(); } catch { /* handled below */ }
         if (!response.ok || typeof payload.token !== 'string' || !payload.token.startsWith('enc:')) {
             throw new Error(payload.error || (response.ok ? 'Token endpoint returned an invalid response.' : `Token endpoint failed (HTTP ${response.status}). Check the server logs before changing CONFIG_SECRET.`));
         }
@@ -348,17 +364,17 @@
     }
 
 
-    async function prefillIfReconfigure(provider) {
+    async function prefillIfReconfigure() {
         const parts = window.location.pathname.split('/').filter(Boolean);
         // Stremio/browser URLs may expose the colon in `enc:` as `%3A`.
         // Decode the path segment once before re-encoding it for the fetch URL.
         let token = parts[0];
         try { token = decodeURIComponent(token || ''); } catch { /* keep original segment */ }
-        if (!token || token === 'configure-direct' || token === 'configure-xtream') return;
+        if (!token || token === 'html' || token === 'configure-direct' || token === 'configure-xtream') return;
         try {
-            const response = await fetch('/' + encodeURIComponent(token) + '/configuration.json', { cache: 'no-store' });
+            const { response, payload: config } = await fetchJson('/' + encodeURIComponent(token) + '/configuration.json', { cache: 'no-store' });
             if (!response.ok) throw new Error('Could not load saved configuration');
-            const config = await response.json();
+            retainedConfig = config.includeSeries === undefined ? {} : { includeSeries: config.includeSeries };
             const setValue = (id, value) => {
                 const el = document.getElementById(id);
                 if (el && value !== undefined && value !== null) el.value = value;
@@ -389,7 +405,7 @@
             const customGroup = document.getElementById('customEpgGroup');
             if (customGroup) customGroup.classList.toggle('hidden', !(config.enableEpg !== false && mode === 'custom'));
             const submit = document.querySelector('#directForm button[type="submit"], #xtreamForm button[type="submit"]');
-            if (submit) submit.textContent = provider === 'xtream' ? 'Save / Update Addon' : 'Save / Update Addon';
+            if (submit) submit.textContent = 'Save / Update Addon';
             appendDetail('Existing settings loaded. You can edit them and generate an updated addon link.');
         } catch (error) {
             console.warn('[CONFIGURE] Could not prefill settings:', error.message);
@@ -407,7 +423,9 @@
         prefillIfReconfigure,
         robustFetch,
         checkEpgStats,
-        quickEpgStats,
+        fetchJson,
+        getGeneration: () => generation,
+        isCurrent: value => value === generation,
         overlaySetMessage(msg) { loaderMessage.textContent = msg; },
         setProgress,
         appendDetail,

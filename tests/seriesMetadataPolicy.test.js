@@ -71,7 +71,8 @@ async function testSeriesDetailsIgnoreReplacementIdAndKeepPlayableEpisodes() {
         }, async () => {
             const detail = await addon.buildSeriesMeta(item);
             assert.strictEqual(detail.videos.length, 1);
-            assert.strictEqual(detail.videos[0].runtime, "60 min", "individual episode durations remain available");
+            assert.strictEqual(detail.videos[0].runtime, undefined, "ordinary episode responses omit unused runtimes");
+            assert.strictEqual((await addon.ensureSeriesInfo()).videos[0].runtime, "60 min", "provider durations remain available internally");
             assert.strictEqual(detail.runtime, undefined, "provider episodes must not produce a series average");
             assert.ok(requested.every(id => id === listId));
             if (!listId) assert.deepStrictEqual(requested, []);

@@ -17,15 +17,18 @@ const MAX_DESCRIPTION_CHARS = 8192;
 // Shared by all EPG feeds for one addon refresh to cap aggregate retained data.
 const MAX_PROGRAMMES_TOTAL = 250000;
 const MAX_RETAINED_TEXT_CHARS_TOTAL = 32 * 1024 * 1024;
+const EPG_STATUS = Symbol("epgRetentionStatus");
 
 /**
  * Parse XMLTV from a Node readable stream. XML bytes are consumed incrementally;
  * only programme records for channel IDs used by the playlist are retained.
  */
-function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
+function parseEPGStream(readable, allowedChannelIds, retentionBudget, { countOnly = false } = {}) {
     return new Promise((resolve, reject) => {
         const allowed = allowedChannelIds instanceof Set ? allowedChannelIds : null;
         const epgData = Object.create(null);
+        const status = { programmes: 0, truncated: false, omittedProgrammes: 0, omittedTextCharacters: 0 };
+        Object.defineProperty(epgData, EPG_STATUS, { value: status });
         let current = null;
         let field = null;
         let programmeCount = 0;
@@ -83,12 +86,14 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
         });
 
         xml.on('text', (value) => {
+            if (countOnly) return;
             if (current && current.keep && field) {
                 if (field === 'title') current.title = (current.title + value).slice(0, MAX_TITLE_CHARS);
                 else if (current.desc.length < MAX_DESCRIPTION_CHARS) current.desc = (current.desc + value).slice(0, MAX_DESCRIPTION_CHARS);
             }
         });
         xml.on('cdata', (value) => {
+            if (countOnly) return;
             if (current && current.keep && field) {
                 if (field === 'title') current.title = (current.title + value).slice(0, MAX_TITLE_CHARS);
                 else if (current.desc.length < MAX_DESCRIPTION_CHARS) current.desc = (current.desc + value).slice(0, MAX_DESCRIPTION_CHARS);
@@ -102,6 +107,8 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
             if (name !== 'programme' || !current) return;
             if (current.keep && current.start && current.stop) {
                 programmeCount += 1;
+                status.programmes = programmeCount;
+                if (countOnly) { current = null; field = null; return; }
                 if (programmeCount > MAX_PROGRAMMES_PER_SOURCE) {
                     finish(new Error('EPG source exceeds the 150,000 retained-programme safety limit'));
                     readable.destroy();
@@ -111,6 +118,8 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
                 // stream but do not retain additional programme objects.
                 if (budget.programmes >= MAX_PROGRAMMES_TOTAL ||
                     budget.textChars >= MAX_RETAINED_TEXT_CHARS_TOTAL) {
+                    status.truncated = true;
+                    status.omittedProgrammes++;
                     current = null;
                     field = null;
                     return;
@@ -120,6 +129,8 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
                 const remainingText = MAX_RETAINED_TEXT_CHARS_TOTAL - budget.textChars;
                 const retainedTitle = title.slice(0, remainingText);
                 const retainedDesc = desc.slice(0, Math.max(0, remainingText - retainedTitle.length));
+                const omittedText = title.length + desc.length - retainedTitle.length - retainedDesc.length;
+                if (omittedText > 0) { status.truncated = true; status.omittedTextCharacters += omittedText; }
                 if (!epgData[current.channel]) epgData[current.channel] = [];
                 epgData[current.channel].push({
                     start: current.start,
@@ -155,4 +166,6 @@ function parseEPGStream(readable, allowedChannelIds, retentionBudget) {
     });
 }
 
-module.exports = { parseEPGStream, MAX_PROGRAMMES_PER_SOURCE, MAX_EPG_BYTES, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL, MAX_RETAINED_TEXT_CHARS_TOTAL };
+module.exports = { parseEPGStream, getEPGStatus: value => value?.[EPG_STATUS] || {
+    truncated: false, omittedProgrammes: 0, omittedTextCharacters: 0
+}, MAX_PROGRAMMES_PER_SOURCE, MAX_EPG_BYTES, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS, MAX_PROGRAMMES_TOTAL, MAX_RETAINED_TEXT_CHARS_TOTAL };

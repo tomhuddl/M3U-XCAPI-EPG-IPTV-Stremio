@@ -11,20 +11,51 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: 22
+          - os: ubuntu-latest
+            node: 24
+          - os: windows-latest
+            node: 22
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - name: Install dependencies
         run: npm ci
       - name: Check JavaScript syntax
+        shell: bash
         run: git ls-files -z -- '*.js' | xargs -0 -n 1 node --check
       - name: Run tests
         run: npm test
       - name: Audit all dependencies
         run: npm audit
+
+  container-storage:
+    runs-on: ubuntu-latest
+    env:
+      SMOKE_VOLUME: addon-storage-smoke-${{ github.run_id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build production image
+        run: docker build --tag addon-storage-test .
+      - name: Create fresh test volume
+        run: docker volume create "$SMOKE_VOLUME"
+      - name: Save and restore caches as the runtime user
+        run: |
+          for phase in write read; do
+            docker run --rm --volume "$SMOKE_VOLUME:/data" --volume "$PWD/tests/fixtures/containerStorageSmoke.js:/tmp/storage-smoke.js:ro" addon-storage-test node /tmp/storage-smoke.js "$phase"
+          done
+      - name: Remove test volume
+        if: always()
+        run: docker volume rm "$SMOKE_VOLUME" || true

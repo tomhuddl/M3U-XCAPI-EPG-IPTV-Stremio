@@ -7,6 +7,16 @@ docker-compose.yml
 README.md
 *.env
 .env
+.env.*
+data
+.test-tmp
+**/addon-data-*.json*
+**/catalog-meta-*.json*
+**/series-info-*.json*
+**/omdb-usage.json*
+test.js
+tests
+.github
 vercel.json
 serverless.js
 # Ignore local environment and editor files

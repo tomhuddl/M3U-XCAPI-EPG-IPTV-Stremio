@@ -1,5 +1,4 @@
-// IPTV Stremio Addon Core (with debug logging + series (shows) support for BOTH Xtream & Direct M3U)
-// Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
+// IPTV catalogue, metadata and playback integration for Xtream and direct M3U.
 require('dotenv').config({ quiet: true });
 
 const { createLogger, logAt } = require('./logger');
@@ -8,6 +7,8 @@ const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
 const { isDeepStrictEqual } = require("util");
 const requestContext = require("./requestContext");
+const { mapWithConcurrency, withTimeout } = require("./asyncUtils");
+const m3uParser = require("./src/js/m3u-parser");
 const LRUCache = require("./lruCache");
 const PersistentCatalogMetaCache = require("./persistentCatalogMetaCache");
 const PersistentAddonDataCache = require("./persistentAddonDataCache");
@@ -345,7 +346,9 @@ if (process.env.REDIS_URL && CACHE_ENABLED) {
         const { Redis } = require('ioredis');
         redisClient = new Redis(process.env.REDIS_URL, {
             lazyConnect: true,
-            maxRetriesPerRequest: 2
+            maxRetriesPerRequest: 1,
+            commandTimeout: 1000,
+            enableOfflineQueue: false
         });
         redisClient.on('error', e => logAt('error', '[REDIS] Error:', e && e.name ? e.name : 'Error'));
         redisClient.connect().catch(err => logAt('error', '[REDIS] Connect failed:', err && err.name ? err.name : 'Error'));
@@ -435,6 +438,7 @@ function normalizeSearchText(value) {
         .normalize('NFKD')
         .replace(/\p{M}+/gu, '')
         .toLowerCase()
+        .replace(/&/g, ' and ')
         .replace(/['’‘ʼ]/gu, '')
         .replace(/[\p{P}\p{S}]+/gu, ' ')
         .replace(/\s+/g, ' ')
@@ -589,8 +593,8 @@ function estimateDetailCacheBytes(value) {
     return bytes;
 }
 
-function makeLogger(cfgDebug) {
-    return createLogger(!!cfgDebug);
+function makeLogger() {
+    return createLogger(() => requestContext.current().debug === true);
 }
 
 function parsePositiveInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
@@ -645,19 +649,6 @@ function getProviderSeriesKey(item) {
     return String(item?.series_id || item?.id?.replace(/^iptv_series_/, '') || '');
 }
 
-async function mapWithConcurrency(items, concurrency, mapper) {
-    const results = new Array(items.length);
-    let nextIndex = 0;
-    const workerCount = Math.min(items.length, Math.max(1, concurrency));
-    await Promise.all(Array.from({ length: workerCount }, async () => {
-        while (nextIndex < items.length) {
-            const index = nextIndex++;
-            results[index] = await mapper(items[index], index);
-        }
-    }));
-    return results;
-}
-
 function estimateProviderCacheBytes(entry) {
     if (!entry || typeof entry !== 'object') return 1;
     const catalogueCount = ['channels', 'movies', 'series'].reduce(
@@ -680,6 +671,7 @@ const dataCache = new LRUCache({
 });
 const buildPromiseCache = new Map();
 const addonInterfaceInstances = new WeakMap();
+const liveInterfaces = new Set();
 const addonDisposals = new Map();
 
 // Multiple configuration tokens can create separate addon instances for the same
@@ -691,7 +683,7 @@ const providerRefreshInFlight = new Map();
 async function redisGetJSON(key) {
     if (!redisClient) return null;
     try {
-        const raw = await redisClient.get(key);
+        const raw = await withTimeout(redisClient.get(key), 1000, 'Redis read timed out');
         if (!raw) return null;
         return JSON.parse(raw);
     } catch { return null; }
@@ -699,7 +691,7 @@ async function redisGetJSON(key) {
 async function redisSetJSON(key, value, ttl) {
     if (!redisClient) return;
     try {
-        await redisClient.set(key, JSON.stringify(value), 'PX', ttl);
+        await withTimeout(redisClient.set(key, JSON.stringify(value), 'PX', ttl), 1000, 'Redis write timed out');
     } catch { /* ignore */ }
 }
 
@@ -809,9 +801,10 @@ class M3UEPGAddon {
         // requested window, including programmes that started much earlier.
         this.lastUpdate = 0;
         this.lastEpgUpdate = 0;
+        this.epgRetentionStatus = null;
         this.epgRefreshAttemptedAt = 0;
         this.providerRefreshRetryAfter = 0;
-        this.log = makeLogger(config.debug);
+        this.log = makeLogger();
 
         // Direct provider may populate this (seriesId -> episodes array)
         this.directSeriesEpisodeIndex = new Map();
@@ -874,6 +867,22 @@ class M3UEPGAddon {
         }
     }
 
+    async flushPersistentStores() {
+        const stores = [
+            ['provider snapshot', this.persistentAddonDataCache],
+            ['catalogue metadata', this.persistentCatalogMetaCache],
+            ['series details', this.persistentSeriesInfoCache]
+        ];
+        const results = await Promise.allSettled(stores.map(([, cache]) => Promise.resolve().then(() => cache.flush())));
+        const failures = results.flatMap((result, index) => result.status === 'rejected'
+            ? [{ cache: stores[index][0], reason: result.reason }] : []);
+        if (failures.length) {
+            const error = new AggregateError(failures.map(failure => failure.reason), 'Persistent cache flush failed');
+            error.failedCaches = failures.map(failure => failure.cache);
+            throw error;
+        }
+    }
+
     async dispose() {
         if (this.disposePromise) return this.disposePromise;
         this.disposed = true;
@@ -882,6 +891,9 @@ class M3UEPGAddon {
             this.refreshTimer = null;
         }
         this.disposePromise = (async () => {
+            // Save completed work immediately; the final flush still follows draining.
+            // Slow upstream work must not hold every dirty cache buffer hostage.
+            await this.flushPersistentStores().catch(() => {});
             if (this.activeRequestCount > 0) {
                 this.activeRequestDrainPromise = new Promise(resolve => {
                     this.activeRequestDrainResolve = resolve;
@@ -896,24 +908,14 @@ class M3UEPGAddon {
             while (this.catalogMetaPersistWrites.size) {
                 await Promise.allSettled([...this.catalogMetaPersistWrites]);
             }
-            const stores = [
-                ['provider snapshot', this.persistentAddonDataCache],
-                ['catalogue metadata', this.persistentCatalogMetaCache],
-                ['series details', this.persistentSeriesInfoCache]
-            ];
-            const results = await Promise.allSettled(stores.map(([, cache]) => Promise.resolve().then(() => cache.flush())));
+            let flushError;
+            try { await this.flushPersistentStores(); } catch (error) { flushError = error; }
             providerRefreshState.delete(this.cacheKey);
             if (typeof this.releasePersistentCacheRegistration === "function") {
                 this.releasePersistentCacheRegistration();
                 this.releasePersistentCacheRegistration = null;
             }
-            const failures = results.flatMap((result, index) => result.status === 'rejected'
-                ? [{ cache: stores[index][0], reason: result.reason }] : []);
-            if (failures.length) {
-                const error = new AggregateError(failures.map(failure => failure.reason), 'Persistent cache flush failed');
-                error.failedCaches = failures.map(failure => failure.cache);
-                throw error;
-            }
+            if (flushError) throw flushError;
         })();
         return this.disposePromise;
     }
@@ -923,21 +925,23 @@ class M3UEPGAddon {
         // persistent snapshot must still be loaded when those layers are disabled,
         // otherwise a saved last-good catalogue would be ignored on every restart.
         let cached = CACHE_ENABLED ? dataCache.get(cacheKey) : null;
-        if (CACHE_ENABLED && !cached && redisClient) {
-            cached = await redisGetJSON(cacheKey);
-            if (cached) dataCache.set(cacheKey, cached);
-        }
         if (!cached) {
             cached = await this.persistentAddonDataCache.load();
             if (cached) {
                 if (CACHE_ENABLED) dataCache.set(cacheKey, cached);
             }
         }
+        if (CACHE_ENABLED && !cached && redisClient) {
+            cached = await redisGetJSON(cacheKey);
+            if (cached) dataCache.set(cacheKey, cached);
+        }
         if (cached) {
             this.channels = cached.channels || [];
             this.movies = cached.movies || [];
             this.series = cached.series || [];
             this.epgData = cached.epgData || {};
+            this.epgRetentionStatus = cached.epgRetentionStatus && typeof cached.epgRetentionStatus === 'object'
+                ? cached.epgRetentionStatus : null;
             this.lastUpdate = cached.lastUpdate || 0;
             this.lastEpgUpdate = cached.lastEpgUpdate === undefined
                 ? (Object.values(this.epgData).some(programmes => Array.isArray(programmes) && programmes.length)
@@ -950,7 +954,7 @@ class M3UEPGAddon {
 
             // Direct-M3U episode URLs and IDs are not derivable from the series
             // summaries alone, so persist and restore the episode lists themselves.
-            if (this.providerName === 'direct') {
+            if (this.providerName === 'direct' || this.config.xtreamUseM3U) {
                 const savedEpisodes = cached.directSeriesEpisodes;
                 if (savedEpisodes && typeof savedEpisodes === 'object' && !Array.isArray(savedEpisodes)) {
                     const episodesMap = new Map(
@@ -982,6 +986,7 @@ class M3UEPGAddon {
                 movies: this.movies.length,
                 series: this.series.length,
                 epgChannels: Object.keys(this.epgData).length,
+                ...(this.epgRetentionStatus?.truncated ? { guideLimited: true } : {}),
                 lastUpdate: this.lastUpdate ? new Date(this.lastUpdate).toISOString() : null
             });
         }
@@ -993,6 +998,7 @@ class M3UEPGAddon {
             movies: this.movies,
             series: this.series,
             epgData: this.epgData,
+            epgRetentionStatus: this.epgRetentionStatus,
             lastUpdate: this.lastUpdate,
             lastEpgUpdate: this.lastEpgUpdate,
             epgRefreshAttemptedAt: this.epgRefreshAttemptedAt,
@@ -1017,13 +1023,6 @@ class M3UEPGAddon {
         const entry = this.providerSnapshot();
         dataCache.set(cacheKey, entry);
         try {
-            await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
-        } catch (error) {
-            // Redis is an optional acceleration layer; a failed Redis write must
-            // not turn a valid provider refresh into an in-memory rollback.
-            this.log.warn('Redis provider snapshot save failed', error?.name || 'Error');
-        }
-        try {
             await this.persistentAddonDataCache.save(entry);
         } catch (error) {
             // The in-memory/Redis copy remains usable; a disk write failure must not
@@ -1033,6 +1032,7 @@ class M3UEPGAddon {
                 syscall: error?.syscall || null, message: String(error?.message || 'No error message').slice(0, 300)
             });
         }
+        await redisSetJSON(cacheKey, entry, CACHE_TTL_MS);
     }
 
     buildGenresInManifest() {
@@ -1090,61 +1090,12 @@ class M3UEPGAddon {
     }
 
     parseM3U(content) {
-        const lines = content.split('\n');
-        const items = [];
-        let currentItem = null;
-        for (const raw of lines) {
-            const line = raw.trim();
-            if (line.startsWith('#EXTINF:')) {
-                const matches = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
-                if (matches) {
-                    currentItem = {
-                        duration: parseInt(matches[1]),
-                        attributes: this.parseAttributes(matches[2] || ''),
-                        name: (matches[3] || '').trim()
-                    };
-                }
-            } else if (line && !line.startsWith('#') && currentItem) {
-                currentItem.url = line;
-                currentItem.logo = currentItem.attributes['tvg-logo'];
-                currentItem.epg_channel_id = currentItem.attributes['tvg-id'] || currentItem.attributes['tvg-name'];
-                currentItem.category = currentItem.attributes['group-title'];
-
-                const group = (currentItem.attributes['group-title'] || '').toLowerCase();
-                const lower = currentItem.name.toLowerCase();
-
-                const isMovie =
-                    group.includes('movie') ||
-                    lower.includes('movie') ||
-                    this.isMovieFormat(currentItem.name);
-
-                const isSeries =
-                    !isMovie && (
-                        group.includes('series') ||
-                        group.includes('show') ||
-                        /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) ||
-                        /\bSeason\s?\d+/i.test(currentItem.name)
-                    );
-
-                currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
-                currentItem.id = `iptv_${crypto.createHash('md5').update(currentItem.name + currentItem.url).digest('hex').substring(0, 16)}`;
-                items.push(currentItem);
-                currentItem = null;
-            }
-        }
-        return items;
+        return m3uParser.parseM3U(content).map(item => ({ ...item,
+            id: 'iptv_' + crypto.createHash('md5').update(item.name + item.url).digest('hex').substring(0, 16) }));
     }
 
     parseAttributes(str) {
-        const attrs = {};
-        const regex = /(\w+(?:-\w+)*)="([^"]*)"/g;
-        let m;
-        while ((m = regex.exec(str)) !== null) attrs[m[1]] = m[2];
-        return attrs;
-    }
-
-    isMovieFormat(name) {
-        return [/\(\d{4}\)/, /\d{4}\./, /HD$|FHD$|4K$/i].some(p => p.test(name));
+        return m3uParser.parseAttributes(str);
     }
 
     parseEPGTime(s) {
@@ -1515,6 +1466,7 @@ class M3UEPGAddon {
         const generation = this.lastUpdate;
         const startedAt = Date.now();
         const previousGuide = this.epgData;
+        const previousRetentionStatus = this.epgRetentionStatus;
         const previousSuccess = this.lastEpgUpdate;
         let acceptedPartial = false;
         const staged = Object.assign(Object.create(this), { epgData: {}, epgRefreshFailed: false });
@@ -1527,17 +1479,20 @@ class M3UEPGAddon {
                 const hadGuide = Object.values(this.epgData).some(items => Array.isArray(items) && items.length);
                 if (!hadGuide && hasProgrammes) {
                     this.epgData = staged.epgData;
+                    this.epgRetentionStatus = staged.epgRetentionStatus || null;
                     this.buildGenresInManifest();
                     acceptedPartial = true;
                 }
                 throw new Error('Guide unavailable');
             }
             this.epgData = staged.epgData;
+            this.epgRetentionStatus = staged.epgRetentionStatus || null;
             this.buildGenresInManifest();
             this.lastEpgUpdate = Math.max(Date.now(), startedAt);
             this.epgRefreshAttemptedAt = this.lastEpgUpdate;
             this.log.info('EPG refresh complete', {
                 epgChannels: Object.keys(this.epgData).length,
+                ...(this.epgRetentionStatus?.truncated ? { guideLimited: true } : {}),
                 epgProgrammes: Object.values(this.epgData).reduce((total, programmes) => total + programmes.length, 0),
                 durationMs: Date.now() - startedAt
             });
@@ -1545,6 +1500,7 @@ class M3UEPGAddon {
             if (this.disposed || this.lastUpdate !== generation) return;
             if (!acceptedPartial) {
                 this.epgData = previousGuide;
+                this.epgRetentionStatus = previousRetentionStatus;
                 this.lastEpgUpdate = previousSuccess;
             }
             this.log.warn('EPG refresh failed; retaining saved guide', { retryDelay: EPG_REFRESH_RETRY_MS });
@@ -1563,6 +1519,7 @@ class M3UEPGAddon {
         const previous = {
             channels: this.channels, movies: this.movies, series: this.series,
             epgData: this.epgData, lastUpdate: this.lastUpdate,
+            epgRetentionStatus: this.epgRetentionStatus,
             lastEpgUpdate: this.lastEpgUpdate, epgRefreshAttemptedAt: this.epgRefreshAttemptedAt,
             directSeriesEpisodeIndex: this.directSeriesEpisodeIndex,
             directSeriesEpisodeById: this.directSeriesEpisodeById,
@@ -1621,9 +1578,15 @@ class M3UEPGAddon {
             const hasNewGuide = Object.values(refreshed.epgData || {}).some(items => Array.isArray(items) && items.length);
             const hadGuide = Object.values(previous.epgData || {}).some(items => Array.isArray(items) && items.length);
             const guideSucceeded = !skipEpg && this.config.enableEpg && !refreshed.epgRefreshFailed && hasNewGuide;
-            if (skipEpg) refreshed.epgData = previous.epgData;
+            if (skipEpg) {
+                refreshed.epgData = previous.epgData;
+                refreshed.epgRetentionStatus = previous.epgRetentionStatus;
+            }
             else if (this.config.enableEpg && !guideSucceeded) {
-                if (hadGuide) refreshed.epgData = previous.epgData;
+                if (hadGuide) {
+                    refreshed.epgData = previous.epgData;
+                    refreshed.epgRetentionStatus = previous.epgRetentionStatus;
+                }
                 this.log.warn('EPG refresh incomplete; retaining available guide', { retryDelay: EPG_REFRESH_RETRY_MS });
             }
 
@@ -1640,6 +1603,7 @@ class M3UEPGAddon {
 
             this.channels = refreshed.channels; this.movies = refreshed.movies; this.series = refreshed.series;
             this.epgData = refreshed.epgData;
+            this.epgRetentionStatus = refreshed.epgRetentionStatus || null;
             this.directSeriesEpisodeIndex = refreshed.directSeriesEpisodeIndex;
             this.directSeriesEpisodeById = refreshed.directSeriesEpisodeById;
             this.pendingRemovalCandidates = {};
@@ -1655,6 +1619,7 @@ class M3UEPGAddon {
             this.log.info('Provider data refresh complete', {
                 channels: this.channels.length, movies: this.movies.length, series: this.series.length,
                 epgChannels: Object.keys(this.epgData).length,
+                ...(this.epgRetentionStatus?.truncated ? { guideLimited: true } : {}),
                 epgProgrammes: Object.values(this.epgData).reduce((total, programmes) => total + programmes.length, 0),
                 durationMs: Date.now() - start
             });
@@ -2116,23 +2081,6 @@ class M3UEPGAddon {
                 thumbnail: tmdbEpisode?.thumbnail || v.thumbnail || seriesItem.poster || undefined
             };
             if (tmdbEpisode?.description) video.overview = tmdbEpisode.description;
-            const episodeRuntime = tmdbEpisode?.runtime || v.runtime;
-            if (parseRuntimeMinutes(episodeRuntime) !== null) video.runtime = episodeRuntime;
-            if (tmdbEpisode?.rating) {
-                // Episode ratings are scores, not maturity/content ratings.
-                // Expose the score as a clearly labelled TMDb link, matching
-                // the series/movie metadata convention rather than misusing
-                // Stremio's ContentRating field.
-                video.links = [{
-                    name: 'TMDb rating: ' + tmdbEpisode.rating,
-                    category: 'Rating',
-                    url: 'https://www.themoviedb.org/tv/' + encodeURIComponent(String(tmdbId)) +
-                        '/season/' + encodeURIComponent(String(v.season)) +
-                        '/episode/' + encodeURIComponent(String(v.episode))
-                }];
-            }
-            if (tmdbEpisode?.guestStars?.length) video.cast = tmdbEpisode.guestStars;
-            if (tmdbEpisode?.directors?.length) video.directors = tmdbEpisode.directors;
             if (tmdbEpisode?.released) {
                 const d = new Date(tmdbEpisode.released);
                 if (!isNaN(d.getTime())) released = d.toISOString();
@@ -2168,8 +2116,7 @@ class M3UEPGAddon {
                     season: v.season,
                     episode: v.episode,
                     thumbnail: v.thumbnail || seriesItem.poster || undefined,
-                    ...(v.released ? { released: v.released } : {}),
-                    ...(v.runtime ? { runtime: v.runtime } : {})
+                    ...(v.released ? { released: v.released } : {})
                 }))
             };
             await this.persistDetailedCatalogPreview(seriesItem.id, 'series', null, { ...fallbackMeta, ...runtimeFields }, {
@@ -2191,7 +2138,6 @@ class M3UEPGAddon {
             releaseInfo: tmdb.releaseInfo,
             year: tmdb.year,
             runtime: runtimeFields.runtime,
-            metadataVersion: 2,
             _detailExtras: tmdb._detailExtras,
             imdbId: tmdb.imdbId || omdb?.imdbId,
             imdbRating: omdb?.imdbRating != null ? String(omdb.imdbRating) : undefined,
@@ -2239,6 +2185,7 @@ class M3UEPGAddon {
                 if (requestContext.current().signal?.aborted) {
                     const error = new Error("Catalogue request closed"); error.name = "AbortError"; throw error;
                 }
+                if (this.disposed) return;
                 const item = candidates[nextIndex++];
                 try {
                     const providerLastUpdate = Number(this.lastUpdate) || 0;
@@ -2273,6 +2220,16 @@ class M3UEPGAddon {
                     previews.set(String(item.id), this.catalogMetaCache.get(item.id) || preview);
                 } catch (error) {
                     this.log.warn('Foreground catalogue metadata enrichment failed', { itemId: item.id, errorName: error?.name || 'Error' });
+                    const generation = Number(this.lastUpdate) || 0;
+                    const currentItem = findCatalogueItemById(item.type === 'series' ? this.series : this.movies, item.id);
+                    if (currentItem !== item) continue;
+                    const saved = await this.persistentCatalogMetaCache.get(String(item.id));
+                    if (!this.isCatalogItemCurrent(item.id, generation)) continue;
+                    const fallback = this.catalogMetaCache.get(item.id) || saved?.value;
+                    if (fallback && !(item.tmdbId && fallback._tmdbId && String(item.tmdbId) !== String(fallback._tmdbId))) {
+                        this.putCatalogMeta(item.id, fallback);
+                        previews.set(String(item.id), fallback);
+                    }
                 }
             }
         };
@@ -2686,7 +2643,10 @@ class M3UEPGAddon {
                 { refreshAll: normalMetadataRefreshDue || identityRefreshDue,
                     refreshOmdb: previousRecord?.omdbPending === true,
                     previousMetadata: previousRecord }
-            );
+            ).catch(error => {
+                this.log.warn('Metadata source lookup failed; retaining saved fields', { itemId: key, errorName: error?.name || 'Error' });
+                return null;
+            });
             if (!this.isCatalogItemCurrent(key, providerLastUpdate)) return null;
             if (refreshed) {
                 if (refreshed._tmdbId) this.catalogDetailsAvailableAt.set(key, { generation: providerLastUpdate, at: Date.now() });
@@ -3459,12 +3419,21 @@ async function createAddon(config) {
 
         const iface = builder.getInterface();
         buildingInterface = iface;
+        let cacheWeight = addonInstance.estimateMemoryBytes();
+        let weightCheckedAt = Date.now(), weightGeneration = addonInstance.lastUpdate;
         Object.defineProperty(iface, '__cacheWeight', {
-            value: addonInstance.estimateMemoryBytes(),
+            get: () => {
+                if (Date.now() - weightCheckedAt >= 30000 || weightGeneration !== addonInstance.lastUpdate) {
+                    cacheWeight = addonInstance.estimateMemoryBytes();
+                    weightCheckedAt = Date.now(); weightGeneration = addonInstance.lastUpdate;
+                }
+                return cacheWeight;
+            },
             enumerable: false,
             configurable: false
         });
         addonInterfaceInstances.set(iface, addonInstance);
+        liveInterfaces.add(iface);
 
         // POST-BUILD: Inject 'options' into each catalog's genre extra entry.
         // This MUST happen after getInterface() because the SDK linter would reject
@@ -3485,7 +3454,7 @@ async function createAddon(config) {
         });
         return iface;
     })().catch(async (error) => {
-        if (buildingInterface) addonInterfaceInstances.delete(buildingInterface);
+        if (buildingInterface) { addonInterfaceInstances.delete(buildingInterface); liveInterfaces.delete(buildingInterface); }
         if (buildingAddonInstance) await buildingAddonInstance.dispose().catch(() => {});
         if (releasePersistentCacheRegistration) releasePersistentCacheRegistration();
         throw error;
@@ -3510,7 +3479,7 @@ module.exports.closeRedisClient = async function closeRedisClient() {
     const client = redisClient;
     redisClient = null;
     try {
-        if (client.status === 'ready') await client.quit();
+        if (client.status === 'ready') await withTimeout(client.quit(), 1000, 'Redis shutdown timed out');
         else client.disconnect();
     } catch {
         client.disconnect();
@@ -3534,6 +3503,7 @@ module.exports.disposeAddonInterface = async function disposeAddonInterface(ifac
         await disposal;
     } finally {
         addonInterfaceInstances.delete(iface);
+        liveInterfaces.delete(iface);
         if (addonDisposals.get(addon.cacheKey) === disposal) addonDisposals.delete(addon.cacheKey);
     }
 };
@@ -3543,6 +3513,9 @@ module.exports.flushAddonDisposals = async function flushAddonDisposals() {
     if (failures.length) throw new AggregateError(failures, 'Addon disposal failed');
 };
 module.exports.M3UEPGAddon = M3UEPGAddon;
+module.exports.getActiveInterfaceCount = () => liveInterfaces.size;
+module.exports.flushActiveAddonCaches = () => Promise.allSettled([...liveInterfaces].map(iface =>
+    addonInterfaceInstances.get(iface)?.flushPersistentStores()));
 module.exports.normalizeGenre = normalizeGenre;
 module.exports.matchesGenre = matchesGenre;
 module.exports.normalizeSearchText = normalizeSearchText;

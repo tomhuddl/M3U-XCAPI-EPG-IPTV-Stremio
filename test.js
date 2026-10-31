@@ -195,6 +195,68 @@ function testSearchSupportsReorderedWordsAndPartialTyping() {
     assert.strictEqual(matchesSearchText("man man", "Spider-Man"), false);
 }
 
+function testSearchTreatsAndAndAmpersandAsEquivalent() {
+    assert.strictEqual(normalizeSearchText("Law & Order"), normalizeSearchText("Law and Order"));
+    assert.strictEqual(normalizeSearchText("Tom&Jerry"), "tom and jerry");
+    assert.strictEqual(matchesSearchText("LAW AND ORDER", "Law & Order"), true);
+    assert.strictEqual(matchesSearchText("Law & Order", "Law and Order"), true);
+    assert.strictEqual(matchesSearchText("Tom&Jerry", "Tom and Jerry"), true);
+    assert.strictEqual(normalizeSearchText("Sand Anderson"), "sand anderson");
+    assert.strictEqual(matchesSearchText("s&", "Sand"), false);
+    assert.strictEqual(matchesSearchText("law and ordr", "Law & Order"), false);
+}
+
+async function testSearchAndAmpersandRankExactTitlesBeforePagination() {
+    const createAddon = require("./addon");
+    const proto = M3UEPGAddon.prototype;
+    const methods = ["loadFromCache", "updateData", "startConfiguredCatalogPrefetch", "startScheduledRefresh"];
+    const originals = Object.fromEntries(methods.map(name => [name, proto[name]]));
+    const oldPageSize = process.env.CATALOG_PAGE_SIZE;
+    const oldPrefetch = process.env.CATALOG_PREFETCH_NEXT_PAGE;
+    process.env.CATALOG_PAGE_SIZE = "10";
+    process.env.CATALOG_PREFETCH_NEXT_PAGE = "false";
+    try {
+        proto.updateData = async () => {};
+        proto.startConfiguredCatalogPrefetch = () => {};
+        proto.startScheduledRefresh = () => {};
+        for (const type of ["movie", "series"]) {
+            const names = [...Array.from({ length: 12 }, (_, i) => "Law and Order Case " + i), "Law & Order", "Law and Order"];
+            proto.loadFromCache = async function () {
+                this.lastUpdate = Date.now();
+                const items = names.map((name, i) => ({ id: "iptv_" + (type === "movie" ? "vod" : "series") + "_" + i,
+                    type, name, tmdbId: "123" }));
+                this[type === "movie" ? "movies" : "series"] = items;
+                const entries = new Map(items.map(item => [item.id, { savedAt: Date.now(), value: { ...item,
+                    _tmdbId: "123", metadataVersion: 3, description: "Saved full description", genres: ["Drama"],
+                    poster: "https://example.com/poster.jpg", background: "https://example.com/background.jpg",
+                    year: 2024, runtime: "60 min", cast: ["Actor"], director: ["Director"],
+                    imdbId: "tt1234567", imdbRating: "8.0", imdbIdChecked: true, omdbChecked: true,
+                    metadataCheckedAt: Date.now(), missingMetadataCheckedAt: Date.now(), omdbCheckedAt: Date.now() } }]));
+                this.persistentCatalogMetaCache = { entries, init: async () => {}, get: async id => entries.get(id), flush: async () => {} };
+            };
+            let iface;
+            try {
+                iface = await createAddon({ provider: "direct", m3uUrl: "https://example.com/and-search-" + type + ".m3u" });
+                const catalogId = type === "movie" ? "iptv_movies" : "iptv_series";
+                const first = await iface.get("catalog", type, catalogId, { search: "law and order" });
+                const equivalent = await iface.get("catalog", type, catalogId, { search: "law & order" });
+                assert.deepStrictEqual(first.metas.map(item => item.id), equivalent.metas.map(item => item.id));
+                assert.deepStrictEqual(first.metas.slice(0, 2).map(item => item.name), ["Law & Order", "Law and Order"]);
+                assert.strictEqual(first.metas.length, 10);
+                const next = await iface.get("catalog", type, catalogId, { search: "law & order", skip: "10" });
+                assert.strictEqual(next.metas.length, 4);
+                assert.ok([...first.metas, ...next.metas].every(item => item.description === "Saved full description"));
+            } finally {
+                if (iface) await createAddon.disposeAddonInterface(iface);
+            }
+        }
+    } finally {
+        for (const name of methods) proto[name] = originals[name];
+        if (oldPageSize === undefined) delete process.env.CATALOG_PAGE_SIZE; else process.env.CATALOG_PAGE_SIZE = oldPageSize;
+        if (oldPrefetch === undefined) delete process.env.CATALOG_PREFETCH_NEXT_PAGE; else process.env.CATALOG_PREFETCH_NEXT_PAGE = oldPrefetch;
+    }
+}
+
 function testNormalizedSearchMatcherAgreesWithPublicMatcher() {
     const normalize = normalizeSearchText;
     const cases = [
@@ -361,9 +423,9 @@ function testEpisodeMetadataMapping() {
     assert.strictEqual(episodes[0].description, "Episode overview.");
     assert.strictEqual(episodes[0].thumbnail, "https://image.tmdb.org/t/p/w500/episode.jpg");
     assert.strictEqual(episodes[0].runtime, "44 min");
-    assert.strictEqual(episodes[0].rating, "8.1");
-    assert.deepStrictEqual(episodes[0].guestStars, ["Guest Actor"]);
-    assert.deepStrictEqual(episodes[0].directors, ["Episode Director"]);
+    assert.strictEqual(episodes[0].rating, undefined);
+    assert.strictEqual(episodes[0].guestStars, undefined);
+    assert.strictEqual(episodes[0].directors, undefined);
     assert.strictEqual(mapSeasonEpisodes(null, 1), null);
 }
 
@@ -961,6 +1023,8 @@ async function main() {
         testXtreamTmdbIdNormalization,
         testSearchNormalisationIgnoresPunctuationAndExtraWhitespace,
         testSearchSupportsReorderedWordsAndPartialTyping,
+        testSearchTreatsAndAndAmpersandAsEquivalent,
+        testSearchAndAmpersandRankExactTitlesBeforePagination,
         testNormalizedSearchMatcherAgreesWithPublicMatcher,
         testSearchRejectsTypoOnlyMatches,
         testCatalogueQueryResultCacheIsBoundedAndPreservesPagination,
@@ -1003,6 +1067,7 @@ async function main() {
         ...require("./tests/seriesMetadataPolicy.test"),
         ...require("./tests/refreshAuditFixes.test"),
         ...require("./tests/loading.test"),
+        ...require("./tests/comprehensiveAudit.test"),
     ];
 
     for (const test of tests) {

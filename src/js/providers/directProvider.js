@@ -4,6 +4,8 @@
 // Episodes are stored in addonInstance.directSeriesEpisodeIndex for quick meta/stream resolution.
 
 const { safeFetch: fetch } = require('../../../urlSafety');
+const { mapWithConcurrency } = require("../../../asyncUtils");
+const { getEpgFetchConcurrency, mergeEpgSources } = require("./epgUtils");
 const { parseEPGStream } = require('../epgStreamParser');
 const { parseRuntimeMinutes } = require('../../../seriesRuntime');
 const crypto = require('crypto');
@@ -12,29 +14,7 @@ function hash(str) {
     return crypto.createHash('md5').update(str).digest('hex').slice(0, 16);
 }
 
-function baseSeriesName(raw) {
-    if (!raw) return '';
-    let name = raw
-        .replace(/\bS\d{1,2}E\d{1,2}\b.*$/i, '')
-        .replace(/\bSeason\s?\d+.*$/i, '')
-        .replace(/[-._]+$/,'')
-        .trim();
-    return name;
-}
-
-function extractSeasonEpisode(title) {
-    // Returns { season, episode } or null
-    let m = title.match(/\bS(\d{1,2})E(\d{1,2})\b/i);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
-    // Alternate "Season X Episode Y"
-    m = title.match(/\bSeason\s?(\d{1,2}).*?\bEpisode\s?(\d{1,3})\b/i);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
-    // Alternate "Season X Ep Y"
-    m = title.match(/\bSeason\s?(\d{1,2}).*?\bEp\s?(\d{1,3})\b/i);
-    if (m) return { season: parseInt(m[1], 10), episode: parseInt(m[2], 10) };
-    // "Sx Exx" compressed? (rare) Already covered by SNNENN pattern above.
-    return null;
-}
+const { baseSeriesName, extractSeasonEpisode } = require("../m3u-parser");
 
 function rebuildDirectEpisodeIndexes(addonInstance, episodesMap) {
     const bySeries = new Map();
@@ -51,24 +31,6 @@ function rebuildDirectEpisodeIndexes(addonInstance, episodesMap) {
 
     addonInstance.directSeriesEpisodeIndex = bySeries;
     addonInstance.directSeriesEpisodeById = byId;
-}
-
-function getEpgFetchConcurrency() {
-    const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
-    return Number.isSafeInteger(parsed) && parsed >= 1 ? Math.min(parsed, 4) : 2;
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-    const results = new Array(items.length);
-    let nextIndex = 0;
-    const workerCount = Math.min(items.length, concurrency);
-    await Promise.all(Array.from({ length: workerCount }, async () => {
-        while (nextIndex < items.length) {
-            const index = nextIndex++;
-            results[index] = await mapper(items[index], index);
-        }
-    }));
-    return results;
 }
 
 async function fetchData(addonInstance, { skipEpg = false } = {}) {
@@ -180,6 +142,7 @@ async function fetchEpg(addonInstance) {
     const { config } = addonInstance;
     addonInstance.epgData = {};
     addonInstance.epgRefreshFailed = false;
+    addonInstance.epgRetentionStatus = null;
     // EPG sources are merged by XMLTV channel ID; an unavailable source does not disable the others.
     if (config.enableEpg) {
         const epgSources = [...new Set([...(config.epgUrl ? [config.epgUrl] : []), ...(Array.isArray(config.epgUrls) ? config.epgUrls : [])].filter(Boolean))];
@@ -210,26 +173,7 @@ async function fetchEpg(addonInstance) {
                 clearTimeout(timeout);
             }
         });
-        const merged = {};
-        for (const parsed of parsedSources) {
-            if (!parsed) continue;
-            for (const [channelId, programmes] of Object.entries(parsed)) {
-                if (!merged[channelId]) merged[channelId] = [];
-                merged[channelId].push(...programmes);
-            }
-        }
-        for (const channelId of Object.keys(merged)) {
-            const seen = new Set();
-            merged[channelId] = merged[channelId]
-                .filter(programme => {
-                    const key = [programme.start, programme.stop, programme.title].join('|');
-                    if (seen.has(key)) return false;
-                    seen.add(key);
-                    return true;
-                })
-                .sort((a, b) => String(a.start).localeCompare(String(b.start)));
-        }
-        addonInstance.epgData = merged;
+        addonInstance.epgData = mergeEpgSources(addonInstance, parsedSources);
     }
 
 }

@@ -568,10 +568,10 @@ async function testDisposalReportsFlushFailuresAfterTryingEveryStore() {
         assert.deepStrictEqual(error.failedCaches, ["provider snapshot", "catalogue metadata"]);
         return true;
     });
-    assert.deepStrictEqual(attempted.sort(), ["metadata", "provider", "series"]);
+    assert.deepStrictEqual(attempted.sort(), ["metadata", "metadata", "provider", "provider", "series", "series"]);
     assert.strictEqual(released, 1);
     await assert.rejects(() => instance.dispose());
-    assert.strictEqual(attempted.length, 3, "repeat disposal joins the original operation");
+    assert.strictEqual(attempted.length, 6, "repeat disposal joins the original early/final flush operation");
 }
 
 async function runApiProbe(mode) {

@@ -50,6 +50,7 @@ function uniqueNames(items, selector, limit = 20) {
   const seen = new Set();
   const result = [];
   for (const item of items) {
+    if (!item || typeof item !== "object") continue;
     const name = nonEmpty(selector(item));
     if (name && !seen.has(name)) {
       seen.add(name);
@@ -286,8 +287,8 @@ function mapMovieMetadata(details, credits, videos, images) {
   const directors = uniqueNames(credits?.crew, person => person.job === "Director" ? person.name : null, 10);
   const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
-    ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
-      || videos.results.find(video => video.site === "YouTube" && video.key)
+    ? videos.results.find(video => video?.site === "YouTube" && video.type === "Trailer" && video.key)
+      || videos.results.find(video => video?.site === "YouTube" && video.key)
     : null;
   const genres = Array.isArray(details.genres) ? uniqueNames(details.genres, genre => genre.name, 20) : [];
   const year = dateYear(details.release_date);
@@ -358,18 +359,21 @@ async function getTrailerMetadata(type, id, previous) {
     parsePositiveInteger(process.env.CATALOG_METADATA_REFRESH_MS, 14 * 86400000, 3600000, 90 * 86400000);
   if (String(previous?.tmdbId) === id && now - previous.checkedAt >= 0 && now - previous.checkedAt < interval) return previous;
   const videos = await request("/" + type + "/" + id + "/videos?language=en-GB", { refresh: Boolean(previous) });
-  const results = Array.isArray(videos?.results) ? videos.results : [];
-  const trailer = results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
-    || results.find(video => video.site === "YouTube" && video.key);
-  return { tmdbId: id, checkedAt: now, failed: !Array.isArray(videos?.results),
+  const validResults = Array.isArray(videos?.results) && videos.results.every(video => video && typeof video === "object");
+  const results = validResults ? videos.results : [];
+  const trailer = results.find(video => video?.site === "YouTube" && video.type === "Trailer" && video.key)
+    || results.find(video => video?.site === "YouTube" && video.key);
+  return { tmdbId: id, checkedAt: now, failed: !validResults,
     trailer: trailer ? { id: trailer.key, title: trailer.name || "Trailer", site: "YouTube" }
-      : (Array.isArray(videos?.results) ? null : previous?.trailer || null) };
+      : (validResults ? null : previous?.trailer || null) };
 }
 
 async function getDetailedMetadata(type, tmdbId, options = {}) {
   const id = validTmdbId(tmdbId);
   if (!id) { options.onMetadata?.(null); return null; }
-  const extraPromise = getTrailerMetadata(type, id, options.detailExtras);
+  const extraPromise = getTrailerMetadata(type, id, options.detailExtras).catch(() => ({
+    tmdbId: id, checkedAt: Date.now(), failed: true, trailer: options.detailExtras?.trailer || null
+  }));
   const base = options.cachedMetadata || await (type === "tv" ? getSeriesCatalogMetadata(id, options) : getMovieCatalogMetadata(id, options));
   options.onMetadata?.(base);
   const extras = await extraPromise;
@@ -385,8 +389,8 @@ function mapSeriesMetadata(details, credits, videos, images) {
   const logo = selectLogo(images);
   const cast = uniqueNames(credits?.cast, person => person.name, MAX_MAIN_CAST);
   const trailer = Array.isArray(videos?.results)
-    ? videos.results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
-      || videos.results.find(video => video.site === "YouTube" && video.key)
+    ? videos.results.find(video => video?.site === "YouTube" && video.type === "Trailer" && video.key)
+      || videos.results.find(video => video?.site === "YouTube" && video.key)
     : null;
   const year = dateYear(details.first_air_date);
   const endYear = dateYear(details.last_air_date);
@@ -428,7 +432,7 @@ async function getSeriesMetadata(tmdbId, options = {}) {
 
 function mapSeasonEpisodes(data, season) {
   if (!data || !Array.isArray(data.episodes)) return null;
-  return data.episodes.map(episode => ({
+  return data.episodes.filter(episode => episode && typeof episode === "object").map(episode => ({
     season: Number.isSafeInteger(episode.season_number) ? episode.season_number : season,
     episode: Number.isSafeInteger(episode.episode_number) ? episode.episode_number : undefined,
     title: nonEmpty(episode.name),
@@ -436,9 +440,6 @@ function mapSeasonEpisodes(data, season) {
     thumbnail: imageUrl(episode.still_path, "w500"),
     released: nonEmpty(episode.air_date),
     runtime: Number.isFinite(episode.runtime) && episode.runtime > 0 ? episode.runtime + " min" : undefined,
-    rating: Number.isFinite(episode.vote_average) && episode.vote_count > 0 ? Number(episode.vote_average).toFixed(1) : undefined,
-    guestStars: uniqueNames(episode.guest_stars, person => person.name, 15),
-    directors: uniqueNames(episode.crew, person => /director/i.test(String(person.job || "")) ? person.name : null, 10),
   })).filter(episode => Number.isSafeInteger(episode.episode) && episode.episode > 0);
 }
 

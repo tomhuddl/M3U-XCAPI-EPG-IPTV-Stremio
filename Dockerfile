@@ -10,8 +10,13 @@ RUN npm ci --omit=dev && npm cache clean --force
 # Copy application files without making the runtime process root.
 COPY --chown=node:node . .
 
+# Initialize the named-volume mount point for the non-root runtime user.
+RUN mkdir -p /data && chown node:node /data
+
+ENV PERSISTENT_DATA_DIR=/data
+
 EXPOSE 7000
 
 USER node
 
-CMD ["npm", "start"]
+CMD ["node", "server.js"]

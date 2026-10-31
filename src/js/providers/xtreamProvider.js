@@ -4,26 +4,10 @@
 // - fetchSeriesInfo lazily queries per-series episodes (get_series_info)
 // episodes are transformed into Stremio 'videos' (season/episode).
 const { safeFetch: fetch } = require("../../../urlSafety");
+const { mapWithConcurrency } = require("../../../asyncUtils");
+const { getEpgFetchConcurrency, mergeEpgSources } = require("./epgUtils");
 const { parseEPGStream } = require("../epgStreamParser");
 const { parseRuntimeMinutes } = require("../../../seriesRuntime");
-
-function getEpgFetchConcurrency() {
-    const parsed = Number.parseInt(process.env.EPG_FETCH_CONCURRENCY, 10);
-    return Number.isSafeInteger(parsed) && parsed >= 1 ? Math.min(parsed, 4) : 2;
-}
-
-async function mapWithConcurrency(items, concurrency, mapper) {
-    const results = new Array(items.length);
-    let nextIndex = 0;
-    const workerCount = Math.min(items.length, concurrency);
-    await Promise.all(Array.from({ length: workerCount }, async () => {
-        while (nextIndex < items.length) {
-            const index = nextIndex++;
-            results[index] = await mapper(items[index], index);
-        }
-    }));
-    return results;
-}
 
 function assertCatalogueIdentifiers(items, idField, label) {
   for (const item of items) {
@@ -38,6 +22,17 @@ function assertCatalogueIdentifiers(items, idField, label) {
       throw error;
     }
   }
+}
+
+async function fetchCatalogueResponse(url, options) {
+  const response = await fetch(url, options);
+  try {
+    if (!response.ok) return { ok: false };
+    // Consume siblings immediately, so one failed catalogue request cannot leave
+    // other parallel response bodies occupying sockets/loading slots.
+    const data = await response.json();
+    return { ok: true, json: async () => data };
+  } finally { response.body?.destroy?.(); }
 }
 
 async function fetchData(addonInstance, { skipEpg = false } = {}) {
@@ -61,59 +56,26 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
   addonInstance.epgRefreshFailed = false;
 
   if (xtreamUseM3U) {
-    // M3U plus mode (series heuristic limited)
-    const url =
-      `${xtreamUrl}/get.php?username=${encodeURIComponent(xtreamUsername)}` +
-      `&password=${encodeURIComponent(xtreamPassword)}` +
-      `&type=m3u_plus` +
-      (xtreamOutput ? `&output=${encodeURIComponent(xtreamOutput)}` : "");
-    const resp = await fetch(url, {
-      timeout: 30000,
-      headers: { "User-Agent": "Stremio M3U/EPG Addon (xtreamProvider/m3u)" },
-    });
-    if (!resp.ok) throw new Error("Xtream M3U fetch failed");
-    const text = await resp.text();
-    const items = addonInstance.parseM3U(text);
-
-    addonInstance.channels = items.filter((i) => i.type === "tv");
-    addonInstance.movies = items.filter((i) => i.type === "movie");
-
-    if (config.includeSeries !== false) {
-      const seriesCandidates = items.filter((i) => i.type === "series");
-      // Reduce duplication by grouping by cleaned series name
-      const seen = new Map();
-      for (const sc of seriesCandidates) {
-        const baseName = sc.name.replace(/\bS\d{1,2}E\d{1,2}\b.*$/i, "").trim();
-        if (!seen.has(baseName)) {
-          seen.set(baseName, {
-            id: `iptv_series_${cryptoHash(baseName)}`,
-            series_id: cryptoHash(baseName),
-            name: baseName,
-            type: "series",
-            poster: sc.logo || sc.attributes?.["tvg-logo"],
-            plot: sc.attributes?.["plot"] || "",
-            category: sc.category,
-            attributes: {
-              "tvg-logo": sc.logo || sc.attributes?.["tvg-logo"],
-              "group-title": sc.category || sc.attributes?.["group-title"],
-              plot: sc.attributes?.["plot"] || "",
-            },
-          });
-        }
-      }
-      addonInstance.series = Array.from(seen.values());
-    }
+    const url = new URL(xtreamUrl + "/get.php");
+    url.searchParams.set("username", xtreamUsername);
+    url.searchParams.set("password", xtreamPassword);
+    url.searchParams.set("type", "m3u_plus");
+    if (xtreamOutput) url.searchParams.set("output", xtreamOutput);
+    const playlist = Object.assign(Object.create(addonInstance), { config: { ...config, m3uUrl: url.toString() } });
+    await require("./directProvider").fetchData(playlist, { skipEpg: true });
+    for (const field of ["channels", "movies", "series", "directSeriesEpisodeIndex", "directSeriesEpisodeById"])
+      addonInstance[field] = playlist[field];
   } else {
     // JSON API mode
     const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
     // Fetch streams + category lists in parallel to map category_id -> category_name
     const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-      fetch(`${base}&action=get_live_streams`, { timeout: 30000 }),
-      fetch(`${base}&action=get_vod_streams`, { timeout: 30000 }),
-      fetch(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
+      fetchCatalogueResponse(`${base}&action=get_live_streams`, { timeout: 30000 }),
+      fetchCatalogueResponse(`${base}&action=get_vod_streams`, { timeout: 30000 }),
+      fetchCatalogueResponse(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
-      fetch(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
+      fetchCatalogueResponse(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
     ]);
@@ -199,8 +161,8 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
     if (config.includeSeries !== false) {
       try {
         const [seriesResp, seriesCatsResp] = await Promise.all([
-          fetch(`${base}&action=get_series`, { timeout: 35000 }),
-          fetch(`${base}&action=get_series_categories`, {
+          fetchCatalogueResponse(`${base}&action=get_series`, { timeout: 35000 }),
+          fetchCatalogueResponse(`${base}&action=get_series_categories`, {
             timeout: 20000,
           }).catch((error) => {
             return null;
@@ -269,6 +231,7 @@ async function fetchEpg(addonInstance) {
   const { xtreamUrl, xtreamUsername, xtreamPassword } = config;
   addonInstance.epgData = {};
   addonInstance.epgRefreshFailed = false;
+  addonInstance.epgRetentionStatus = null;
   // Merge the selected primary XMLTV feed with any additional feeds.
   if (config.enableEpg) {
     const customEpgUrl = config.epgUrl && typeof config.epgUrl === "string" && config.epgUrl.trim()
@@ -295,26 +258,7 @@ async function fetchEpg(addonInstance) {
         return null;
       }
     });
-    const merged = {};
-    for (const parsed of parsedSources) {
-      if (!parsed) continue;
-      for (const [channelId, programmes] of Object.entries(parsed)) {
-        if (!merged[channelId]) merged[channelId] = [];
-        merged[channelId].push(...programmes);
-      }
-    }
-    for (const channelId of Object.keys(merged)) {
-      const seen = new Set();
-      merged[channelId] = merged[channelId]
-        .filter(programme => {
-          const key = [programme.start, programme.stop, programme.title].join("|");
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        })
-        .sort((a, b) => String(a.start).localeCompare(String(b.start)));
-    }
-    addonInstance.epgData = merged;
+    addonInstance.epgData = mergeEpgSources(addonInstance, parsedSources);
   }
 
 }
@@ -442,6 +386,7 @@ function seriesLevelRuntime(info) {
 async function fetchSeriesInfo(addonInstance, seriesId) {
   // Fetch playable episodes on demand; individual durations are saved with details.
   const { config } = addonInstance;
+  if (config.xtreamUseM3U) return require("./directProvider").fetchSeriesInfo(addonInstance, seriesId);
   if (!seriesId || !hasSeriesCredentials(addonInstance)) return { videos: [] };
   try {
     const { payload: infoJson, diagnostic } = await requestSeriesPayload(addonInstance, seriesId);
@@ -515,14 +460,6 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
       fetchedAt: Date.now()
     };
   }
-}
-
-function cryptoHash(text) {
-  return require("crypto")
-    .createHash("md5")
-    .update(text)
-    .digest("hex")
-    .slice(0, 12);
 }
 
 module.exports = {

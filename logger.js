@@ -6,7 +6,7 @@ const requestedLevel = (process.env.LOG_LEVEL || "info").trim().toLowerCase();
 const minimumLevel = LEVELS[requestedLevel] ?? LEVELS.info;
 
 function isEnabled(level, forceDebug = false) {
-    if (forceDebug || DEBUG_MODE) return true;
+    if ((typeof forceDebug === "function" ? forceDebug() : forceDebug) || DEBUG_MODE) return true;
     return LEVELS[level] >= minimumLevel;
 }
 

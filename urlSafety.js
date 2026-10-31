@@ -18,8 +18,14 @@ const pendingDnsLookups = new Map();
 
 function lookupAllAddresses(hostname) {
   if (pendingDnsLookups.has(hostname)) return pendingDnsLookups.get(hostname);
-  const lookup = dns.lookup(hostname, { all: true, verbatim: true })
-    .finally(() => pendingDnsLookups.delete(hostname));
+  let timer;
+  const lookup = Promise.race([
+    dns.lookup(hostname, { all: true, verbatim: true }),
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("URL DNS lookup timed out")), 10000); })
+  ]).finally(() => {
+    clearTimeout(timer);
+    if (pendingDnsLookups.get(hostname) === lookup) pendingDnsLookups.delete(hostname);
+  });
   pendingDnsLookups.set(hostname, lookup);
   return lookup;
 }
@@ -189,6 +195,7 @@ async function safeFetchUnscheduled(input, options = {}) {
       }
 
       let dnsTimer;
+      let onDnsAbort;
       let records;
       const dnsStartedAt = Date.now();
       try {
@@ -200,9 +207,15 @@ async function safeFetchUnscheduled(input, options = {}) {
               10000,
             );
           }),
+          new Promise((_, reject) => {
+            onDnsAbort = () => reject(Object.assign(new Error("Request aborted or timed out"), { name: "AbortError" }));
+            controller.signal.addEventListener("abort", onDnsAbort, { once: true });
+            if (controller.signal.aborted) onDnsAbort();
+          }),
         ]);
       } finally {
         clearTimeout(dnsTimer);
+        controller.signal.removeEventListener("abort", onDnsAbort);
         if (diagnostics) {
           diagnostics.dnsMs = (diagnostics.dnsMs || 0) + Date.now() - dnsStartedAt;
         }
@@ -283,15 +296,27 @@ async function safeFetchUnscheduled(input, options = {}) {
 
 async function safeFetch(input, options = {}) {
   const origin = new URL(input).origin;
-  const release = await scheduler.acquire(origin, requestContext.current().priority);
+  const timeoutMs = Number.isFinite(options.timeout) && options.timeout > 0 ? Math.min(options.timeout, 120000) : 45000;
+  const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(onAbort, timeoutMs);
+  let release;
+  const cleanup = () => {
+    clearTimeout(timer); options.signal?.removeEventListener("abort", onAbort); release?.();
+  };
   try {
-    const response = await safeFetchUnscheduled(input, options);
+    release = await scheduler.acquire(origin, requestContext.current().priority, { signal: controller.signal });
+    const response = await safeFetchUnscheduled(input, { ...options, signal: controller.signal,
+      timeout: Math.max(1, deadline - Date.now()) });
     if (response.body?.once) {
-      response.body.once("end", release); response.body.once("close", release); response.body.once("error", release);
-      if (response.body.readableEnded || response.body.destroyed) release();
-    } else release();
+      response.body.once("end", cleanup); response.body.once("close", cleanup); response.body.once("error", cleanup);
+      if (response.body.readableEnded || response.body.destroyed) cleanup();
+    } else cleanup();
     return response;
-  } catch (error) { release(); throw error; }
+  } catch (error) { cleanup(); throw error; }
 }
 
 module.exports = {

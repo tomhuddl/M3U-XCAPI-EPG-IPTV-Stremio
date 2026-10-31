@@ -56,7 +56,7 @@
             <legend>Diagnostics</legend>
             <div class="form-group checkbox-line">
                 <input type="checkbox" id="debugMode" name="debugMode">
-                <label class="checkbox-label" for="debugMode" class="inline">Enable Debug Logging</label>
+                <label class="checkbox-label" for="debugMode">Enable Debug Logging</label>
             </div>
         </fieldset>
 
@@ -66,18 +66,7 @@
         </div>
         <div class="donate-inline under-form">
             <p class="hint" style="margin:.4rem 0 .6rem;">Enjoying the addon? Support development:</p>
-            <script type="text/javascript"
-                    src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js"
-                    data-name="bmc-button"
-                    data-slug="K3QSoR2"
-                    data-color="#BD5FFF"
-                    data-emoji="☕"
-                    data-font="Cookie"
-                    data-text="Buy me a coffee"
-                    data-outline-color="#000000"
-                    data-font-color="#ffffff"
-                    data-coffee-color="#FFDD00">
-            </script>
+            <iframe class="donation-frame" title="Support Inside4ndroid" src="/support.html" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy"></iframe>
         </div>
     </form>
 
@@ -99,7 +88,7 @@
     </div>
 </footer>
 
-<div id="loaderOverlay" class="overlay hidden">
+<div id="loaderOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="loaderMessage">
     <div class="overlay-box">
         <header class="overlay-header">
             <h2 id="loaderMessage">Starting…</h2>
@@ -108,12 +97,14 @@
         <div class="progress-track"><div id="progressBar" class="progress-fill" style="width:0%"></div></div>
         <pre id="statusDetails" class="status-log" aria-live="polite"></pre>
         <div class="overlay-actions">
+            <button id="closeSetupBtn" type="button" class="btn secondary">Close</button>
             <button id="openStremioBtn" class="btn success" disabled>Open in Stremio</button>
             <button id="copyManifestBtn" class="btn secondary" disabled>Copy Manifest URL</button>
         </div>
     </div>
 </div>
 
+<script src="/js/m3u-parser.js"></script>
 <script src="/js/configure-common.js"></script>
 <script src="/js/direct-config.js"></script>
 </body>

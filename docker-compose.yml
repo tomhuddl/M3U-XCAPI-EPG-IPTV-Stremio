@@ -13,6 +13,7 @@ services:
     volumes:
       - addon-data:/data
     restart: unless-stopped
+    stop_grace_period: 30s
     # Uncomment below if you want to use Redis
     # depends_on:
     #   - redis

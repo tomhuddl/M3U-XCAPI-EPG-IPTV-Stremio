@@ -24,7 +24,7 @@
         appendDetail,
         prefillIfReconfigure,
         robustFetch,
-        quickEpgStats
+        checkEpgStats, getGeneration, isCurrent
     } = window.ConfigureCommon || {};
 
     if (!window.ConfigureCommon) {
@@ -32,7 +32,7 @@
         return;
     }
 
-    if (typeof prefillIfReconfigure === 'function') prefillIfReconfigure('direct');
+    const prefillReady = typeof prefillIfReconfigure === 'function' ? prefillIfReconfigure() : Promise.resolve();
 
     function validateUrl(u) {
         try {
@@ -43,50 +43,11 @@
         }
     }
 
-    function parseM3U(content) {
-        const start = performance.now();
-        const lines = content.split('\n');
-        const items = [];
-        let current = null;
-        let processed = 0;
-        for (const raw of lines) {
-            const line = raw.trim();
-            if (line.startsWith('#EXTINF:')) {
-                const m = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
-                if (m) {
-                    current = {
-                        duration: parseInt(m[1]),
-                        attrs: parseAttrs(m[2] || ''),
-                        name: (m[3] || '').trim()
-                    };
-                }
-            } else if (line && !line.startsWith('#') && current) {
-                current.url = line;
-                items.push(current);
-                current = null;
-            }
-            processed++;
-            if (processed % 1500 === 0) {
-                appendDetail(`… parsed ${processed}/${lines.length}`);
-            }
-        }
-        const ms = (performance.now() - start).toFixed(1);
-        appendDetail(`✔ Playlist parsed: ${items.length} entries (${ms} ms)`);
-        return items;
-    }
-
-    function parseAttrs(str) {
-        const out = {};
-        const r = /(\w+(?:-\w+)*)="([^"]*)"/g;
-        let m;
-        while ((m = r.exec(str)) !== null) out[m[1]] = m[2];
-        return out;
-    }
-
-    
+    const parseM3U = window.M3UParser.parseM3U;
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
+        await prefillReady;
 
         const m3uUrl = m3uInput.value.trim();
         const enableEpgInitial = enableEpgChk.checked;
@@ -113,6 +74,7 @@
         }
 
         showOverlay(true);
+        const generation = getGeneration();
         overlaySetMessage('Pre-flight: Validating inputs…');
         setProgress(4, 'Starting');
         appendDetail('== PRE-FLIGHT CHECKS ==');
@@ -125,6 +87,7 @@
             // 1. Fetch Playlist
             setProgress(10, 'Fetching Playlist');
             const playlistText = await robustFetch(m3uUrl, 'playlist');
+            if (!isCurrent(generation)) return;
 
             // 2. Parse M3U
             setProgress(28, 'Parsing Playlist');
@@ -133,27 +96,25 @@
 
             // Stats
             const approxMovies = items.filter(i =>
-                /movie/i.test(i.name) || /\(\d{4}\)/.test(i.name)
+                i.type === "movie"
             ).length;
             const approxTv = items.length - approxMovies;
             appendDetail(`Heuristic: ~${approxTv} TV / ~${approxMovies} Movie`);
 
             // 3. Optional EPG feeds (each source fails independently)
             const epgSources = [...new Set([...(epgUrl ? [epgUrl] : []), ...epgUrls])];
-            const validEpgSources = [];
             if (enableEpgInitial && epgSources.length) {
                 for (let index = 0; index < epgSources.length; index++) {
                     const sourceUrl = epgSources[index];
                     try {
-                        const epgTxt = await robustFetch(sourceUrl, 'epg ' + (index + 1));
-                        const stats = quickEpgStats(epgTxt);
-                        validEpgSources.push(sourceUrl);
-                        appendDetail('✔ EPG source ' + (index + 1) + ': ' + stats.programmes.toLocaleString() + ' programmes');
+                        await checkEpgStats(sourceUrl, index + 1);
+                        if (!isCurrent(generation)) return;
                     } catch {
+                        if (!isCurrent(generation)) return;
                         appendDetail('⚠ EPG source ' + (index + 1) + ' failed; continuing with other sources.');
                     }
                 }
-                if (!validEpgSources.length) enableEpgFinal = false;
+                // Retain selected sources so transient failures can recover on refresh.
             } else if (enableEpgInitial) {
                 appendDetail('No EPG URL supplied; continuing without EPG.');
                 enableEpgFinal = false;
@@ -169,9 +130,9 @@
                 enableEpg: enableEpgFinal,
                 debug: debug || undefined
             };
-            if (enableEpgFinal && validEpgSources.length) {
-                config.epgUrl = validEpgSources[0];
-                config.epgUrls = validEpgSources.slice(1);
+            if (enableEpgFinal && epgSources.length) {
+                config.epgUrl = epgSources[0];
+                config.epgUrls = epgSources.slice(1);
             }
             if (isFinite(epgOffsetHours) && epgOffsetHours !== 0) config.epgOffsetHours = epgOffsetHours;
 
@@ -185,6 +146,7 @@
             appendDetail('Polling server…');
             startPolling(70);
         } catch (err) {
+            if (!isCurrent(generation)) return;
             console.error('[DIRECT-CONFIG] Pre-flight error', err);
             overlaySetMessage('Pre-flight failed');
             appendDetail('✖ Error: ' + (err.message || err.toString()));

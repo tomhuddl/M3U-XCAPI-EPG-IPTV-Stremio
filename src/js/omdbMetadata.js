@@ -16,7 +16,6 @@ const DATA_DIR = process.env.PERSISTENT_DATA_DIR || path.join(process.cwd(), "da
 const USAGE_FILE = path.join(DATA_DIR, "omdb-usage.json");
 let usageState = null;
 let usageLoadPromise = null;
-let usageWriteQueue = Promise.resolve();
 let reservedRequestsRemaining = 0;
 let usageReservationPromise = null;
 const diagnostics = {
@@ -73,52 +72,40 @@ async function loadUsageState() {
 }
 
 async function reserveDailyRequest() {
-  const state = await loadUsageState();
-  const today = new Date().toISOString().slice(0, 10);
-  if (state.day !== today) {
-    state.day = today;
-    state.count = 0;
-    reservedRequestsRemaining = 0;
-  }
-  if (reservedRequestsRemaining > 0) {
-    reservedRequestsRemaining--;
-    return true;
-  }
-  if (state.count >= DAILY_REQUEST_LIMIT) return false;
-  if (usageReservationPromise) {
-    const reserved = await usageReservationPromise;
-    return reserved ? reserveDailyRequest() : false;
-  }
-
-  const reservation = (async () => {
-    const grant = Math.min(DAILY_RESERVATION_BLOCK_SIZE, DAILY_REQUEST_LIMIT - state.count);
-    if (grant <= 0) return false;
-    const snapshot = { day: state.day, count: state.count + grant };
-    let persisted = true;
-    // Persist the budget block before using any of it. If the process stops, the
-    // unused slots are conservatively counted, so a restart cannot exceed quota.
-    usageWriteQueue = usageWriteQueue.catch(() => {}).then(async () => {
-      await fs.promises.mkdir(DATA_DIR, { recursive: true });
+  // Serialize rollover, reservation and consumption, not only the disk write.
+  // Otherwise a reservation from yesterday can overwrite today's shared state.
+  const reservation = Promise.resolve(usageReservationPromise).catch(() => {}).then(async () => {
+    const state = await loadUsageState();
+    while (true) {
+      const today = new Date().toISOString().slice(0, 10);
+      if (state.day !== today) {
+        state.day = today;
+        state.count = 0;
+        reservedRequestsRemaining = 0;
+      }
+      if (reservedRequestsRemaining > 0) { reservedRequestsRemaining--; return true; }
+      if (state.count >= DAILY_REQUEST_LIMIT) return false;
+      const grant = Math.min(DAILY_RESERVATION_BLOCK_SIZE, DAILY_REQUEST_LIMIT - state.count);
+      const snapshot = { day: today, count: state.count + grant };
       const temp = USAGE_FILE + "." + process.pid + ".tmp";
-      await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
-      await fs.promises.rename(temp, USAGE_FILE);
-    }).catch(() => {
-      persisted = false;
-    });
-    await usageWriteQueue;
-    if (!persisted) return false;
-    state.count = snapshot.count;
-    reservedRequestsRemaining = grant;
-    return true;
-  })();
+      try {
+        await fs.promises.mkdir(DATA_DIR, { recursive: true });
+        await fs.promises.writeFile(temp, JSON.stringify(snapshot), { mode: 0o600 });
+        await fs.promises.rename(temp, USAGE_FILE);
+      } catch { return false; }
+      finally { await fs.promises.unlink(temp).catch(() => {}); }
+      if (new Date().toISOString().slice(0, 10) !== today) continue;
+      state.count = snapshot.count;
+      reservedRequestsRemaining = grant - 1;
+      return true;
+    }
+  });
   usageReservationPromise = reservation;
-  let reserved;
   try {
-    reserved = await reservation;
+    return await reservation;
   } finally {
     if (usageReservationPromise === reservation) usageReservationPromise = null;
   }
-  return reserved ? reserveDailyRequest() : false;
 }
 
 function parsePositiveInteger(value, fallback, min, max) {
@@ -189,6 +176,7 @@ async function getByImdbId(value, options = {}) {
         headers: { Accept: "application/json", "User-Agent": "M3U-XCAPI-EPG-IPTV-Stremio" }
       });
       if (!response || !response.ok) {
+        response?.body?.destroy?.();
         markRetryableFailure(imdbId, true);
         recordOutcome("retryable-failure", { httpOk: Boolean(response?.ok) });
         return retryableResult(imdbId, staleCached);
@@ -214,7 +202,8 @@ async function getByImdbId(value, options = {}) {
         recordOutcome("definitive-no-match");
         return result;
       }
-      const ratingValue = Number(data.imdbRating);
+      const ratingValue = data.imdbRating != null && String(data.imdbRating).trim() !== ""
+        ? Number(data.imdbRating) : NaN;
       const freshResult = {
         imdbId: validImdbId(data.imdbID) || imdbId,
         omdbChecked: true,

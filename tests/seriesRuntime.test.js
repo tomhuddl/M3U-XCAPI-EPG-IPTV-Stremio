@@ -656,7 +656,7 @@ async function testSeriesDetailAverageMatchesPersistentCataloguePreview() {
         assert.strictEqual(detailed.runtime, "49 min");
         assert.strictEqual(store.entries.get(item.id).value.runtime, detailed.runtime);
         assert.strictEqual(store.entries.get(item.id).value.runtimeAverage.episodeCount, 9);
-        assert.strictEqual(detailed.videos[0].runtime, "56 min", "episode-specific runtime must remain unchanged");
+        assert.strictEqual(detailed.videos[0].runtime, undefined, "ordinary episode responses omit runtime while the series average still uses internal durations");
     } finally {
         tmdbMetadata.getSeriesMetadata = originals.details;
         tmdbMetadata.getSeasonEpisodes = originals.episodes;

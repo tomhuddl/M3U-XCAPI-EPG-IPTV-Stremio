@@ -110,9 +110,9 @@ services:
       CACHE_ENABLED: "true"
       CACHE_TTL_MS: 21600000
       PERSISTENT_DATA_DIR: /data
-      MAX_CACHE_ENTRIES: 400
+      MAX_CACHE_ENTRIES: 10
       PREFETCH_ENABLED: "true"
-      PREFETCH_MAX_BYTES: 6000000
+      PREFETCH_MAX_BYTES: 50000000
       CONFIG_SECRET: "generate_a_long_random_string"
       DEBUG_MODE: "false"
     depends_on:
@@ -218,15 +218,19 @@ The existing catalogue metadata volume stores `runtimeAverage`: its source, disp
 
 ### Loading and response data
 
+Search treats `and` and `&` as equivalent, including forms without surrounding spaces such as `Tom&Jerry`. This affects matching and ranking only; displayed titles are unchanged. Apostrophes, punctuation, accents and case retain their existing normalization, and typo matching remains disabled.
+
 Catalogue and search pages still wait for full available metadata enrichment before returning their cards. Detail responses merge saved metadata with current source results, and catalogue/detail requests rebuild if a provider refresh changes their generation while they are loading. A valid saved provider snapshot can serve requests immediately after startup while an overdue provider/guide refresh runs in the background; an installation with no usable snapshot waits for its initial provider load.
 
 The application keeps refresh flags, schema/policy versions, check timestamps and runtime-average summaries internally on the volume. These internal fields are omitted from Stremio responses. Public cards/details retain descriptions, artwork, years/release information, title-level runtimes, ratings, cast/directors, trailers and applicable links. Writer credits retain their iOS-only behavior. Channel metadata omits the artificial `runtime: "Live"` label. Ordinary series episode responses omit unused episode cast/director/link/runtime fields; episode titles, dates, overviews and thumbnails remain, and internal durations remain available to enrichment. Native EPG programmes retain their real durations, start/end times and programme metadata.
 
 Repeated details requests share in-progress assembly and use a bounded five-minute in-memory result cache, invalidated by provider or metadata changes and due retries. Fresh saved preview fields and trailer-check state avoid repeating raw TMDb/OMDb requests after a restart. Opened Xtream series can save mapped TMDb season/episode metadata alongside their provider episode lists. This extra enrichment uses the normal 14-day metadata interval; newly listed provider episodes trigger a fresh season lookup. Extra episode metadata is limited to 200 series and 256 KiB per series. Failed or incomplete season refreshes retain saved episode metadata and use the 12-hour retry interval. Saving it does not renew the provider episode-list timestamp, and no bulk provider episode download is introduced.
 
-Upstream requests have per-origin concurrency bounds with capacity reserved for interactive work, foreground priority and bounded background progress. This is not a rate-limit cooldown. Abandoned catalogue requests stop starting unshared item work; lookups shared with other requests can finish and populate the cache. Cache pruning is batched, and background scans yield between batches. Guide responses have a small bounded cache invalidated by guide/catalogue changes. SDK routers are reused and public metadata is serialized once. Larger JSON responses negotiate gzip/Brotli compression, preserving existing encodings and freshness headers; small stream responses remain uncompressed.
+Upstream requests have per-origin and process-wide concurrency bounds with capacity reserved for interactive work, foreground priority and bounded background progress. Queue time counts toward request deadlines and cancelled tickets are removed. This is not a rate-limit cooldown. Abandoned catalogue requests stop starting unshared item work; lookups shared with other requests can finish and populate the cache. Cache pruning is batched, and background scans yield between batches. Guide responses have a small bounded cache invalidated by guide/catalogue changes. SDK routers are reused and public metadata is serialized once. Larger JSON responses negotiate gzip/Brotli compression, preserving existing encodings and freshness headers; small stream responses remain uncompressed.
 
 No new Railway settings or volume reset are required. Keep one process writing to each cache directory. `LOG_LEVEL=debug` adds a single stage-timing record for very slow detail requests without restoring progress/API counter or rate-limit log spam.
+
+See [Fresh deployment and manual checks](FRESH_DEPLOYMENT.md) for Railway paths, graceful shutdown, optional owner-only setup access and the manual Stremio checks. Startup verifies configured storage is writable; journal recovery preserves newer values after interrupted appends. Malformed optional metadata retains saved fields, Redis has bounded command waits, and UTC-day quota reservations are serialized. Shared playlist parsing supports both direct and Xtream M3U episode indexes. Guide-size limits are explicit in saved status and logs. Selected EPG URLs are retained through temporary setup failures so normal refreshes can retry them.
 
 ### Metadata source priority
 
@@ -278,7 +282,7 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `SERIES_INFO_PERSISTENT_TTL_MS` | same as DATA_REFRESH_INTERVAL_MS | Freshness window for persisted Xtream episode details (bounded to 1h–30d) |
 | `SERIES_INFO_STALE_RETENTION_MS` | 2592000000 (30d) | Maximum stale Xtream episode-detail fallback age |
 | `SERIES_INFO_PERSISTENT_MAX_ENTRIES` | 20000 | Maximum persistent Xtream series-detail entries |
-| `EPG_FETCH_CONCURRENCY` | 2 | Concurrent EPG sources fetched and parsed per provider (capped at 4) |
+| `EPG_FETCH_CONCURRENCY` | 1 | Process sources in configured order, giving earlier feeds priority under aggregate guide limits. Values 2-4 enable parallel parsing with a shared retention budget. |
 | `SERIES_EPISODE_METADATA_CONCURRENCY` | 6 | Concurrent TMDb season episode requests on a series detail page (capped at 12) |
 | `SERIES_EPISODE_CACHE_MAX` | 50000 | Maximum in-memory episode ID lookup entries (bounded to 1,000–200,000) |
 | `CATALOG_META_MEMORY_TTL_MS` | `21600000` (6h) | In-memory LRU lifetime for enriched movie/series metadata |
@@ -309,6 +313,10 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 | `PROVIDER_MAX_BYTES` | `50000000` (50 MB) | Max bytes read from each playlist, API or EPG response; hard cap 150 MB |
 | `EPG_MAX_BYTES` | `150000000` (150 MB) | Maximum bytes accepted for each XMLTV guide, also used by `/api/epg-stats`; configurable from 1 MiB to the 150 MB hard cap |
 | `MAX_ACTIVE_INTERFACE_BUILDS` | `2` | Concurrent addon build limit (maximum 8) |
+| `MAX_LIVE_ADDON_INTERFACES` | `6` | Limit across cached and draining interfaces; new distinct builds wait for capacity to become available. |
+| `SHUTDOWN_TIMEOUT_MS` | `15000` | Overall budget for draining work and saving completed cache updates before exit. |
+| `SETUP_PASSWORD` | unset | Optional owner-only protection for setup pages, token creation and preflight. At least 16 characters; use HTTPS. Installed token routes keep working. |
+| `SETUP_USERNAME` | `admin` | Username used when SETUP_PASSWORD is configured. |
 | `ALLOW_LEGACY_CONFIG_TOKENS` | `false` | Temporary opt-in for old plaintext Base64 configuration links |
 | `NODE_ENV` | (user value) | Standard Node semantics |
 
@@ -513,7 +521,7 @@ A: Ensure naming matches patterns (`S01E01` or `Season 1 Episode 1`). Heuristic 
 
 Please include:
 - Node version
-- Hosting method (Docker / bare / serverless)
+- Hosting method (Railway / Docker / bare Node)
 - Provider type (direct / xtream-json / xtream-m3u)
 - Sample (sanitized) playlist or line count
 - Logs with debug enabled only when needed (scrub credentials and tokens before sharing)
@@ -547,14 +555,14 @@ The authors are not liable for misuse.
 
 ## 📄 License
 
-MIT License (see `LICENSE` file).  
+MIT License.  
 Attribution appreciated but not required.
 
 ---
 
-## 🧪 Serverless Note
+## Supported hosting
 
-The included `serverless.js` / `vercel.json` adapter is experimental and does not parse tokenized per-request configuration. It is not suitable for the normal Railway/Docker deployment path or for deployments that require durable volume-backed catalogue and metadata caches. Use `server.js` on a persistent Node service unless the adapter is completed for your platform.
+Use `server.js` on a long-running Node service, such as Railway or Docker, with an attached persistent volume. The incomplete serverless adapter has been removed; ephemeral serverless hosting is not supported.
 
 ---
 

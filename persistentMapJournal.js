@@ -22,6 +22,7 @@ class PersistentMapJournal {
         this.sequence = 0;
         this.journalBytes = 0;
         this.writePromise = null;
+        this.appendRecoveryRequired = false;
     }
 
     async trimIncompleteJournalTail(contents = null) {
@@ -50,6 +51,19 @@ class PersistentMapJournal {
     }
     get hasPending() {
         return this.pending.size > 0;
+    }
+
+    async recoverAppend() {
+        const contents = await this.trimIncompleteJournalTail();
+        for (const line of contents.split(/\r?\n/)) {
+            try {
+                const record = JSON.parse(line);
+                if (Number.isSafeInteger(record?.sequence) && record.sequence > this.sequence) {
+                    this.sequence = record.sequence;
+                }
+            } catch { /* Incomplete/corrupt records are ignored consistently with load(). */ }
+        }
+        this.appendRecoveryRequired = false;
     }
 
     async load() {
@@ -129,6 +143,7 @@ class PersistentMapJournal {
     }
 
     async flushBatch(entries) {
+        if (this.appendRecoveryRequired) await this.recoverAppend();
         if (this.pending.size) {
             const batch = this.pending;
             this.pending = new Map();
@@ -147,7 +162,10 @@ class PersistentMapJournal {
                 this.sequence = sequence;
                 this.journalBytes += Buffer.byteLength(payload, "utf8");
             } catch (error) {
-                await this.trimIncompleteJournalTail().catch(() => {});
+                // A failed append may already have written complete records. Never
+                // allocate their sequence numbers again, including if recovery fails.
+                this.appendRecoveryRequired = true;
+                await this.recoverAppend().catch(() => {});
                 for (const [key, value] of batch) {
                     if (!this.pending.has(key)) this.pending.set(key, value);
                 }

@@ -3,3 +3,12 @@
 .vscode/
 .well-known/
 node_modules/
+.env.*
+!.env.example
+data/
+.test-tmp/
+**/addon-data-*.json*
+**/catalog-meta-*.json*
+**/series-info-*.json*
+**/omdb-usage.json*
+*.log

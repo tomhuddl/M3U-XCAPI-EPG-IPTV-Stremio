@@ -37,8 +37,7 @@
     forceDisableActions,
     prefillIfReconfigure,
     robustFetch,
-    checkEpgStats,
-    quickEpgStats,
+    checkEpgStats, getGeneration, isCurrent, fetchJson,
   } = window.ConfigureCommon || {};
 
   if (!window.ConfigureCommon) {
@@ -46,8 +45,7 @@
     return;
   }
 
-  if (typeof prefillIfReconfigure === "function")
-    prefillIfReconfigure("xtream");
+  const prefillReady = typeof prefillIfReconfigure === "function" ? prefillIfReconfigure() : Promise.resolve();
 
   function selectedEpgMode() {
     const r = epgModeRadios().find((r) => r.checked);
@@ -115,6 +113,7 @@
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    await prefillReady;
 
     const baseUrlRaw = xtreamUrlInput.value.trim();
     const baseUrl = normalizedBaseUrl(baseUrlRaw);
@@ -161,6 +160,7 @@
     }
 
     showOverlay(true);
+    const generation = getGeneration();
     forceDisableActions && forceDisableActions();
     overlaySetMessage("Pre-flight: Validating Xtream inputs…");
     setProgress(5, "Starting");
@@ -183,6 +183,7 @@
         `${base}&action=get_live_streams`,
         "live_streams",
       );
+      if (!isCurrent(generation)) return;
       let liveList = [];
       try {
         liveList = JSON.parse(liveJsonText);
@@ -197,6 +198,7 @@
         `${base}&action=get_vod_streams`,
         "vod_streams",
       );
+      if (!isCurrent(generation)) return;
       let vodList = [];
       try {
         vodList = JSON.parse(vodJsonText);
@@ -214,7 +216,7 @@
         setProgress(38, "Checking TV Series from Railway");
         appendDetail("→ (Railway) Checking Xtream TV series (credentials hidden)");
         try {
-          const response = await fetch("/api/xtream-series-check", {
+          const { response, payload } = await fetchJson("/api/xtream-series-check", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -223,8 +225,7 @@
               xtreamPassword: password,
             }),
           });
-          let payload = {};
-          try { payload = await response.json(); } catch { /* reported below */ }
+          if (!isCurrent(generation)) return;
           if (!response.ok || !payload.ok) {
             const status = payload.status ? ` HTTP ${payload.status}` : "";
             const code = payload.code ? ` (${payload.code})` : "";
@@ -237,6 +238,7 @@
             }
           }
         } catch (error) {
+          if (!isCurrent(generation)) return;
           appendDetail(`⚠ (Railway) Series check could not complete: ${error?.name || "request error"}`);
         }
       }
@@ -246,17 +248,17 @@
         ? (epgMode === "custom" ? customEpg : `${baseUrl}/xmltv.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`)
         : "";
       const epgSources = [...new Set([...(primaryEpgUrl ? [primaryEpgUrl] : []), ...additionalEpgUrls])];
-      const validEpgSources = [];
       if (enableEpgInitial) {
         for (let index = 0; index < epgSources.length; index++) {
           try {
-            const stats = await checkEpgStats(epgSources[index], index + 1);
-            validEpgSources.push(epgSources[index]);
+            await checkEpgStats(epgSources[index], index + 1);
+            if (!isCurrent(generation)) return;
           } catch (error) {
+            if (!isCurrent(generation)) return;
             appendDetail("⚠ EPG source " + (index + 1) + " failed: " + (error.message || "check failed") + "; continuing with other sources.");
           }
         }
-        if (!validEpgSources.length) enableEpgFinal = false;
+        // Keep configured sources for normal refresh retries.
       } else {
         appendDetail("EPG disabled by user.");
       }
@@ -279,10 +281,10 @@
         if (outVal) config.xtreamOutput = outVal;
       }
 
-      if (enableEpgFinal && validEpgSources.length) {
-        if (epgMode === "custom") config.epgUrl = validEpgSources[0];
+      if (enableEpgFinal && epgSources.length) {
+        if (epgMode === "custom") config.epgUrl = customEpg;
         else config.epgUrl = "";
-        config.epgUrls = epgMode === "custom" ? validEpgSources.slice(1) : validEpgSources.filter(url => url !== primaryEpgUrl);
+        config.epgUrls = additionalEpgUrls;
       }
       if (isFinite(epgOffset) && epgOffset !== 0)
         config.epgOffsetHours = epgOffset;
@@ -296,6 +298,7 @@
       appendDetail("Polling server…");
       startPolling(70);
     } catch (err) {
+      if (!isCurrent(generation)) return;
       console.error("[XTREAM-CONFIG] Pre-flight error", err);
       overlaySetMessage("Pre-flight failed");
       appendDetail("✖ Error: " + (err.message || err.toString()));

@@ -63,7 +63,11 @@ class LRUCache {
         if (existing && existing.value === value) {
             this.map.delete(key);
             existing.expires = entryTtl > 0 ? this._now() + entryTtl : null;
+            const weight = this._weight(value);
+            this.totalWeight += weight - existing.weight;
+            existing.weight = weight;
             this.map.set(key, existing);
+            this._evictCapacity();
             return;
         }
         if (this.map.has(key)) this._delete(key, 'replaced');
@@ -76,6 +80,10 @@ class LRUCache {
         });
         this.totalWeight += weight;
 
+        this._evictCapacity();
+    }
+
+    _evictCapacity() {
         // Keep one oversized entry instead of rebuilding it on every request.
         while (this.map.size > this.max || (this.totalWeight > this.maxWeight && this.map.size > 1)) {
             const oldestKey = this.map.keys().next().value;

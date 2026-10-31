@@ -8,7 +8,10 @@ const path = require("path");
 const net = require("net");
 const fetch = require("node-fetch");
 const createAddon = require("./addon");
-const { MAX_EPG_BYTES } = require("./src/js/epgStreamParser");
+const { MAX_EPG_BYTES, parseEPGStream, getEPGStatus } = require("./src/js/epgStreamParser");
+const { withTimeout } = require("./asyncUtils");
+const { checkPersistence } = require("./storageStatus");
+const setupAccess = require("./setupAccess");
 const { isDebugEnabled, logAt } = require("./logger");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const { validateConfig } = require("./configValidation");
@@ -19,6 +22,17 @@ const responseCompression = require("./responseCompression");
 const fallbackLogo = require("./fallbackLogo");
 const routerCache = new WeakMap();
 const interfaceBuilds = new Map();
+const MAX_LIVE_ADDON_INTERFACES = parseLiveLimit(process.env.MAX_LIVE_ADDON_INTERFACES);
+function parseLiveLimit(value) { const parsed = Number.parseInt(value, 10); return Number.isSafeInteger(parsed) && parsed >= 2 ? Math.min(32, parsed) : 6; }
+let storageReady = !process.env.PERSISTENT_DATA_DIR && !process.env.CATALOG_META_CACHE_DIR && !process.env.SERIES_INFO_CACHE_DIR && !process.env.OMDB_API_KEY;
+let stopping = false;
+const storageReadyPromise = checkPersistence().then(status => {
+  storageReady = true;
+  logAt("info", "[STORAGE] Persistence check complete", status);
+}).catch(error => {
+  logAt("error", "[STORAGE] Configured storage is not writable", { errorName: error?.name || "Error", code: error?.code || "UNKNOWN" });
+  setImmediate(() => shutdown("Storage initialization failed", true));
+});
 
 const DEBUG = isDebugEnabled();
 function dlog(...args) {
@@ -174,8 +188,15 @@ app.use((req, res, next) => {
   res.setHeader("X-App", "IPTV-Stremio-Addon");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'" +
+    (req.path === "/support.html" ? " https://cdnjs.buymeacoffee.com" : "") +
+    "; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https: http:; font-src 'self' data: https:; connect-src 'self' https: http:; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; object-src 'none'");
+  if (req.path !== "/health" && (!storageReady || stopping)) {
+    res.setHeader("Retry-After", "5"); return res.status(503).json({ error: "Addon is starting or stopping; retry shortly" });
+  }
   next();
 });
+app.use(setupAccess);
 app.use(express.static(staticDir));
 app.use(express.json({ limit: "128kb" }));
 app.use(responseCompression);
@@ -334,7 +355,6 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
   const controller = new AbortController();
   let totalBytes = 0;
   let programmeCount = 0;
-  let tail = "";
   try {
     const response = await safeFetch(url, {
       method: "GET",
@@ -349,47 +369,9 @@ app.post("/api/epg-stats", preflightRateLimit, async (req, res) => {
     if (!response.body) return res.status(502).json({ error: "EPG source returned an empty response" });
 
     const body = response.body;
-    const countTags = (text, cutoff) => {
-      const re = /<programme(?:\s|>)/gi;
-      let match;
-      while ((match = re.exec(text)) !== null) {
-        if (match.index >= cutoff) break;
-        programmeCount++;
-      }
-    };
-
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        error ? reject(error) : resolve();
-      };
-      body.on("data", (chunk) => {
-        totalBytes += chunk.length;
-        if (totalBytes > MAX_EPG_BYTES) {
-          controller.abort();
-          body.destroy();
-          const error = new Error(`EPG source exceeds the ${Math.floor(MAX_EPG_BYTES / 1000000)} MB preflight scan limit`);
-          error.code = "EPG_TOO_LARGE";
-          finish(error);
-          return;
-        }
-        const combined = tail + chunk.toString("utf8");
-        const cutoff = Math.max(0, combined.length - 40);
-        countTags(combined, cutoff);
-        tail = combined.slice(cutoff);
-      });
-      body.on("end", () => {
-        countTags(tail, tail.length + 1);
-        finish();
-      });
-      body.on("error", (error) => finish(error));
-      body.on("close", () => {
-        if (!settled) finish(new Error("EPG response closed before completion"));
-      });
-    });
-
+    body.on("data", chunk => { totalBytes += chunk.length; });
+    const parsed = await parseEPGStream(body, null, null, { countOnly: true });
+    programmeCount = getEPGStatus(parsed).programmes;
     res.json({ ok: true, bytes: totalBytes, programmes: programmeCount });
   } catch (error) {
     const tooLarge = error && error.code === "EPG_TOO_LARGE";
@@ -599,22 +581,12 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) =>
-  res.json({ status: "OK", timestamp: new Date().toISOString() }),
+  res.status(storageReady && !stopping ? 200 : 503).json({ status: storageReady && !stopping ? "OK" : "STARTING", timestamp: new Date().toISOString() }),
 );
 app.get("/favicon.ico", (req, res) => res.status(204).end());
 
-app.get("/configure-direct", (req, res) => {
-  const fileRoot = path.join(__dirname, "direct-config.html");
-  res.sendFile(fileRoot, (err) => {
-    if (err) res.sendFile(path.join(staticDir, "html", "direct-config.html"));
-  });
-});
-app.get("/configure-xtream", (req, res) => {
-  const fileRoot = path.join(__dirname, "xtream-config.html");
-  res.sendFile(fileRoot, (err) => {
-    if (err) res.sendFile(path.join(staticDir, "html", "xtream-config.html"));
-  });
-});
+app.get("/configure-direct", (req, res) => res.sendFile(path.join(staticDir, "html", "direct-config.html")));
+app.get("/configure-xtream", (req, res) => res.sendFile(path.join(staticDir, "html", "xtream-config.html")));
 
 function maybeDecryptConfig(token) {
   return tryParseConfigToken(token);
@@ -643,18 +615,12 @@ app.get("/:token/configure", (req, res) => {
 app.get("/:token/configure-direct", (req, res) => {
   if (!isConfigToken(req.params.token))
     return res.status(400).json({ error: "Invalid token" });
-  const fileRoot = path.join(__dirname, "direct-config.html");
-  res.sendFile(fileRoot, (err) => {
-    if (err) res.sendFile(path.join(staticDir, "html", "direct-config.html"));
-  });
+  res.sendFile(path.join(staticDir, "html", "direct-config.html"));
 });
 app.get("/:token/configure-xtream", (req, res) => {
   if (!isConfigToken(req.params.token))
     return res.status(400).json({ error: "Invalid token" });
-  const fileRoot = path.join(__dirname, "xtream-config.html");
-  res.sendFile(fileRoot, (err) => {
-    if (err) res.sendFile(path.join(staticDir, "html", "xtream-config.html"));
-  });
+  res.sendFile(path.join(staticDir, "html", "xtream-config.html"));
 });
 
 // Return the saved config to its token-specific Configure page so settings can be edited.
@@ -695,7 +661,8 @@ app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
   if (!iface) {
     let build = interfaceBuilds.get(ifaceKey);
     if (!build) {
-      if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
+      if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS ||
+          (createAddon.getActiveInterfaceCount?.() || 0) + activeInterfaceBuilds >= MAX_LIVE_ADDON_INTERFACES) {
         res.setHeader("Retry-After", "5");
         return res.status(503).json({ error: "Addon is busy building configurations; retry shortly" });
       }
@@ -728,7 +695,7 @@ app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
     const candidate = new URL(protocol + "://" + req.get("host"));
     if (["http:", "https:"].includes(candidate.protocol) && !candidate.username && !candidate.password) origin = candidate.origin;
   } catch { /* Invalid origins use the absolute placeholder fallback. */ }
-  req.loadingContext = { priority: "foreground", ios: userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent),
+  req.loadingContext = { priority: "foreground", debug: config.debug === true, ios: userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent),
     origin, token, signal: controller.signal, pending: new Set() };
   let released = false;
   const releaseInterface = () => {
@@ -818,37 +785,42 @@ const server = app.listen(port, () => {
 });
 
 let shutdownPromise = null;
-async function shutdown(signal) {
+async function shutdown(signal, initialFailure = false) {
   if (shutdownPromise) return shutdownPromise;
-  logAt("info", `[SHUTDOWN] ${signal} received; flushing persistent caches`);
-  const closePromise = new Promise((resolve) => server.close(resolve));
-  const forceCloseTimer = setTimeout(() => {
-    if (typeof server.closeAllConnections === "function") server.closeAllConnections();
-  }, 15000);
-  if (typeof forceCloseTimer.unref === "function") forceCloseTimer.unref();
-
+  stopping = true;
+  logAt("info", "[SHUTDOWN] Stopping requests and saving completed cache updates");
+  const timeout = parsePositiveInteger(process.env.SHUTDOWN_TIMEOUT_MS, 15000, 1000, 60000);
+  const finalSaveBudget = Math.min(2000, Math.max(100, Math.floor(timeout / 5)));
+  const deadline = Date.now() + timeout;
+  const remaining = () => Math.max(1, deadline - Date.now());
+  const closePromise = new Promise(resolve => server.close(resolve));
   shutdownPromise = (async () => {
-    await closePromise;
+    let failed = initialFailure;
     const interfaces = interfaceCache.entries().map(([, iface]) => iface);
-    const results = await Promise.allSettled(interfaces.map((iface) => createAddon.disposeAddonInterface(iface)));
-    results.push(...await Promise.allSettled([createAddon.flushAddonDisposals()]));
-    interfaceCache.clear();
-    await createAddon.closeRedisClient();
-    await closePromise;
-    clearTimeout(forceCloseTimer);
-    const failures = results.filter(result => result.status === "rejected");
-    if (failures.length) {
-      const error = new AggregateError(failures.map(result => result.reason), "Persistent cache flush failed");
-      error.failedCaches = [...new Set(failures.flatMap(result => result.reason?.failedCaches || []))];
-      throw error;
+    const drain = Promise.allSettled(interfaces.map(iface => createAddon.disposeAddonInterface(iface)))
+      .then(async results => {
+        await createAddon.flushAddonDisposals();
+        if (results.some(result => result.status === "rejected")) throw new Error("Cache disposal failed");
+      });
+    try {
+      await withTimeout(Promise.all([closePromise, drain]), Math.max(1, remaining() - finalSaveBudget), "Shutdown drain timed out");
+    } catch (error) {
+      failed = true;
+      logAt("warn", "[SHUTDOWN] Work did not finish before the shutdown deadline", { code: error?.code || "UNKNOWN" });
     }
-    logAt("info", "[SHUTDOWN] Persistent caches flushed");
-  })().catch((error) => {
-    clearTimeout(forceCloseTimer);
-    logAt("error", "[SHUTDOWN] Persistent cache flush incomplete", {
-      errorName: error?.name || "Error", failedCaches: error?.failedCaches || []
-    });
-  });
+    server.closeAllConnections?.();
+    try {
+      const results = await withTimeout(createAddon.flushActiveAddonCaches?.() || Promise.resolve([]), remaining(), "Final cache flush timed out");
+      if (results.some(result => result.status === "rejected")) throw new Error("Final cache flush failed");
+      await withTimeout(createAddon.closeRedisClient(), remaining(), "Redis shutdown timed out");
+    } catch (error) {
+      failed = true;
+      logAt("error", "[SHUTDOWN] Final cache save incomplete", { code: error?.code || "UNKNOWN" });
+    }
+    interfaceCache.clear();
+    logAt(failed ? "warn" : "info", failed ? "[SHUTDOWN] Stopped with unfinished work" : "[SHUTDOWN] Persistent caches saved");
+    process.exit(failed ? 1 : 0);
+  })();
   return shutdownPromise;
 }
 

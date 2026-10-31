@@ -667,3 +667,9 @@ select:focus {
     0% { background-position: 0 0; }
     100% { background-position: 360px 0; }
 }
+
+.donation-frame { width: min(100%, 340px); height: 86px; border: 0; background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+}
