@@ -13,6 +13,12 @@ const { isDebugEnabled, logAt } = require("./logger");
 const { encryptConfig, tryParseConfigToken } = require("./cryptoConfig");
 const { validateConfig } = require("./configValidation");
 const LRUCache = require("./lruCache");
+const requestContext = require("./requestContext");
+const { projectResponse } = require("./publicMetadata");
+const responseCompression = require("./responseCompression");
+const fallbackLogo = require("./fallbackLogo");
+const routerCache = new WeakMap();
+const interfaceBuilds = new Map();
 
 const DEBUG = isDebugEnabled();
 function dlog(...args) {
@@ -172,6 +178,7 @@ app.use((req, res, next) => {
 });
 app.use(express.static(staticDir));
 app.use(express.json({ limit: "128kb" }));
+app.use(responseCompression);
 
 // Encryption endpoint
 app.post("/encrypt", preflightRateLimit, (req, res) => {
@@ -686,106 +693,65 @@ app.use("/:token", addonRequestRateLimit, async (req, res, next) => {
   let iface = interfaceCache.get(ifaceKey);
   let acquired = false;
   if (!iface) {
-    if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
-      res.setHeader("Retry-After", "5");
-      return res.status(503).json({ error: "Addon is busy building configurations; retry shortly" });
-    }
-    activeInterfaceBuilds += 1;
-    try {
-      iface = await createAddon(config);
-      acquired = createAddon.acquireAddonInterface(iface);
-      // The same config may have been evicted while another request awaited this
-      // build. createAddon waits for its old instance to flush before rebuilding.
-      if (!acquired) {
-        iface = await createAddon(config);
-        acquired = createAddon.acquireAddonInterface(iface);
+    let build = interfaceBuilds.get(ifaceKey);
+    if (!build) {
+      if (activeInterfaceBuilds >= MAX_ACTIVE_INTERFACE_BUILDS) {
+        res.setHeader("Retry-After", "5");
+        return res.status(503).json({ error: "Addon is busy building configurations; retry shortly" });
       }
-      if (!acquired) {
-        res.setHeader("Retry-After", "1");
-        return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
-      }
-      interfaceCache.set(ifaceKey, iface);
-    } catch (e) {
-      if (acquired) createAddon.releaseAddonInterface(iface);
-      // Provider errors can include request URLs; don't log them with credentials.
-      console.error("[SERVER] Addon build failed:", e && e.name ? e.name : "Error");
-      return res.status(500).json({ error: "Addon build error" });
-    } finally {
-      activeInterfaceBuilds = Math.max(0, activeInterfaceBuilds - 1);
+      activeInterfaceBuilds++;
+      build = Promise.resolve().then(() => createAddon(config)).finally(() => {
+        activeInterfaceBuilds--;
+        if (interfaceBuilds.get(ifaceKey) === build) interfaceBuilds.delete(ifaceKey);
+      });
+      interfaceBuilds.set(ifaceKey, build);
     }
-  } else {
-    acquired = createAddon.acquireAddonInterface(iface);
+    try { iface = await build; }
+    catch (error) {
+      logAt("error", "[SERVER] Addon build failed:", error?.name || "Error");
+      return res.status(503).json({ error: "Addon build unavailable; retry shortly" });
+    }
   }
+  acquired = createAddon.acquireAddonInterface(iface);
+  if (acquired) interfaceCache.set(ifaceKey, iface);
 
   if (!acquired) {
     res.setHeader("Retry-After", "1");
     return res.status(503).json({ error: "Addon interface is restarting; retry shortly" });
   }
+  const controller = new AbortController();
+  const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
+  let origin = "";
+  try {
+    const protocol = process.env.RAILWAY_SERVICE_ID || process.env.RENDER
+      ? (req.headers["x-forwarded-proto"] === "https" ? "https" : req.protocol) : req.protocol;
+    const candidate = new URL(protocol + "://" + req.get("host"));
+    if (["http:", "https:"].includes(candidate.protocol) && !candidate.username && !candidate.password) origin = candidate.origin;
+  } catch { /* Invalid origins use the absolute placeholder fallback. */ }
+  req.loadingContext = { priority: "foreground", ios: userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent),
+    origin, token, signal: controller.signal, pending: new Set() };
   let released = false;
   const releaseInterface = () => {
     if (released) return;
     released = true;
-    createAddon.releaseAddonInterface(iface);
+    if (!res.writableFinished) controller.abort();
+    const work = [...req.loadingContext.pending];
+    if (work.length) Promise.allSettled(work).then(() => createAddon.releaseAddonInterface(iface));
+    else createAddon.releaseAddonInterface(iface);
   };
   res.once("finish", releaseInterface);
   res.once("close", releaseInterface);
+  if (res.destroyed) { releaseInterface(); return; }
   req.addonInterface = iface;
   req.configToken = token;
   next();
 });
 
-// Logo proxy
-app.get("/:token/logo/:tvgId.png", async (req, res) => {
-  if (!req.addonInterface) {
-    return res.redirect(
-      `https://via.placeholder.com/300x400/333333/FFFFFF?text=${encodeURIComponent(req.params.tvgId)}`,
-    );
-  }
-  const sources = req.addonInterface._logoSources || [];
-  if (!sources.length) {
-    return res.redirect(
-      `https://via.placeholder.com/300x400/333333/FFFFFF?text=${encodeURIComponent(req.params.tvgId)}`,
-    );
-  }
-  const { tvgId } = req.params;
-  const rawId = tvgId;
-  const noCountry = rawId.replace(/\.[a-z]{2,3}$/, "");
-  const hyphenated = noCountry.replace(/[^a-zA-Z0-9]+/g, "-");
-  const underscored = noCountry.replace(/[^a-zA-Z0-9]+/g, "_");
-  const candidates = [...new Set([rawId, noCountry, hyphenated, underscored])];
-  for (const cand of candidates) {
-    for (const template of sources) {
-      const url = template.replace("{id}", cand);
-      try {
-        const image = await safeFetch(url, {
-          method: "GET",
-          timeout: 10000,
-          size: 5 * 1024 * 1024,
-        });
-        if (!image.ok) {
-          if (image.body) image.body.destroy();
-          continue;
-        }
-        const contentType = image.headers.get("content-type") || "";
-        if (!contentType.toLowerCase().startsWith("image/")) {
-          if (image.body) image.body.destroy();
-          continue;
-        }
-        const buffer = await image.buffer();
-        if (buffer.length > 50) {
-          res.setHeader("Content-Type", contentType);
-          res.setHeader("X-Content-Type-Options", "nosniff");
-          res.setHeader("Cache-Control", "public, max-age=21600");
-          return res.end(buffer);
-        }
-      } catch {
-        /* Try another candidate. */
-      }
-    }
-  }
-  res.redirect(
-    `https://via.placeholder.com/300x400/333333/FFFFFF?text=${encodeURIComponent(noCountry.toUpperCase().slice(0, 12))}`,
-  );
+// Local fallback avoids external placeholder requests for channels without artwork.
+app.get("/:token/logo/:tvgId.png", (req, res) => {
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "private, max-age=21600");
+  res.end(fallbackLogo(req.params.tvgId));
 });
 
 // Serve manifest directly (bypasses SDK's 8KB-limited frozen manifest)
@@ -803,65 +769,11 @@ app.get("/:token/manifest.json", (req, res) => {
   res.end(JSON.stringify(manifest));
 });
 
-// Filter platform-specific metadata links at the HTTP boundary. The Stremio SDK does not expose request headers to metadata handlers.
-// Writer credits are retained only for iOS Stremio; rating links keep their client-specific behavior.
-
+// Keep rendered card data fresh; internal/server caches do not require browser caching.
 app.use("/:token", (req, res, next) => {
-  const pathIsMeta = /^\/meta\/(movie|series)\//.test(req.path);
-  const pathIsCatalog = /^\/catalog\/(movie|series)\//.test(req.path);
-  const pathIsMetadataResponse = pathIsMeta || pathIsCatalog;
-  const userAgent = String(req.headers["user-agent"] || "").toLowerCase();
-  const isIosStremioClient = userAgent.includes("stremio") && /iphone|ipad|ipod|ios/.test(userAgent);
-
-  if (pathIsMetadataResponse) {
+  if (/^\/(?:meta|catalog)\/(?:movie|series)\//.test(req.path)) {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-    res.setHeader("Pragma", "no-cache");
-    res.setHeader("Expires", "0");
-
-    const originalEnd = res.end.bind(res);
-    res.end = function (chunk, encoding, callback) {
-      const contentType = String(res.getHeader("content-type") || "").toLowerCase();
-      if (chunk != null && contentType.includes("application/json")) {
-        try {
-          const jsonText = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-          const body = JSON.parse(jsonText);
-          const metadataItems = Array.isArray(body?.metas)
-            ? body.metas
-            : (body?.meta && typeof body.meta === "object" ? [body.meta] : []);
-          const hasPlatformLinks = metadataItems.some(meta => Array.isArray(meta?.links) &&
-            meta.links.some(link => link?.category === "Rating" || link?.category === "Writers"));
-          if (hasPlatformLinks) {
-            const valid = value => value != null && value !== "" &&
-              Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10;
-            for (const meta of metadataItems) {
-              let rating = meta.imdbRating;
-              if (!valid(rating) && Array.isArray(meta.links)) {
-                const link = meta.links.find(item => item && typeof item.name === "string" &&
-                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i.test(item.name.trim()));
-                const match = link?.name?.trim().match(
-                  /^IMDb rating:\s*(10(?:\.0+)?|[0-9](?:\.[0-9]+)?)$/i
-                );
-                if (match) rating = match[1];
-              }
-              if (valid(rating)) meta.imdbRating = Number(rating).toFixed(1);
-              const links = Array.isArray(meta.links) ? meta.links : [];
-              if (isIosStremioClient) {
-                meta.links = links.filter(link => link?.category !== "Rating");
-                delete meta.tmdbRating;
-              } else {
-                // Writer credits are exposed only to iOS Stremio clients.
-                meta.links = links.filter(link => link?.category !== "Writers");
-              }
-            }
-            const output = JSON.stringify(body);
-            chunk = Buffer.isBuffer(chunk) ? Buffer.from(output, "utf8") : output;
-          }
-        } catch {
-          // Leave non-JSON or unexpected SDK responses untouched.
-        }
-      }
-      return originalEnd(chunk, encoding, callback);
-    };
+    res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
   }
   next();
 });
@@ -870,15 +782,26 @@ app.use("/:token", (req, res) => {
   const iface = req.addonInterface;
   if (!iface) return res.status(500).json({ error: "Interface not ready" });
 
-  const router = getRouter(iface);
-  router(req, res, (err) => {
+  let router = routerCache.get(iface);
+  if (!router) {
+    router = getRouter({ manifest: iface.manifest, get: (...args) => {
+      const context = requestContext.current();
+      const task = Promise.resolve().then(() => iface.get(...args))
+        .then(body => projectResponse(body, context));
+      context.pending?.add(task);
+      task.then(() => context.pending?.delete(task), () => context.pending?.delete(task));
+      return task;
+    } });
+    routerCache.set(iface, router);
+  }
+  requestContext.run(req.loadingContext, () => router(req, res, (err) => {
     if (err) {
       console.error("[SERVER] Router error:", err && err.name ? err.name : "Error");
       res.status(500).json({ error: "Addon error" });
     } else {
       res.status(404).json({ error: "Not found" });
     }
-  });
+  }));
 });
 
 app.use("*", (req, res) => res.status(404).json({ error: "Not found" }));

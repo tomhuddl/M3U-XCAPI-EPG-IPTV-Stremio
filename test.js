@@ -657,38 +657,6 @@ async function testConcurrentCatalogMetadataLookupsAreDeduplicated() {
     assert.strictEqual(addon.catalogMetaInFlight.size, 0, "in-flight entries should be cleared after completion");
 }
 
-async function testCatalogMetadataQueueDrainsWithoutLosingItems() {
-    const addon = new M3UEPGAddon({ provider: "direct" });
-    const count = 75;
-    let active = 0;
-    let maxActive = 0;
-    const processed = [];
-    addon.getCatalogMetaAsync = async (id) => {
-        active++;
-        maxActive = Math.max(maxActive, active);
-        await Promise.resolve();
-        processed.push(id);
-        active--;
-        return { id, type: "movie", name: id };
-    };
-
-    for (let i = 0; i < count; i++) {
-        addon.queueCatalogMetaEnrichment({ id: "movie-" + i, type: "movie", name: "Movie " + i });
-    }
-
-    const drainDeadline = Date.now() + 5000;
-    while (addon.catalogMetaWorkers > 0 || addon.catalogMetaQueueHead < addon.catalogMetaQueue.length) {
-        assert.ok(Date.now() < drainDeadline, "metadata enrichment queue should drain within five seconds");
-        await new Promise(resolve => setImmediate(resolve));
-    }
-
-    assert.strictEqual(processed.length, count);
-    assert.strictEqual(new Set(processed).size, count);
-    assert.ok(maxActive <= 3, "metadata enrichment concurrency should remain capped at three");
-    assert.deepStrictEqual(addon.catalogMetaQueue, []);
-    assert.strictEqual(addon.catalogMetaQueueHead, 0);
-}
-
 async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval() {
     const addon = new M3UEPGAddon({ provider: "direct" });
     addon.movies = [{ id: "movie-1", type: "movie", name: "Movie 1" }];
@@ -718,7 +686,7 @@ async function testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval(
     assert.strictEqual(addon.catalogPrefetchJobs.has("movie"), false);
 
     // A changed catalogue must bypass that shortcut and warm the newly added item.
-    addon.movies.push({ id: "movie-2", type: "movie", name: "Movie 2" });
+    addon.movies = [...addon.movies, { id: "movie-2", type: "movie", name: "Movie 2" }];
     addon.startContinuousCatalogPrefetch("movie", 10, 1);
     const job = addon.catalogPrefetchJobs.get("movie");
     assert.ok(job, "a changed catalogue should start a new warm-up");
@@ -1006,7 +974,6 @@ async function main() {
         testPersistentCatalogMetadataCacheRetainsDirtyStateAfterWriteFailure,
         testPersistentAddonDataCacheRoundTripAndLastGoodSnapshot,
         testConcurrentCatalogMetadataLookupsAreDeduplicated,
-        testCatalogMetadataQueueDrainsWithoutLosingItems,
         testCataloguePrefetchRechecksChangedCatalogueBeforeDailyInterval,
         testCataloguePrefetchSkipsWarmCatalogueAfterRestart,
         testCataloguePrefetchBacksOffAfterIncompleteWarmup,
@@ -1035,6 +1002,7 @@ async function main() {
         ...require("./tests/seriesRuntime.test"),
         ...require("./tests/seriesMetadataPolicy.test"),
         ...require("./tests/refreshAuditFixes.test"),
+        ...require("./tests/loading.test"),
     ];
 
     for (const test of tests) {

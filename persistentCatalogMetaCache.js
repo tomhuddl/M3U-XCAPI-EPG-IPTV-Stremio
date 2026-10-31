@@ -58,6 +58,7 @@ class PersistentCatalogMetaCache {
         this.writeTimer = null;
         this.dirty = false;
         this.writeRetryDelayMs = 1000;
+        this.nextPruneAt = 0;
     }
 
     async init() {
@@ -91,6 +92,7 @@ class PersistentCatalogMetaCache {
     }
 
     prune() {
+        this.nextPruneAt = Date.now() + 60 * 1000;
         const cutoff = Date.now() - this.staleRetentionMs;
         for (const [key, entry] of this.entries) {
             if (!entry || entry.savedAt < cutoff) {
@@ -144,7 +146,7 @@ class PersistentCatalogMetaCache {
         const entry = { savedAt: Date.now(), value };
         this.entries.set(normalizedKey, entry);
         this.journal.mark(normalizedKey, entry);
-        this.prune();
+        if (Date.now() >= this.nextPruneAt || this.entries.size > this.maxEntries) this.prune();
         this.dirty = true;
         this.scheduleWrite();
     }

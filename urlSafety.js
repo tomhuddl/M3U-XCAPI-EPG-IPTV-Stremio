@@ -6,6 +6,9 @@ const https = require("https");
 const net = require("net");
 const ipaddr = require("ipaddr.js");
 const fetch = require("node-fetch");
+const RequestScheduler = require("./requestScheduler");
+const requestContext = require("./requestContext");
+const scheduler = new RequestScheduler();
 
 const REUSABLE_AGENT_MAX_ENTRIES = 8;
 const reusableAgents = new Map();
@@ -126,7 +129,7 @@ function getPinnedAgent(url, addresses, reuseConnection) {
  * Caller-supplied node-fetch options (timeout, signal, headers, etc.) are kept,
  * but redirect handling and the DNS-pinned agent are controlled here.
  */
-async function safeFetch(input, options = {}) {
+async function safeFetchUnscheduled(input, options = {}) {
   let currentUrl;
   try {
     currentUrl = input instanceof URL ? new URL(input.toString()) : new URL(input);
@@ -276,6 +279,19 @@ async function safeFetch(input, options = {}) {
     cleanup(finalAgent);
     throw error;
   }
+}
+
+async function safeFetch(input, options = {}) {
+  const origin = new URL(input).origin;
+  const release = await scheduler.acquire(origin, requestContext.current().priority);
+  try {
+    const response = await safeFetchUnscheduled(input, options);
+    if (response.body?.once) {
+      response.body.once("end", release); response.body.once("close", release); response.body.once("error", release);
+      if (response.body.readableEnded || response.body.destroyed) release();
+    } else release();
+    return response;
+  } catch (error) { release(); throw error; }
 }
 
 module.exports = {

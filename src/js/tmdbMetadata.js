@@ -352,17 +352,32 @@ async function getSeriesCatalogMetadata(tmdbId, options = {}) {
   return metadata;
 }
 
-async function getMovieMetadata(tmdbId) {
+async function getTrailerMetadata(type, id, previous) {
+  const now = Date.now();
+  const interval = previous?.failed ? PARTIAL_SEASON_RUNTIME_TTL_MS :
+    parsePositiveInteger(process.env.CATALOG_METADATA_REFRESH_MS, 14 * 86400000, 3600000, 90 * 86400000);
+  if (String(previous?.tmdbId) === id && now - previous.checkedAt >= 0 && now - previous.checkedAt < interval) return previous;
+  const videos = await request("/" + type + "/" + id + "/videos?language=en-GB", { refresh: Boolean(previous) });
+  const results = Array.isArray(videos?.results) ? videos.results : [];
+  const trailer = results.find(video => video.site === "YouTube" && video.type === "Trailer" && video.key)
+    || results.find(video => video.site === "YouTube" && video.key);
+  return { tmdbId: id, checkedAt: now, failed: !Array.isArray(videos?.results),
+    trailer: trailer ? { id: trailer.key, title: trailer.name || "Trailer", site: "YouTube" }
+      : (Array.isArray(videos?.results) ? null : previous?.trailer || null) };
+}
+
+async function getDetailedMetadata(type, tmdbId, options = {}) {
   const id = validTmdbId(tmdbId);
-  if (!id) return null;
-  // Reuse the exact details/credits/images response already fetched for Discover.
-  // Only trailers need a separate request; the shared request cache deduplicates it
-  // when another detail request for the same movie is already in progress.
-  const [details, videos] = await Promise.all([
-    request("/movie/" + id + "?language=en-GB&append_to_response=credits,images,external_ids&include_image_language=en,null"),
-    request("/movie/" + id + "/videos?language=en-GB"),
-  ]);
-  return mapMovieMetadata(details, details?.credits, videos, details?.images);
+  if (!id) { options.onMetadata?.(null); return null; }
+  const extraPromise = getTrailerMetadata(type, id, options.detailExtras);
+  const base = options.cachedMetadata || await (type === "tv" ? getSeriesCatalogMetadata(id, options) : getMovieCatalogMetadata(id, options));
+  options.onMetadata?.(base);
+  const extras = await extraPromise;
+  return base ? { ...base, trailer: extras.trailer || undefined, _detailExtras: extras } : null;
+}
+
+async function getMovieMetadata(tmdbId, options = {}) {
+  return getDetailedMetadata("movie", tmdbId, options);
 }
 
 function mapSeriesMetadata(details, credits, videos, images) {
@@ -407,17 +422,8 @@ function mapSeriesMetadata(details, credits, videos, images) {
   });
 }
 
-async function getSeriesMetadata(tmdbId) {
-  const id = validTmdbId(tmdbId);
-  if (!id) return null;
-  // Reuse the exact details/credits/images response already fetched for Discover.
-  // Only trailers need a separate request; the shared request cache deduplicates it
-  // when another detail request for the same series is already in progress.
-  const [details, videos] = await Promise.all([
-    request("/tv/" + id + SERIES_DETAILS_QUERY),
-    request("/tv/" + id + "/videos?language=en-GB"),
-  ]);
-  return mapSeriesMetadata(details, details?.aggregate_credits, videos, details?.images);
+async function getSeriesMetadata(tmdbId, options = {}) {
+  return getDetailedMetadata("tv", tmdbId, options);
 }
 
 function mapSeasonEpisodes(data, season) {
@@ -454,7 +460,7 @@ function validSeasonRuntimeSummary(value, now) {
     Number.isFinite(value.checkedAt) && value.checkedAt > 0 && value.checkedAt <= now;
 }
 
-async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false, refreshAll = false } = {}) {
+async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = false, refreshAll = false, reuseDetails = false } = {}) {
   const id = validTmdbId(tmdbId);
   if (!id || !tmdbConfigured()) return null;
   const pendingKey = id + (refreshAll ? ":full" : refresh ? ":refresh" : ":cached");
@@ -462,7 +468,7 @@ async function getSeriesRuntimeMetadata(tmdbId, { previous = null, refresh = fal
   const task = (async () => {
     // Share the existing series-details response with catalogue/detail requests.
     // Persistent callers retain only the small per-season totals returned below.
-    const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, { refresh });
+    const details = await request("/tv/" + id + SERIES_DETAILS_QUERY, { refresh: refresh && !reuseDetails });
     if (!details || !nonEmpty(details.name)) return null;
     const officialRuntime = Array.isArray(details.episode_run_time)
       ? details.episode_run_time.map(parseRuntimeMinutes).find(value => value !== null) : null;

@@ -23,23 +23,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Check JavaScript syntax
-        run: |
-          node --check server.js
-          node --check addon.js
-          node --check cryptoConfig.js
-          node --check configValidation.js
-          node --check lruCache.js
-          node --check persistentCatalogMetaCache.js
-          node --check urlSafety.js
-          node --check src/js/providers/directProvider.js
-          node --check src/js/providers/xtreamProvider.js
-          node --check src/js/tmdbMetadata.js
-          node --check src/js/epgStreamParser.js
-          node --check src/js/configure-common.js
-          node --check src/js/direct-config.js
-          node --check src/js/xtream-config.js
-          node --check serverless.js
-          node --check test.js
+        run: git ls-files -z -- '*.js' | xargs -0 -n 1 node --check
       - name: Run tests
         run: npm test
       - name: Audit all dependencies

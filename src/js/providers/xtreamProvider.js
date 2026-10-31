@@ -164,7 +164,7 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
         id: `iptv_live_${s.stream_id}`,
         name: s.name,
         type: "tv",
-        url: `${xtreamUrl}/live/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.m3u8`,
+        url: `${xtreamUrl}/live/${encodeURIComponent(xtreamUsername)}/${encodeURIComponent(xtreamPassword)}/${s.stream_id}.m3u8`,
         logo: s.stream_icon,
         category: cat,
         epg_channel_id: s.epg_channel_id,
@@ -182,7 +182,7 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
         id: `iptv_vod_${s.stream_id}`,
         name: s.name,
         type: "movie",
-        url: `${xtreamUrl}/movie/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.${s.container_extension}`,
+        url: `${xtreamUrl}/movie/${encodeURIComponent(xtreamUsername)}/${encodeURIComponent(xtreamPassword)}/${s.stream_id}.${s.container_extension}`,
         poster: s.stream_icon,
         plot: s.plot,
         // TMDb ID is an identifier only; display metadata is fetched from TMDb.
@@ -335,7 +335,7 @@ async function fetchMovieInfo(addonInstance, streamId) {
       // addresses are unchanged; safeFetch still validates DNS on every request.
       reuseConnection: true,
     });
-    if (!response.ok) return null;
+    if (!response.ok) { response.body?.destroy?.(); return null; }
     const payload = await response.json();
     const info = payload && payload.info && typeof payload.info === "object" ? payload.info : {};
     const tmdbId = info.tmdb_id || info.tmdb || payload.tmdb_id || payload.tmdb || null;

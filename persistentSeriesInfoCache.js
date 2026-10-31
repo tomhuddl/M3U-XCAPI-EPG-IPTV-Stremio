@@ -1,6 +1,7 @@
 "use strict";
 
 const path = require("path");
+const { isDeepStrictEqual } = require("util");
 const { logAt } = require("./logger");
 const PersistentMapJournal = require("./persistentMapJournal");
 
@@ -180,6 +181,28 @@ class PersistentSeriesInfoCache {
             this.journal.forceCompact = true;
             this.scheduleWrite();
         }
+    }
+
+    async updateEnrichment(seriesId, enrichment, providerLastUpdate, canStore = null) {
+        if (!this.enabled) return;
+        await this.init();
+        const key = String(seriesId), entry = this.entries.get(key);
+        if (!entry || entry.providerLastUpdate !== Number(providerLastUpdate) ||
+            (canStore && !canStore())) return;
+        const previous = entry.value._episodeMetadata;
+        if (previous?.tmdbId === enrichment.tmdbId && isDeepStrictEqual(previous.seasons, enrichment.seasons)) return previous;
+        if (Buffer.byteLength(JSON.stringify(enrichment)) > 256 * 1024) return;
+        // Enriching TMDb fields must not renew the provider episode-list clock.
+        entry.value = { ...entry.value, _episodeMetadata: enrichment };
+        this.journal.mark(key, entry); this.dirty = true;
+        const enriched = [...this.entries].filter(([, value]) => value.value?._episodeMetadata)
+            .sort((a, b) => a[1].value._episodeMetadata.checkedAt - b[1].value._episodeMetadata.checkedAt);
+        for (const [oldKey, old] of enriched.slice(0, Math.max(0, enriched.length - 200))) {
+            const value = { ...old.value }; delete value._episodeMetadata;
+            old.value = value; this.journal.mark(oldKey, old);
+        }
+        this.scheduleWrite();
+        return enrichment;
     }
 
     async findSeriesByEpisodeId(episodeId) {
