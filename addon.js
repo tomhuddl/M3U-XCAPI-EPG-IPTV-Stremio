@@ -1701,13 +1701,13 @@ class M3UEPGAddon {
                 const m = item.name.match(/\((\d{4})\)/);
                 if (m) meta.year = parseInt(m[1]);
             }
-            meta.description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
+            meta.description = item.plot || item.attributes?.['plot'] || undefined;
             meta.genres = item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'];
         } else if (item.type === 'series') {
             meta.poster = item.poster ||
                 item.attributes?.['tvg-logo'] ||
                 `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(item.name)}`;
-            meta.description = item.plot || item.attributes?.['plot'] || 'Series / Show';
+            meta.description = item.plot || item.attributes?.['plot'] || undefined;
             meta.genres = item.category
                 ? [item.category]
                 : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Series']);
@@ -2106,7 +2106,7 @@ class M3UEPGAddon {
                 runtime: runtimeFields.runtime,
                 poster: seriesItem.poster || seriesItem.attributes?.['tvg-logo'] ||
                     `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(seriesItem.name)}`,
-                description: seriesItem.plot || seriesItem.attributes?.['plot'] || 'Series / Show',
+                description: seriesItem.plot || seriesItem.attributes?.['plot'] || undefined,
                 genres: seriesItem.category
                     ? [seriesItem.category]
                     : (seriesItem.attributes?.['group-title'] ? [seriesItem.attributes['group-title']] : ['Series']),
@@ -2970,7 +2970,7 @@ class M3UEPGAddon {
                 const m = item.name.match(/\((\d{4})\)/);
                 if (m) year = parseInt(m[1]);
             }
-            const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
+            const description = item.plot || item.attributes?.['plot'] || undefined;
             return {
                 id: item.id,
                 type: 'movie',

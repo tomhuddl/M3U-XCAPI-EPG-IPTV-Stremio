@@ -12,6 +12,10 @@ function pick(value, fields) {
 function projectMeta(meta, context = {}) {
     if (!meta || typeof meta !== "object") return meta;
     const out = pick(meta, META_FIELDS);
+    // Hide generated descriptions still present in older saved previews.
+    if ((out.type === "movie" || out.type === "series") &&
+        (out.description === "Series / Show" || out.description === `Movie: ${out.name}`))
+        delete out.description;
     if (out.type === "tv") delete out.runtime;
     if (typeof out.poster === "string" && out.poster.startsWith("logo/")) {
         out.poster = context.origin && context.token
