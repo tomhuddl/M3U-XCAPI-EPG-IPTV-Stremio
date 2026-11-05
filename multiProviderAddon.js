@@ -109,10 +109,15 @@ class MultiProviderAddon {
         try { return await task; } finally { if (slot.promise === task) slot.promise = null; }
     }
     getManifest() {
+        // Count configured sources, including temporarily unavailable ones, so
+        // catalogue names stay stable during provider outages and recovery.
+        const sourceCount = Object.fromEntries(["tv", "movie", "series"].map(type =>
+            [type, this.sources.filter(({ source }) => enabled(source, type)).length]));
         const catalogs = this.sources.flatMap(({ source, lease }) => {
             const children = lease?.iface.manifest.catalogs || this.baseManifest.catalogs;
             return children.filter(catalog => enabled(source, catalog.type)).map(catalog => ({
-                ...catalog, id: qualify(source.id, catalog.id), name: `${source.name} · ${catalog.name}`,
+                ...catalog, id: qualify(source.id, catalog.id),
+                name: sourceCount[catalog.type] > 1 ? `${source.name} · ${catalog.name}` : catalog.name,
                 extra: catalog.extra?.map(extra => ({ ...extra, ...(Array.isArray(extra.options) ? { options: [...extra.options] } : {}) }))
             }));
         });

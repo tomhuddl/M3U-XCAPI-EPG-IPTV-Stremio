@@ -47,6 +47,7 @@ function testMultiProviderCollisionsEnrichedPagesSearchPlaybackAndEpg() { probe(
 function testMultiProviderFailureRecoveryAndSharedWriterOwnership() { probe("failure"); }
 function testMultiProviderHttpSetupAndPlayback() { probe("http"); }
 function testMultiProviderPlaylistModesKeepEpisodesAndPlayback() { probe("m3u"); }
+function testMultiProviderNamesOnlyDisambiguateSharedContentTypes() { probe("naming"); }
 function testMultiProviderRestoresEachSourceAcrossFreshProcesses() {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), "multi-provider-"));
     try { probe("write", directory); probe("read", directory); }
@@ -55,4 +56,5 @@ function testMultiProviderRestoresEachSourceAcrossFreshProcesses() {
 module.exports = [testMultiProviderValidationAndStableSourceIdentities, testMultiProviderResponseIdsDoNotMutateOrMixSources,
     testMultiProviderFetchesOnlySelectedContent, testMultiProviderCollisionsEnrichedPagesSearchPlaybackAndEpg,
     testMultiProviderFailureRecoveryAndSharedWriterOwnership, testMultiProviderRestoresEachSourceAcrossFreshProcesses,
-    testMultiProviderHttpSetupAndPlayback, testMultiProviderPlaylistModesKeepEpisodesAndPlayback];
+    testMultiProviderHttpSetupAndPlayback, testMultiProviderPlaylistModesKeepEpisodesAndPlayback,
+    testMultiProviderNamesOnlyDisambiguateSharedContentTypes];

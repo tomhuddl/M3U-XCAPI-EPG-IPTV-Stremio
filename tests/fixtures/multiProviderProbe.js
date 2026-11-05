@@ -127,13 +127,22 @@ async function close(value) { if (value) await createAddon.disposeAddonInterface
         const config = validateConfig({ sources: [source("a", { includeLive: false }), source("b", { includeMovies: false, includeSeries: false })] });
         calls.length = 0; iface = await createAddon(config);
         assert.strictEqual(iface.manifest.catalogs.length, 3);
+        assert.deepStrictEqual(iface.manifest.catalogs.map(entry => entry.name), ['IPTV Movies', 'IPTV Series', 'IPTV Channels']);
         assert(!calls.some(([host, action]) => host === "a" && /live|epg/.test(action)));
         assert(!calls.some(([host, action]) => host === "b" && /vod|series/.test(action)));
+    } else if (mode === "naming") {
+        const config = validateConfig({ sources: [source("a"), source("b", { includeLive: false, includeSeries: false })] });
+        iface = await createAddon(config);
+        const names = iface.manifest.catalogs.map(entry => [entry.type, entry.name]);
+        assert.deepStrictEqual(names.filter(([type]) => type === 'tv').map(([, name]) => name), ['IPTV Channels']);
+        assert.deepStrictEqual(names.filter(([type]) => type === 'series').map(([, name]) => name), ['IPTV Series']);
+        assert.deepStrictEqual(names.filter(([type]) => type === 'movie').map(([, name]) => name), ['Provider A · IPTV Movies', 'Provider B · IPTV Movies']);
     } else {
         const config = validateConfig({ sources: [source("a"), source("b")] });
         iface = await createAddon(config);
         if (mode === "failure") {
             assert.strictEqual(iface.manifest.providerStatus[1].ready, false);
+            assert.deepStrictEqual(iface.manifest.catalogs.filter(entry => entry.type === 'movie').map(entry => entry.name), ['Provider A · IPTV Movies', 'Provider B · IPTV Movies']);
             assert.strictEqual((await iface.get("catalog", "movie", catalog("a", "iptv_movies"))).metas.length, 50);
             failB = false;
             const originalNow = Date.now;
@@ -141,6 +150,7 @@ async function close(value) { if (value) await createAddon.disposeAddonInterface
             try { assert.strictEqual((await iface.get("catalog", "tv", catalog("b", "iptv_channels"))).metas.length, 1); }
             finally { Date.now = originalNow; }
             assert.strictEqual(iface.manifest.providerStatus[1].ready, true);
+            assert.deepStrictEqual(iface.manifest.catalogs.filter(entry => entry.type === 'movie').map(entry => entry.name), ['Provider A · IPTV Movies', 'Provider B · IPTV Movies']);
             const count = createAddon.getActiveInterfaceCount();
             const second = await createAddon(validateConfig({ sources: [{ ...config.sources[0], name: "Renamed" }] }));
             assert.strictEqual(createAddon.getActiveInterfaceCount(), count, "shared sources must use one writer");
