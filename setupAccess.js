@@ -11,7 +11,7 @@ module.exports = function setupAccess(req, res, next) {
     const password = process.env.SETUP_PASSWORD;
     if (!password) return next();
     const protectedRoute =
-        /^\/(?:$|index\.html$|configure-(?:direct|xtream)$|html\/(?:direct|xtream)-config\.html$|encrypt$|api\/)/.test(
+        /^\/(?:$|index\.html$|configure-(?:direct|xtream|multi)$|html\/(?:direct|xtream|multi)-config\.html$|encrypt$|api\/)/.test(
             req.path
         );
     if (!protectedRoute) return next();

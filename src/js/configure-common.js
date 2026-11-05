@@ -10,7 +10,7 @@
 
     // Polling / timing constants
     const POLL_INTERVAL_MS     = 1500;
-    const MAX_WAIT_MS          = 90000;
+    const MAX_WAIT_MS          = document.getElementById('multiForm') ? 360000 : 90000;
     const PROGRESS_ESTIMATE_MS = 45000;
 
     let pollTimer      = null;
@@ -112,6 +112,7 @@
     }
 
     function progressMessage(elapsed) {
+        if (document.getElementById('multiForm')) return 'Loading selected provider catalogues…';
         if (elapsed < 4000)  return 'Downloading playlist…';
         if (elapsed < 10000) return 'Parsing channels…';
         if (elapsed < 18000) return 'Grouping / movies…';
@@ -140,6 +141,10 @@
                 ready = true;
                 setProgress(100, 'Ready');
                 appendDetail('Manifest ready.');
+                for (const provider of payload.providerStatus || []) {
+                    appendDetail(provider.ready ? `✔ ${provider.name}: catalogue ready` :
+                        `⚠ ${provider.name}: unavailable; will retry automatically. Its catalogue is not ready yet.`);
+                }
                 enableActionButtons();
                 return;
             }
@@ -370,11 +375,19 @@
         // Decode the path segment once before re-encoding it for the fetch URL.
         let token = parts[0];
         try { token = decodeURIComponent(token || ''); } catch { /* keep original segment */ }
-        if (!token || token === 'html' || token === 'configure-direct' || token === 'configure-xtream') return;
+        if (!token || token === 'html' || token === 'configure-direct' || token === 'configure-xtream' || token === 'configure-multi') return;
         try {
             const { response, payload: config } = await fetchJson('/' + encodeURIComponent(token) + '/configuration.json', { cache: 'no-store' });
             if (!response.ok) throw new Error('Could not load saved configuration');
-            retainedConfig = config.includeSeries === undefined ? {} : { includeSeries: config.includeSeries };
+            if (config.sources) {
+                window.location.replace('/' + encodeURIComponent(token) + '/configure-multi');
+                return;
+            }
+            retainedConfig = Object.fromEntries(['includeLive', 'includeMovies', 'includeSeries']
+                .filter(field => config[field] !== undefined).map(field => [field, config[field]]));
+            document.querySelectorAll('[data-multi-link]').forEach(link => {
+                link.href = '/' + encodeURIComponent(token) + '/configure-multi';
+            });
             const setValue = (id, value) => {
                 const el = document.getElementById(id);
                 if (el && value !== undefined && value !== null) el.value = value;

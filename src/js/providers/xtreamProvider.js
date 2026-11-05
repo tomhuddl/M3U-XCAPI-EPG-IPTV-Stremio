@@ -69,13 +69,14 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
     // JSON API mode
     const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
     // Fetch streams + category lists in parallel to map category_id -> category_name
+    const emptyResponse = () => Promise.resolve({ ok: true, json: async () => [] });
     const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
-      fetchCatalogueResponse(`${base}&action=get_live_streams`, { timeout: 30000 }),
-      fetchCatalogueResponse(`${base}&action=get_vod_streams`, { timeout: 30000 }),
-      fetchCatalogueResponse(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
+      config.includeLive === false ? emptyResponse() : fetchCatalogueResponse(`${base}&action=get_live_streams`, { timeout: 30000 }),
+      config.includeMovies === false ? emptyResponse() : fetchCatalogueResponse(`${base}&action=get_vod_streams`, { timeout: 30000 }),
+      config.includeLive === false ? emptyResponse() : fetchCatalogueResponse(`${base}&action=get_live_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
-      fetchCatalogueResponse(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
+      config.includeMovies === false ? emptyResponse() : fetchCatalogueResponse(`${base}&action=get_vod_categories`, { timeout: 20000 }).catch(
         () => null,
       ),
     ]);
@@ -223,7 +224,7 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
     }
   }
 
-  if (!skipEpg) await fetchEpg(addonInstance);
+  if (!skipEpg && config.includeLive !== false) await fetchEpg(addonInstance);
 }
 
 async function fetchEpg(addonInstance) {

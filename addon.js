@@ -701,6 +701,11 @@ function stableStringify(obj) {
 }
 
 function createCacheKey(config) {
+    if (Array.isArray(config.sources)) {
+        return crypto.createHash('sha256').update(JSON.stringify({
+            sources: config.sources.map(source => ({ id: source.id, name: source.name, key: createCacheKey(source) }))
+        })).digest('hex');
+    }
     const minimal = {
         provider: config.provider,
         m3uUrl: config.m3uUrl,
@@ -716,6 +721,10 @@ function createCacheKey(config) {
         epgOffsetHours: config.epgOffsetHours,
         includeSeries: config.includeSeries !== false // default true
     };
+    // Keep existing installations' cache keys byte-for-byte compatible.
+    if (config.includeLive === false) minimal.includeLive = false;
+    if (config.includeMovies === false) minimal.includeMovies = false;
+    if (config.__multiSource === true) minimal.multiSource = true;
     return crypto.createHash('sha256').update(stableStringify(minimal)).digest('hex');
 }
 
@@ -805,6 +814,13 @@ class M3UEPGAddon {
         this.epgRefreshAttemptedAt = 0;
         this.providerRefreshRetryAfter = 0;
         this.log = makeLogger();
+        if (config.__sourceLabel) {
+            const logger = this.log;
+            this.log = Object.fromEntries(['info', 'warn', 'error', 'debug'].map(level =>
+                [level, (message, ...args) => logger[level](message, ...(args.length === 1 && args[0] &&
+                    typeof args[0] === 'object' && !(args[0] instanceof Error)
+                    ? [{ ...args[0], provider: config.__sourceLabel }] : [{ provider: config.__sourceLabel }, ...args]))]));
+        }
 
         // Direct provider may populate this (seriesId -> episodes array)
         this.directSeriesEpisodeIndex = new Map();
@@ -838,7 +854,7 @@ class M3UEPGAddon {
             : 0;
         // The Xtream detail map is lazy-loaded after interface construction. Reserve
         // a conservative allowance for its configured entry capacity in advance.
-        const seriesDetailVideoCapacity = this.providerName === 'xtream'
+        const seriesDetailVideoCapacity = this.providerName === 'xtream' && this.config.includeSeries !== false
             ? this.persistentSeriesInfoCache.maxEntries * 10
             : 0;
         const metadataCapacity = Math.max(
@@ -846,7 +862,7 @@ class M3UEPGAddon {
             this.movies.length + this.series.length
         );
         // Reserve the bounded detail/guide caches and opened-series enrichment.
-        return (4 + 16 + 12 + (this.providerName === 'xtream' ? 50 : 0)) * 1024 * 1024 +
+        return (4 + 16 + 12 + (this.providerName === 'xtream' && this.config.includeSeries !== false ? 50 : 0)) * 1024 * 1024 +
             metadataCapacity * 3000 +
             catalogueCount * 1200 + epgProgrammeCount * 320 +
             directEpisodeCount * 600 + Math.max(seriesDetailVideoCount, seriesDetailVideoCapacity) * 500;
@@ -3024,6 +3040,12 @@ async function createAddon(config) {
     };
 
     const cacheKey = createCacheKey(config);
+    if (!Array.isArray(config.sources)) {
+        const selected = type => type === 'tv' ? config.includeLive !== false :
+            type === 'movie' ? config.includeMovies !== false : config.includeSeries !== false;
+        manifest.catalogs = manifest.catalogs.filter(catalog => selected(catalog.type));
+        manifest.types = manifest.types.filter(selected);
+    }
     const buildKey = createInterfaceKey(config);
     if (buildPromiseCache.has(buildKey)) {
         return buildPromiseCache.get(buildKey);
@@ -3035,6 +3057,23 @@ async function createAddon(config) {
     const buildPromise = (async () => {
         const priorDisposal = addonDisposals.get(cacheKey);
         if (priorDisposal) await priorDisposal.catch(() => {});
+        if (Array.isArray(config.sources)) {
+            const { iface, instance } = await require('./multiProviderAddon').createMultiProviderAddon(config, manifest, {
+                key: createCacheKey,
+                build: createAddon,
+                dispose: iface => module.exports.disposeAddonInterface(iface),
+                acquire: iface => module.exports.acquireAddonInterface(iface),
+                release: iface => module.exports.releaseAddonInterface(iface),
+                flush: iface => addonInterfaceInstances.get(iface)?.flushPersistentStores(),
+                activeCount: () => liveInterfaces.size,
+                maxLive: parsePositiveInteger(process.env.MAX_LIVE_ADDON_INTERFACES, 6, 1, 24),
+                retryDelay: PROVIDER_REFRESH_RETRY_MS
+            });
+            buildingAddonInstance = instance;
+            buildingInterface = iface;
+            addonInterfaceInstances.set(iface, instance);
+            return iface;
+        }
         releasePersistentCacheRegistration = cleanupPersistentCacheFiles.registerActiveCache(cacheKey);
         await cleanupPersistentCacheFiles(cacheKey);
         const addonInstance = new M3UEPGAddon(config, manifest);
