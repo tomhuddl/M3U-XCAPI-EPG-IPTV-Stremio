@@ -393,6 +393,14 @@ TMDb's numeric score is not substituted for IMDb rating. The user-facing IMDb ra
 
 ---
 
+## Multiple providers and content selection
+
+Open **Choose Your Providers** from the setup page to configure one to four Xtream or direct M3U sources in a single addon. Name each provider and independently select live channels, movies and series. For example, select movies and series from one provider and live channels from another. When more than one provider supplies a content type, its catalogue names include their provider names; otherwise they use the standard name. Search, pages, details and playback use the relevant provider's own content. Duplicate titles are retained as separate provider entries. Xtream JSON requests skip disabled catalogue types; a direct or Xtream M3U playlist must still be downloaded as a whole before its selected content can be extracted.
+
+Enable an EPG for each live-channel source. Xtream uses its panel guide by default; optional custom XMLTV URLs can be supplied per provider. Provider IDs, episode lookups, metadata, refresh schedules, last-good snapshots and removal guards are isolated. If a provider is unavailable at startup, available providers can still be used; the unavailable provider is retried using the normal provider refresh backoff. Its setup status is shown when the manifest is ready. New configurations use separate persistent caches and will perform an initial metadata warm-up. Existing single-provider addon links and caches continue to work; switching an existing setup to multiple providers creates a new addon link and provider-qualified item IDs, so Stremio library entries from the old configuration may need to be added again.
+
+The settings page offers the existing single-provider setup pages as well as the new provider-selection page. Use the new page for a live-only, movies-only or series-only setup, including when using just one provider. Keep the same `CONFIG_SECRET` and persistent volume across restarts. Several large providers can require more memory and storage than one; `MAX_LIVE_ADDON_INTERFACES` also limits concurrently loaded provider interfaces.
+
 ## 🧭 Usage Examples
 
 ### Direct Playlist (Plain)

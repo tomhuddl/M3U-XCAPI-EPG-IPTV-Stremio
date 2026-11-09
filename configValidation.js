@@ -2,6 +2,7 @@
 
 const MAX_URL_LENGTH = 8192;
 const MAX_EPG_SOURCES = 20;
+const MAX_PROVIDER_SOURCES = 4;
 
 function requireString(value, field, { required = false, maxLength = 4096 } = {}) {
   if (value === undefined || value === null || value === "") {
@@ -32,6 +33,32 @@ function validateHttpUrl(value, field, { required = false } = {}) {
 function validateConfig(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Configuration must be a JSON object");
+  }
+
+  if (input.sources !== undefined) {
+    if (!Array.isArray(input.sources) || !input.sources.length || input.sources.length > MAX_PROVIDER_SOURCES)
+      throw new Error(`Choose between 1 and ${MAX_PROVIDER_SOURCES} providers`);
+    const ids = new Set();
+    const sources = input.sources.map((source, index) => {
+      if (!source || typeof source !== "object" || Array.isArray(source) || source.sources !== undefined)
+        throw new Error(`Invalid provider ${index + 1}`);
+      const config = validateConfig(source);
+      const identity = JSON.stringify([config.provider, config.m3uUrl, config.xtreamUrl,
+        config.xtreamUsername, config.xtreamPassword, !!config.xtreamUseM3U]);
+      const id = source.id === undefined
+        ? require("crypto").createHash("sha256").update(identity).digest("hex").slice(0, 12)
+        : requireString(source.id, "provider ID", { required: true, maxLength: 12 });
+      if (!/^[a-z0-9]{12}$/.test(id) || ids.has(id)) throw new Error("Provider IDs must be unique 12-character identifiers");
+      ids.add(id);
+      const name = requireString(source.name, "provider name", { maxLength: 60 })?.trim() || `Provider ${index + 1}`;
+      return { id, name, ...config };
+    });
+    const config = { sources };
+    if (input.debug !== undefined) {
+      if (typeof input.debug !== "boolean") throw new Error("Invalid debug");
+      config.debug = input.debug;
+    }
+    return config;
   }
 
   const provider = input.provider || (input.useXtream ? "xtream" : "direct");
@@ -78,12 +105,15 @@ function validateConfig(input) {
     config.epgUrls = [...new Set(urls)];
   }
 
-  for (const field of ["enableEpg", "includeSeries", "debug"]) {
+  for (const field of ["enableEpg", "includeLive", "includeMovies", "includeSeries", "debug"]) {
     if (input[field] !== undefined && typeof input[field] !== "boolean") {
       throw new Error(`Invalid ${field}`);
     }
     if (input[field] !== undefined) config[field] = input[field];
   }
+  if (config.includeLive === false) config.enableEpg = false;
+  if (config.includeLive === false && config.includeMovies === false && config.includeSeries === false)
+    throw new Error("Select at least one content type for each provider");
 
   if (input.epgOffsetHours !== undefined) {
     const offset = Number(input.epgOffsetHours);
@@ -96,4 +126,4 @@ function validateConfig(input) {
   return config;
 }
 
-module.exports = { validateConfig };
+module.exports = { validateConfig, MAX_PROVIDER_SOURCES };

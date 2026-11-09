@@ -67,8 +67,8 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
     const items = addonInstance.parseM3U(playlistText);
 
     // Separate by type (already heuristically assigned in parseM3U)
-    addonInstance.channels = items.filter(i => i.type === 'tv');
-    addonInstance.movies = items.filter(i => i.type === 'movie');
+    addonInstance.channels = config.includeLive === false ? [] : items.filter(i => i.type === 'tv');
+    addonInstance.movies = config.includeMovies === false ? [] : items.filter(i => i.type === 'movie');
 
     if (config.includeSeries !== false) {
         // Build episode grouping from items of type 'series'
@@ -135,7 +135,7 @@ async function fetchData(addonInstance, { skipEpg = false } = {}) {
         addonInstance.series = Array.from(seriesMap.values());
     }
 
-    if (!skipEpg) await fetchEpg(addonInstance);
+    if (!skipEpg && config.includeLive !== false) await fetchEpg(addonInstance);
 }
 
 async function fetchEpg(addonInstance) {

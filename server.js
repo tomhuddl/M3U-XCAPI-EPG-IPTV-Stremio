@@ -587,6 +587,7 @@ app.get("/favicon.ico", (req, res) => res.status(204).end());
 
 app.get("/configure-direct", (req, res) => res.sendFile(path.join(staticDir, "html", "direct-config.html")));
 app.get("/configure-xtream", (req, res) => res.sendFile(path.join(staticDir, "html", "xtream-config.html")));
+app.get("/configure-multi", (req, res) => res.sendFile(path.join(staticDir, "html", "multi-config.html")));
 
 function maybeDecryptConfig(token) {
   return tryParseConfigToken(token);
@@ -609,7 +610,8 @@ app.get("/:token/configure", (req, res) => {
   } catch {
     return res.status(400).json({ error: "Invalid or unsupported configuration token" });
   }
-  return res.redirect(`/${encodeURIComponent(token)}/configure-${cfg.provider}`);
+  const page = cfg.sources || cfg.includeLive === false || cfg.includeMovies === false ? "multi" : cfg.provider;
+  return res.redirect(`/${encodeURIComponent(token)}/configure-${page}`);
 });
 
 app.get("/:token/configure-direct", (req, res) => {
@@ -621,6 +623,10 @@ app.get("/:token/configure-xtream", (req, res) => {
   if (!isConfigToken(req.params.token))
     return res.status(400).json({ error: "Invalid token" });
   res.sendFile(path.join(staticDir, "html", "xtream-config.html"));
+});
+app.get("/:token/configure-multi", (req, res) => {
+  if (!isConfigToken(req.params.token)) return res.status(400).json({ error: "Invalid token" });
+  res.sendFile(path.join(staticDir, "html", "multi-config.html"));
 });
 
 // Return the saved config to its token-specific Configure page so settings can be edited.

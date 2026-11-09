@@ -1068,6 +1068,7 @@ async function main() {
         ...require("./tests/refreshAuditFixes.test"),
         ...require("./tests/loading.test"),
         ...require("./tests/comprehensiveAudit.test"),
+        ...require("./tests/multiProvider.test"),
     ];
 
     for (const test of tests) {

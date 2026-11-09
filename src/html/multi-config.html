@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Choose Your Providers • IPTV Addon</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body class="page-config">
+<header class="site-header"><div class="inner">
+    <h1 class="app-title">Choose Your Providers</h1>
+    <p class="subtitle">Select live channels, movies and series from up to four providers in one addon.</p>
+    <nav class="top-nav"><a href="/" class="nav-link">Home</a></nav>
+</div></header>
+<main class="main-content narrow">
+    <form id="multiForm" class="config-form" autocomplete="off">
+        <p class="hint">When multiple providers supply the same type of content, their catalogues appear under their provider names. Movies and series play from the provider that supplies them.</p>
+        <div id="providerSources"></div>
+        <button id="addProviderBtn" type="button" class="btn secondary">Add Provider</button>
+        <div class="form-group checkbox-line"><input id="debugMode" type="checkbox"><label for="debugMode">Debug logging</label></div>
+        <p id="formError" class="hint" role="alert"></p>
+        <div class="form-actions"><button type="submit" class="btn primary">Create Addon</button></div>
+    </form>
+    <div class="donate-inline under-form">
+        <p class="hint">Support the original developer:</p>
+        <iframe class="donation-frame" title="Support Inside4ndroid" src="/support.html" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" loading="lazy"></iframe>
+    </div>
+</main>
+<footer class="site-footer"><div class="inner"><p>M3U/EPG Addon • Made with ❤️ by Inside4ndroid</p></div></footer>
+<template id="providerTemplate">
+    <fieldset class="provider-source">
+        <legend>Provider</legend>
+        <div class="form-group"><label>Provider name <input data-field="name" type="text" maxlength="60" required></label></div>
+        <div class="form-group"><label>Connection <select data-field="provider"><option value="xtream">Xtream Codes API</option><option value="direct">Direct M3U playlist</option></select></label></div>
+        <fieldset data-group="xtream">
+            <legend>Xtream credentials</legend>
+            <div class="form-group"><label>Base URL <input data-field="xtreamUrl" type="url" placeholder="https://panel.example.com" required></label></div>
+            <div class="form-group"><label>Username <input data-field="xtreamUsername" type="text" maxlength="256" required></label></div>
+            <div class="form-group"><label>Password <input data-field="xtreamPassword" type="password" maxlength="1024" required autocomplete="new-password"></label></div>
+            <div class="form-group"><label><input data-field="xtreamUseM3U" type="checkbox"> Use Xtream M3U playlist mode</label></div>
+            <div class="form-group"><label>Playlist output <select data-field="xtreamOutput"><option value="">Provider default</option><option value="m3u8">HLS (m3u8)</option><option value="ts">MPEG-TS</option></select></label></div>
+        </fieldset>
+        <fieldset data-group="direct"><legend>Playlist</legend>
+            <div class="form-group"><label>M3U URL <input data-field="m3uUrl" type="url" required></label></div>
+        </fieldset>
+        <fieldset><legend>Include from this provider</legend>
+            <label><input data-field="includeLive" type="checkbox" checked> Live channels</label>
+            <label><input data-field="includeMovies" type="checkbox" checked> Movies</label>
+            <label><input data-field="includeSeries" type="checkbox" checked> Series</label>
+        </fieldset>
+        <fieldset data-group="guide"><legend>Programme guide</legend>
+            <label><input data-field="enableEpg" type="checkbox" checked> Enable EPG</label>
+            <div class="form-group"><label>Custom XMLTV URLs, one per line <textarea data-field="epgUrls" rows="3"></textarea></label>
+                <small class="hint">Leave empty to use the Xtream provider's guide. Direct playlists need an XMLTV URL for guide data.</small></div>
+            <div class="form-group"><label>EPG time offset (hours) <input data-field="epgOffsetHours" type="number" min="-24" max="24" step="0.5" value="0"></label></div>
+        </fieldset>
+        <button data-action="remove" type="button" class="btn secondary">Remove Provider</button>
+    </fieldset>
+</template>
+<div id="loaderOverlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="loaderMessage">
+    <div class="overlay-box">
+        <header class="overlay-header"><h2 id="loaderMessage">Starting…</h2><p class="overlay-sub" id="progressText">0%</p></header>
+        <div class="progress-track"><div id="progressBar" class="progress-fill" style="width:0%"></div></div>
+        <pre id="statusDetails" class="status-log" aria-live="polite"></pre>
+        <div class="overlay-actions">
+            <button id="closeSetupBtn" type="button" class="btn secondary">Close</button>
+            <button id="openStremioBtn" type="button" class="btn success" disabled>Open in Stremio</button>
+            <button id="copyManifestBtn" type="button" class="btn secondary" disabled>Copy Manifest URL</button>
+        </div>
+    </div>
+</div>
+<script src="/js/configure-common.js"></script>
+<script src="/js/multi-config.js"></script>
+</body></html>
